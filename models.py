@@ -1,0 +1,1220 @@
+"""
+OKX-Dog 个人量化智能交易系统 - 核心数据模型与契约定义
+模块: okx-dog-backend/models.py
+Python 版本: Python 3.10+
+验证框架: Pydantic v2 (BaseModel, Field, ConfigDict, field_validator, field_serializer)
+
+本模块定义了系统所有的领域枚举、数据库映射模型、REST API 请求/响应体、
+WebSocket 传输协议包、OKX v5 消息映射以及 AI 研判结构化输入输出契约。
+100% 严格对齐 AI_SCHEMA.json, DATABASE_SCHEMA.sql, API_SPEC.md 与 TYPES_CONTRACT.ts。
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, Generic, List, Optional, TypeVar, Union
+from pydantic import BaseModel, Field, ConfigDict, field_validator, field_serializer
+
+
+# =============================================================================
+# 1. 核心领域枚举 (Domain Enums)
+# =============================================================================
+
+class CredentialType(str, Enum):
+    """凭证类型枚举"""
+    OKX_V5 = "OKX_V5"
+    OPENAI = "OPENAI"
+    CUSTOM_LLM = "CUSTOM_LLM"
+
+
+class CopilotMode(str, Enum):
+    """人机协同工作模式"""
+    MANUAL = "MANUAL"          # 手动模式：AI提供建议，交易员手动确认下单
+    SEMI_AUTO = "SEMI_AUTO"    # 半自动模式：系统推送研判提醒，人工二次确认执行
+    FULL_AUTO = "FULL_AUTO"    # 全自动模式：高置信度信号在硬风控限额下自动委托
+
+
+class InstType(str, Enum):
+    """OKX 产品类型"""
+    SPOT = "SPOT"              # 现货
+    SWAP = "SWAP"              # 永续合约
+    FUTURES = "FUTURES"        # 交割合约
+    MARGIN = "MARGIN"          # 杠杆交易
+
+
+InstrumentType = InstType  # 前后端别名兼容
+
+
+class OrderSide(str, Enum):
+    """订单买卖方向"""
+    BUY = "buy"                # 买入
+    SELL = "sell"              # 卖出
+
+
+class PosSide(str, Enum):
+    """持仓方向 (合约)"""
+    LONG = "long"              # 多头 (双向持仓)
+    SHORT = "short"            # 空头 (双向持仓)
+    NET = "net"                # 单向持仓 (现货或单向合约)
+
+
+class OrderType(str, Enum):
+    """订单类型"""
+    LIMIT = "limit"                        # 普通限价单
+    MARKET = "market"                      # 市价单
+    TRIGGER = "trigger"                    # 计划委托单
+    POST_ONLY = "post_only"                # 只做 Maker (Post-Only)
+    FOK = "fok"                            # 全部成交或立即取消 (Fill-Or-Kill)
+    IOC = "ioc"                            # 立即成交并取消剩余 (Immediate-Or-Cancel)
+    OPTIMAL_LIMIT_IOC = "optimal_limit_ioc"# 市价委托立即成交并取消 (OKX 特有)
+
+
+class OrderState(str, Enum):
+    """订单生命周期状态 (全链路对齐前端与数据库)"""
+    LIVE = "live"                          # 活跃挂单中 (等待成交)
+    PARTIALLY_FILLED = "partially_filled"  # 部分成交
+    FILLED = "filled"                      # 完全成交
+    CANCELED = "canceled"                  # 用户手动撤销
+    MMP_CANCELED = "mmp_canceled"          # 做市商保护撤单
+    REJECTED = "rejected"                  # 交易所或网关拒绝
+    RISK_REJECTED = "risk_rejected"        # 遭后端硬风控中枢拦截拒绝
+    EXPIRED = "expired"                    # 委托过期
+    FAIL = "fail"                          # OKX 上游报错拒绝
+
+
+class RiskStatus(str, Enum):
+    """系统风控状态"""
+    NORMAL = "NORMAL"                      # 正常交易中
+    WARNING = "WARNING"                    # 预警状态 (接近风控阈值或强平线)
+    CIRCUIT_BROKEN = "CIRCUIT_BROKEN"      # 触发单日亏损熔断锁定
+    SAFE_MODE = "SAFE_MODE"                # Panic Button 触发后的安全只读模式
+
+
+class TimeFrame(str, Enum):
+    """行情周期枚举"""
+    M1 = "1m"
+    M5 = "5m"
+    M15 = "15m"
+    H1 = "1h"
+    H4 = "4h"
+    D1 = "1d"
+
+
+class MarketRegime(str, Enum):
+    """宏观盘面结构分类 (严格对齐 AI_SCHEMA.json 与 TYPES_CONTRACT.ts)"""
+    TRENDING_UP = "TRENDING_UP"              # 多头趋势
+    TRENDING_DOWN = "TRENDING_DOWN"          # 空头趋势
+    RANGING = "RANGING"                      # 震荡整理
+    VOLATILE_BREAKOUT = "VOLATILE_BREAKOUT"  # 剧烈突破/异动
+
+
+MarketState = MarketRegime  # 别名兼容
+
+
+class TimeframeTrend(str, Enum):
+    """单一周期趋势研判 (严格对齐 AI_SCHEMA.json definitions.TimeframeDetail)"""
+    BULLISH = "BULLISH"                      # 多头排列/强劲上涨
+    BEARISH = "BEARISH"                      # 空头排列/破位下跌
+    NEUTRAL_CHOPPY = "NEUTRAL_CHOPPY"        # 均线缠绕/宽幅震荡
+    OVERBOUGHT = "OVERBOUGHT"                # 超买顶背离
+    OVERSOLD = "OVERSOLD"                    # 超卖底背离
+
+
+class FundingRateBias(str, Enum):
+    """资金费率倾向评估 (严格对齐 AI_SCHEMA.json properties.derivatives_sentiment)"""
+    EXTREME_POSITIVE = "EXTREME_POSITIVE"    # 极端看多 (费率过热风险)
+    MODERATE_POSITIVE = "MODERATE_POSITIVE"  # 健康看多
+    NEUTRAL = "NEUTRAL"                      # 中性平衡
+    MODERATE_NEGATIVE = "MODERATE_NEGATIVE"  # 健康看空
+    EXTREME_NEGATIVE = "EXTREME_NEGATIVE"    # 极端看空 (空头挤压风险)
+
+
+class SignalAction(str, Enum):
+    """AI 核心操作动作 (补全 CLOSE_POSITION，100% 对齐 AI_SCHEMA.json)"""
+    BUY_LONG = "BUY_LONG"                    # 做多 / 买入开多
+    SELL_SHORT = "SELL_SHORT"                # 做空 / 卖出开空
+    CLOSE_POSITION = "CLOSE_POSITION"        # 平仓离场
+    HOLD_WAIT = "HOLD_WAIT"                  # 空仓观望 / 维持现有持仓
+
+
+SignalDirection = SignalAction  # 别名兼容
+
+
+class SignalUrgency(str, Enum):
+    """交易信号执行紧迫度"""
+    LOW = "LOW"                              # 挂单等待回调入场
+    MEDIUM = "MEDIUM"                        # 常规限价单挂单
+    HIGH = "HIGH"                            # 市价即时成交 / 突破紧急入场或紧急止损
+
+
+class TradePlanOrderType(str, Enum):
+    """建议交易计划委托类型"""
+    LIMIT = "LIMIT"                          # 限价单
+    MARKET = "MARKET"                        # 市价单
+    TRIGGER_LIMIT = "TRIGGER_LIMIT"          # 条件计划限价单
+
+
+class LLMProvider(str, Enum):
+    """支持的大模型服务商"""
+    DEEPSEEK = "deepseek"
+    OPENAI = "openai"
+    ANTHROPIC = "anthropic"
+    CUSTOM = "custom"
+
+
+class RiskEventType(str, Enum):
+    """风控审计事件类型 (包含全集枚举与前端映射别名)"""
+    MAX_ORDER_EXCEEDED = "MAX_ORDER_EXCEEDED"                            # 单笔金额超限
+    DAILY_LOSS_LIMIT = "DAILY_LOSS_LIMIT"                                # 触发单日亏损熔断
+    LEVERAGE_EXCEEDED = "LEVERAGE_EXCEEDED"                              # 杠杆倍数超限
+    SLIPPAGE_EXCEEDED = "SLIPPAGE_EXCEEDED"                              # 预估滑点超限
+    POSITION_LIMIT_EXCEEDED = "POSITION_LIMIT_EXCEEDED"                  # 持仓数量或规模超限
+    UNAUTHORIZED_WITHDRAWAL_ATTEMPT = "UNAUTHORIZED_WITHDRAWAL_ATTEMPT"  # 非法提现权限探测
+    PANIC_BUTTON_TRIGGERED = "PANIC_BUTTON_TRIGGERED"                    # 紧急一键平仓触发
+    CIRCUIT_BREAK_TRIGGERED = "CIRCUIT_BREAK_TRIGGERED"                  # 熔断触发锁定
+    CIRCUIT_BREAK_MANUAL_RESET = "CIRCUIT_BREAK_MANUAL_RESET"            # 交易员手动解除熔断
+    # 兼容前端命名别名
+    ORDER_REJECTED = "ORDER_REJECTED"                                    # 订单被拒
+    DAILY_LOSS_TRIGGERED = "DAILY_LOSS_TRIGGERED"                        # 单日亏损触发
+    PANIC_TRIGGERED = "PANIC_TRIGGERED"                                  # 紧急熔断触发
+    UNAUTHORIZED_WITHDRAWAL_DETECTED = "UNAUTHORIZED_WITHDRAWAL_DETECTED"# 提现权限探测
+    SLIPPAGE_PROTECTION = "SLIPPAGE_PROTECTION"                          # 滑点保护触发
+
+
+class AuditSeverity(str, Enum):
+    """审计日志严重程度"""
+    INFO = "INFO"
+    WARNING = "WARNING"
+    CRITICAL = "CRITICAL"
+    FATAL = "FATAL"
+
+
+RiskSeverity = AuditSeverity  # 别名兼容
+
+
+class AttributionStatus(str, Enum):
+    """AI 信号归因追踪状态"""
+    TRACKING = "TRACKING"          # 追踪中
+    COMPLETED = "COMPLETED"        # 已完成评估
+    EXPIRED = "EXPIRED"            # 超时未触发入场
+    INVALIDATED = "INVALIDATED"    # 达到失效条件提前作废
+
+
+class AIAttributionOutcome(str, Enum):
+    """研判历史归因评估结果"""
+    WIN = "WIN"
+    LOSS = "LOSS"
+    NEUTRAL = "NEUTRAL"
+    PENDING = "PENDING"
+
+
+# =============================================================================
+# 2. 通用 API 响应与包装模型 (Generic API Envelopes)
+# =============================================================================
+
+T = TypeVar("T")
+
+
+class ApiResponse(BaseModel, Generic[T]):
+    """标准 REST API 响应外壳 (统一毫秒时间戳)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    code: int = Field(0, description="状态码：0 为成功，非 0 为系统业务错误码")
+    msg: str = Field("success", description="提示信息或错误描述")
+    data: Optional[T] = Field(None, description="业务数据载荷")
+    timestamp: int = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="服务器响应毫秒时间戳")
+
+
+class PaginatedData(BaseModel, Generic[T]):
+    """分页数据通用包装"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    items: List[T] = Field(..., description="当前页数据列表")
+    total: int = Field(..., description="总记录条数")
+    page: int = Field(..., description="当前页码 (从1开始)")
+    page_size: int = Field(..., description="每页条数")
+    has_more: bool = Field(False, description="是否存在下一页")
+
+
+# =============================================================================
+# 3. 凭证密盒与安全配置模型 (Vault & Credentials Models)
+# =============================================================================
+
+class SaveCredentialsRequest(BaseModel):
+    """保存或更新 OKX 凭证请求"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    master_password: str = Field(..., min_length=8, description="用于派生 AES 密盒密钥的主密码")
+    is_live_mode: bool = Field(False, description="是否为实盘环境 (False: 模拟盘, True: 实盘)")
+    api_key: str = Field(..., min_length=10, description="OKX v5 API Key (明文输入，经加密后绝不以明文存储)")
+    secret_key: str = Field(..., min_length=10, description="OKX v5 Secret Key (明文输入，经加密存储)")
+    passphrase: str = Field(..., min_length=6, description="OKX v5 Passphrase 密码")
+
+
+class CredentialsStatusResponse(BaseModel):
+    """凭证状态查询响应 (完全脱敏)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    has_configured_okx: bool = Field(..., description="是否已配置 OKX 凭证")
+    is_live_mode: bool = Field(..., description="当前使用的环境 (True: 实盘, False: 模拟盘)")
+    api_key_masked: Optional[str] = Field(None, description="脱敏 API Key (如 6b2a****8e91)")
+    permissions: List[str] = Field(default_factory=lambda: ["read", "trade"], description="当前凭证具有的权限列表")
+    has_withdraw_permission: bool = Field(False, description="是否包含提现权限 (若为 True 则触发最高安全告警)")
+    is_valid: bool = Field(..., description="当前凭证连通性测试是否通过")
+    last_tested_at: Optional[Union[int, datetime]] = Field(None, description="上次成功连通测试时间戳 (ms)")
+
+    @field_serializer("last_tested_at")
+    def serialize_dt(self, dt: Optional[Union[int, datetime]]) -> Optional[int]:
+        if dt is None:
+            return None
+        if isinstance(dt, datetime):
+            return int(dt.timestamp() * 1000)
+        return dt
+
+
+class TestConnectionRequest(BaseModel):
+    """测试连通性请求"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    master_password: str = Field(..., description="用于解密密盒的主密码")
+    is_live_mode: Optional[bool] = Field(None, description="测试的目标环境，为空则测试当前配置环境")
+
+
+class TestConnectionResponse(BaseModel):
+    """测试连通性结果响应"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    connected: bool = Field(..., description="网络连通与签名认证是否成功")
+    latency_ms: int = Field(..., description="OKX API 端到端通信延迟 (毫秒)")
+    permissions: List[str] = Field(..., description="查询到的账户权限列表")
+    security_warning: Optional[str] = Field(None, description="安全预警信息 (例如包含提现权限时给出强阻断告警)")
+
+
+class LLMConfigRequest(BaseModel):
+    """大模型配置更新请求"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    master_password: str = Field(..., description="主密码 (用于加密保存 LLM API Key)")
+    llm_provider: LLMProvider = Field(LLMProvider.DEEPSEEK, description="大模型服务提供商")
+    llm_base_url: str = Field("https://api.deepseek.com", description="OpenAI 兼容的基础 API URL")
+    llm_api_key: Optional[str] = Field(None, description="大模型 API Key (若不修改则传 null)")
+    llm_model: str = Field("deepseek-reasoner", description="模型名称 (如 deepseek-reasoner, deepseek-chat, gpt-4o)")
+    llm_temperature: float = Field(0.2, ge=0.0, le=2.0, description="采样温度")
+    llm_max_tokens: int = Field(4096, ge=512, le=16384, description="最大生成 Token 数量")
+
+
+class LLMConfigResponse(BaseModel):
+    """大模型配置信息响应 (脱敏)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    llm_provider: LLMProvider = Field(..., description="服务提供商")
+    llm_base_url: str = Field(..., description="Base URL")
+    llm_model: str = Field(..., description="当前模型名称")
+    llm_api_key_masked: Optional[str] = Field(None, description="脱敏 API Key")
+    llm_temperature: float = Field(..., description="采样温度")
+    llm_max_tokens: int = Field(..., description="最大 Token 数")
+
+
+class TestLLMRequest(BaseModel):
+    """测试大模型连通性请求"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    master_password: Optional[str] = Field(None, description="主密码 (若使用已保存的加密 Key)")
+    llm_provider: Optional[LLMProvider] = Field(None, description="大模型服务商")
+    llm_base_url: Optional[str] = Field(None, description="大模型 Base URL")
+    llm_api_key: Optional[str] = Field(None, description="大模型 API Key (若传则使用，不传则使用密盒中解密的 Key)")
+    llm_model: Optional[str] = Field(None, description="模型名称")
+
+
+class TestLLMResponse(BaseModel):
+    """测试大模型连通性响应"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    connected: bool = Field(..., description="是否连通成功")
+    latency_ms: int = Field(0, description="响应耗时 (毫秒)")
+    model: str = Field(..., description="响应模型名称")
+    message: Optional[str] = Field(None, description="测试响应内容或错误说明")
+
+
+# =============================================================================
+# 4. 系统运行与人机协同配置模型 (System Config Models)
+# =============================================================================
+
+class SystemConfigModel(BaseModel):
+    """系统运行完整配置视图"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    copilot_mode: CopilotMode = Field(CopilotMode.MANUAL, description="人机协同工作模式")
+    active_symbol: str = Field("BTC-USDT-SWAP", description="当前主监控交易对")
+    supported_timeframes: List[str] = Field(default_factory=lambda: ["15m", "1h", "4h", "1d"], description="支持的计算周期")
+    is_trading_enabled: bool = Field(True, description="全局交易主开关")
+    is_ai_auto_trigger: bool = Field(False, description="是否启用 AI 定时自动研判")
+    auto_trigger_interval_mins: int = Field(60, ge=5, le=1440, description="定时研判间隔 (分钟)")
+
+
+class UpdateSystemConfigRequest(BaseModel):
+    """修改系统配置请求"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    copilot_mode: Optional[CopilotMode] = None
+    active_symbol: Optional[str] = None
+    supported_timeframes: Optional[List[str]] = None
+    is_trading_enabled: Optional[bool] = None
+    is_ai_auto_trigger: Optional[bool] = None
+    auto_trigger_interval_mins: Optional[int] = None
+
+
+# =============================================================================
+# 5. 多重硬风控拦截中枢模型 (Hard Risk Controller Models)
+# =============================================================================
+
+class RiskRulesConfig(BaseModel):
+    """硬风控规则配置 (严格对齐前端 HardRiskRules)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    max_order_usdt: float = Field(500.0, gt=0, description="单笔最大委托名义价值 (USDT)")
+    max_daily_loss_usdt: float = Field(200.0, gt=0, description="单日累计最大亏损熔断阈值 (USDT)")
+    max_leverage: int = Field(5, ge=1, le=20, description="最高允许杠杆倍数")
+    max_slippage_pct: float = Field(0.5, gt=0, le=5.0, description="市价单允许最大滑点百分比 (0.5%)")
+    max_open_positions: int = Field(3, ge=1, le=10, description="最大同时持仓标的数")
+    max_position_usdt: float = Field(2000.0, gt=0, description="单标的最大持仓名义价值 (USDT)")
+    default_stop_loss_pct: Optional[float] = Field(None, description="默认附带止损百分比")
+    default_take_profit_pct: Optional[float] = Field(None, description="默认附带止盈百分比")
+
+
+HardRiskRules = RiskRulesConfig  # 别名兼容
+
+
+class RiskDailyStats(BaseModel):
+    """单日亏损统计与熔断状态"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    date: str = Field(..., description="统计日期 (YYYY-MM-DD)")
+    today_realized_pnl: float = Field(..., description="当日已实现亏损 (USDT)")
+    today_unrealized_pnl: float = Field(..., description="当日当前未实现浮动亏损 (USDT)")
+    today_total_loss: float = Field(..., description="当日总亏损金额 (已实现 + 未实现)")
+    max_daily_loss_limit: float = Field(..., description="最大允许亏损额度 (USDT)")
+    loss_usage_ratio: float = Field(..., description="亏损额度使用百分比 (0.0 ~ 1.0)")
+    is_circuit_broken: bool = Field(..., description="系统是否已被硬风控熔断锁死")
+    circuit_break_reason: Optional[str] = Field(None, description="熔断原因说明")
+    circuit_break_at: Optional[int] = Field(None, description="熔断触发时间戳 (ms)")
+
+
+class RiskStatusResponse(BaseModel):
+    """风控中枢实时状态响应"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    risk_status: RiskStatus = Field(..., description="当前风控全局状态")
+    is_circuit_broken: bool = Field(..., description="是否处于熔断锁定中")
+    circuit_break_reason: Optional[str] = Field(None, description="熔断触发原因")
+    circuit_break_at: Optional[Union[int, datetime]] = Field(None, description="熔断触发时间戳")
+    daily_loss_current: float = Field(..., description="当日已发生亏损 (USDT)")
+    max_daily_loss_usdt: float = Field(..., description="单日亏损熔断阈值 (USDT)")
+    daily_loss_ratio: float = Field(..., description="当日亏损占熔断阈值比例 (0.0~1.0+)")
+    is_safe_mode: bool = Field(..., description="是否处于安全只读模式")
+    rules: RiskRulesConfig = Field(..., description="当前生效的硬风控规则参数")
+
+    @field_serializer("circuit_break_at")
+    def serialize_cb_at(self, dt: Optional[Union[int, datetime]]) -> Optional[int]:
+        if dt is None:
+            return None
+        if isinstance(dt, datetime):
+            return int(dt.timestamp() * 1000)
+        return dt
+
+
+class RiskCheckResult(BaseModel):
+    """硬风控拦截单次评估结果"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    passed: bool = Field(..., description="是否通过全部硬风控校验")
+    risk_status: Optional[RiskStatus] = Field(RiskStatus.NORMAL, description="当前风控状态")
+    rejected_rule: Optional[str] = Field(None, alias="violated_rule", description="被触发并阻断的风控规则名称")
+    violated_rule: Optional[str] = Field(None, description="别名兼容")
+    message: str = Field("通过风控检查", description="审核通过确认或拦截拒绝说明")
+    threshold: Optional[float] = Field(None, description="风控阈值")
+    actual_value: Optional[float] = Field(None, description="尝试提交的实际数值")
+    evaluated_metrics: Dict[str, Any] = Field(default_factory=dict, description="评估时的上下文指标参数")
+
+
+class ResetCircuitBreakerRequest(BaseModel):
+    """手动解除熔断锁定请求"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    master_password: str = Field(..., description="主密码 (防止误触，需密码授权)")
+    reason: str = Field(..., min_length=4, description="解除熔断的原因与交易员备注")
+
+
+class PanicButtonRequest(BaseModel):
+    """Panic Button 紧急一键平仓请求 (统一前后端参数)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    master_password: str = Field(..., description="用于解密与安全二次确认的主密码")
+    confirm_phrase: str = Field("PANIC_CLOSE_ALL", description="确认文本，必须严格等于 'PANIC_CLOSE_ALL'")
+    target: str = Field("ALL", description="熔断目标范围: 'ALL', 'SWAP_ONLY', 'SPOT_ONLY'")
+    cancel_all_orders: bool = Field(True, description="是否撤销所有挂单")
+    close_all_positions: bool = Field(True, description="是否市价全平所有持仓")
+    reason: Optional[str] = Field("PANIC_BUTTON_TRIGGERED", description="触发原因说明")
+    confirm_token: Optional[str] = Field(None, description="安全校验 Token (前端兼容)")
+
+    @field_validator("confirm_phrase")
+    @classmethod
+    def validate_phrase(cls, v: str) -> str:
+        if v != "PANIC_CLOSE_ALL":
+            raise ValueError("确认文本错误，必须输入 'PANIC_CLOSE_ALL'")
+        return v
+
+
+class PanicExecutionDetail(BaseModel):
+    """Panic 执行明细项"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: str = Field(..., description="交易标的代码")
+    action: str = Field(..., description="执行动作 (CANCEL_ORDER / CLOSE_POSITION)")
+    target_id: str = Field(..., description="订单 ID 或 持仓 ID")
+    status: str = Field(..., description="执行状态 (SUCCESS / FAILED)")
+    message: Optional[str] = Field(None, description="状态描述")
+
+
+class PanicButtonResponse(BaseModel):
+    """Panic Button 触发处置结果 (统一前后端响应)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    success: bool = Field(..., description="紧急处置动作是否成功启动")
+    canceled_orders_count: int = Field(..., description="成功批量撤销的挂单数量")
+    closed_positions_count: int = Field(..., description="成功发起市价全平的持仓数量")
+    failed_operations: List[str] = Field(default_factory=list, description="失败的操作细节 (若有)")
+    execution_details: List[PanicExecutionDetail] = Field(default_factory=list, description="各标的执行明细列表")
+    system_state: str = Field("LOCKED_SAFE_MODE", description="系统后续保护状态")
+    circuit_broken_at: int = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="熔断触发时间戳 (ms)")
+    message: str = Field(..., description="处置完成摘要")
+
+
+# =============================================================================
+# 6. 行情与多周期技术指标模型 (Market Data & Indicator Models)
+# =============================================================================
+
+class TickerData(BaseModel):
+    """单个标的实时 Ticker 数据 (严格对齐前端 Ticker)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: str = Field(..., description="标的代码 (如 BTC-USDT-SWAP)")
+    last_price: float = Field(..., description="最新成交价")
+    last_sz: float = Field(0.0, description="最新成交数量")
+    high_24h: float = Field(..., description="24小时最高价")
+    low_24h: float = Field(..., description="24小时最低价")
+    open_24h: float = Field(0.0, description="24小时开盘价")
+    change_24h: Optional[float] = Field(None, description="24小时价格变动绝对值")
+    change_24h_pct: float = Field(..., description="24小时涨跌幅 (例如 2.35 表示 +2.35%)")
+    volume_24h: float = Field(..., description="24小时成交量 (张数/币数)")
+    vol_currency_24h: float = Field(..., alias="volume_24h_currency", description="24小时成交额 (USDT)")
+    volume_24h_currency: Optional[float] = Field(None, description="别名兼容")
+    mark_price: Optional[float] = Field(None, description="最新标记价格")
+    index_price: Optional[float] = Field(None, description="指数价格")
+    funding_rate: Optional[float] = Field(None, description="当前资金费率")
+    next_funding_time: Optional[int] = Field(None, description="下次结算资金费率时间戳 (ms)")
+    timestamp: int = Field(..., description="行情毫秒时间戳")
+
+
+Ticker = TickerData  # 别名兼容
+
+
+class KlineCandle(BaseModel):
+    """单个 K 线 Bar 数据 (对齐 Lightweight Charts 与前端 CandleStick)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    timestamp: int = Field(..., alias="time", description="Bar 开盘时间戳 (ms)")
+    time: Optional[int] = Field(None, description="时间轴字段别名")
+    open: float = Field(..., description="开盘价")
+    high: float = Field(..., description="最高价")
+    low: float = Field(..., description="最低价")
+    close: float = Field(..., description="收盘价")
+    volume: float = Field(..., description="成交量")
+    vol_currency: float = Field(0.0, description="成交额 (USDT)")
+    is_closed: bool = Field(True, alias="confirmed", description="该 Bar 是否已收线确认")
+    confirmed: Optional[bool] = Field(None, description="别名兼容")
+
+
+CandleStick = KlineCandle  # 别名兼容
+
+
+class OrderBookLevel(BaseModel):
+    """订单簿档位"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    price: float = Field(..., description="价格")
+    size: float = Field(..., description="委托数量")
+    order_count: Optional[int] = Field(1, description="订单数")
+    cumulative_size: Optional[float] = Field(None, description="累计深度")
+    depth_ratio: Optional[float] = Field(None, description="深度占比")
+
+
+class OrderBookDepth(BaseModel):
+    """深度盘口数据 (Level-2)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: str = Field(..., description="标的代码")
+    timestamp: int = Field(..., description="盘口毫秒时间戳")
+    bids: List[OrderBookLevel] = Field(..., description="买盘档位 (价格从高到低)")
+    asks: List[OrderBookLevel] = Field(..., description="卖盘档位 (价格从低到高)")
+    checksum: Optional[int] = Field(None, description="序列校验和")
+
+
+OrderBook = OrderBookDepth  # 别名兼容
+
+
+class MarketTrade(BaseModel):
+    """逐笔实时成交记录"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    trade_id: str = Field(..., description="成交唯一 ID")
+    symbol: str = Field(..., description="标的代码")
+    side: OrderSide = Field(..., description="成交方向 (buy / sell)")
+    price: float = Field(..., description="成交价格")
+    size: float = Field(..., description="成交数量")
+    timestamp: int = Field(..., description="成交时间戳 (ms)")
+    is_whale_trade: Optional[bool] = Field(False, description="是否为大单异动")
+
+
+class DerivativesMetrics(BaseModel):
+    """衍生品专项监控指标"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: str = Field(..., description="标的代码")
+    funding_rate: float = Field(..., description="当前资金费率 (例如 0.0001)")
+    predicted_funding_rate: Optional[float] = Field(None, description="预测下期资金费率")
+    funding_rate_annualized_pct: Optional[float] = Field(None, description="年化资金费率百分比")
+    next_funding_time: Optional[int] = Field(None, description="下次结算时间戳 (ms)")
+    funding_countdown_ms: Optional[int] = Field(None, description="距离下次结算倒计时毫秒")
+    open_interest: float = Field(..., alias="open_interest_size", description="全网未平仓合约张数 (OI)")
+    open_interest_size: Optional[float] = Field(None, description="别名兼容")
+    open_interest_usdt: float = Field(..., alias="open_interest_usd", description="全网未平仓合约估值 (USDT)")
+    open_interest_usd: Optional[float] = Field(None, description="别名兼容")
+    oi_change_24h_pct: float = Field(..., alias="open_interest_change_24h_pct", description="24小时 OI 变动百分比")
+    open_interest_change_24h_pct: Optional[float] = Field(None, description="别名兼容")
+    long_short_ratio: Optional[float] = Field(None, description="多空持仓人数比")
+    top_trader_long_short_ratio: Optional[float] = Field(None, description="大户多空持仓比")
+    sentiment_score: Optional[float] = Field(0.0, description="情绪量化得分 (-1.0 ~ +1.0)")
+    timestamp: Optional[int] = Field(None, description="指标生成时间戳 (ms)")
+
+
+class MACDIndicator(BaseModel):
+    """MACD 详细指标"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    dif: float = Field(..., description="MACD DIF (快线)")
+    dea: float = Field(..., description="MACD DEA (慢线)")
+    macd_bar: float = Field(..., description="MACD 柱状图")
+    is_golden_cross: bool = Field(False, description="是否金叉")
+    is_death_cross: bool = Field(False, description="是否死叉")
+
+
+class BollingerIndicator(BaseModel):
+    """布林带详细指标"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    upper: float = Field(..., description="上轨")
+    mid: float = Field(..., description="中轨")
+    lower: float = Field(..., description="下轨")
+    bandwidth: float = Field(..., description="带宽")
+    percent_b: float = Field(..., description="位置 %b")
+
+
+class SinglePeriodIndicators(BaseModel):
+    """单个时间周期的量化技术指标集合"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    timeframe: str = Field(..., description="周期 (15m, 1h, 4h, 1d)")
+    ema_20: float = Field(..., description="EMA 20")
+    ema_50: float = Field(..., description="EMA 50")
+    ema_200: Optional[float] = Field(None, description="EMA 200")
+    macd_dif: float = Field(..., description="MACD DIF")
+    macd_dea: float = Field(..., description="MACD DEA")
+    macd_hist: float = Field(..., description="MACD 柱状图")
+    rsi_14: float = Field(..., description="RSI 14")
+    bb_upper: float = Field(..., description="布林带上轨")
+    bb_middle: float = Field(..., description="布林带中轨")
+    bb_lower: float = Field(..., description="布林带下轨")
+    atr_14: float = Field(..., description="ATR 14 真实波动区间")
+
+
+TechnicalIndicatorSet = SinglePeriodIndicators  # 别名兼容
+
+
+class MultiPeriodIndicators(BaseModel):
+    """多周期指标汇总聚合包"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: str = Field(..., description="标的代码")
+    timestamp: int = Field(..., description="计算时间戳")
+    indicators: Dict[str, SinglePeriodIndicators] = Field(..., description="各周期指标映射，例如 {'15m': ..., '1h': ...}")
+
+
+MultiTimeframeIndicators = MultiPeriodIndicators  # 别名兼容
+
+
+class MarketContextSnapshot(BaseModel):
+    """送入 AI 决策中枢的结构化行情完整快照"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: str = Field(..., description="标的代码")
+    timestamp: int = Field(..., description="毫秒时间戳")
+    ticker: TickerData = Field(..., description="实时行情 Ticker")
+    derivatives: DerivativesMetrics = Field(..., description="衍生品指标")
+    multi_indicators: MultiPeriodIndicators = Field(..., description="多周期技术指标")
+    current_position: Optional[PositionModel] = Field(None, description="交易员当前持仓状态 (若无持仓为 null)")
+    account_available_margin_usdt: float = Field(..., description="当前可用保证金 (USDT)")
+
+
+# =============================================================================
+# 7. AI 智能研判与决策契约模型 (LLM Decision Models)
+# 100% 严格对齐 okx-dog-ai/AI_SCHEMA.json 与 TYPES_CONTRACT.ts
+# =============================================================================
+
+class TimeframeDetail(BaseModel):
+    """单一周期技术指标与形态研判细节 (AI_SCHEMA definitions.TimeframeDetail)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    trend: TimeframeTrend = Field(..., description="周期趋势：BULLISH, BEARISH, NEUTRAL_CHOPPY, OVERBOUGHT, OVERSOLD")
+    key_indicators_summary: str = Field(..., description="该周期关键指标表现描述")
+    support_level: float = Field(..., ge=0.0, description="识别出的第一关键支撑价位")
+    resistance_level: float = Field(..., ge=0.0, description="识别出的第一关键阻力价位")
+
+
+class TimeframeAnalysis(BaseModel):
+    """多周期技术面共振分析字典 (AI_SCHEMA properties.timeframe_analysis)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    tf_15m: TimeframeDetail = Field(..., description="15分钟周期研判细节")
+    tf_1h: TimeframeDetail = Field(..., description="1小时周期研判细节")
+    tf_4h: TimeframeDetail = Field(..., description="4小时周期研判细节")
+    tf_1d: TimeframeDetail = Field(..., description="日线周期研判细节")
+
+
+class DerivativesSentiment(BaseModel):
+    """衍生品与市场情绪专项研判 (AI_SCHEMA properties.derivatives_sentiment)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    funding_rate_bias: FundingRateBias = Field(..., description="资金费率倾向")
+    open_interest_interpretation: str = Field(..., description="全网未平仓合约量 (OI) 异动解读")
+    long_short_ratio_state: str = Field(..., description="多空持仓比与大户状态分析")
+    sentiment_score: float = Field(..., ge=-1.0, le=1.0, description="综合情绪量化得分 (-1.0 ~ +1.0)")
+
+
+AIDerivativesSentiment = DerivativesSentiment  # 别名兼容
+
+
+class AISignal(BaseModel):
+    """最终交易决策信号与置信度 (AI_SCHEMA properties.signal)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    action: SignalAction = Field(..., description="核心操作动作：BUY_LONG, SELL_SHORT, CLOSE_POSITION, HOLD_WAIT")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="决策置信度打分 [0.0, 1.0]")
+    urgency: SignalUrgency = Field(..., description="执行紧迫度：LOW, MEDIUM, HIGH")
+
+
+class TakeProfitLevel(BaseModel):
+    """分阶段止盈点位与平仓比例 (AI_SCHEMA definitions.TakeProfitLevel)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    price: float = Field(..., ge=0.0, description="目标止盈价格")
+    percentage: float = Field(..., ge=0.01, le=1.0, description="该点位建议平仓比例 (0.01 ~ 1.0)")
+    description: str = Field(..., description="止盈依据说明")
+
+
+AITakeProfitLevel = TakeProfitLevel  # 别名兼容
+
+
+class TradePlan(BaseModel):
+    """建议交易计划与量化点位参数 (AI_SCHEMA properties.trade_plan)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    entry_range: List[float] = Field(..., min_length=2, max_length=2, description="建议入场价格区间 [最低入场价, 最高入场价]")
+    take_profit_levels: List[TakeProfitLevel] = Field(..., min_length=1, max_length=4, description="分批止盈目标列表")
+    stop_loss_price: float = Field(..., ge=0.0, description="硬止损价格")
+    risk_reward_ratio: float = Field(..., ge=0.0, description="理论盈亏比 (R:R Ratio)")
+    suggested_leverage: int = Field(..., ge=1, le=20, description="建议杠杆倍数 (1 ~ 20)")
+    order_type: TradePlanOrderType = Field(TradePlanOrderType.LIMIT, description="建议委托类型：LIMIT, MARKET, TRIGGER_LIMIT")
+
+
+AITradePlan = TradePlan  # 别名兼容
+
+
+class RiskAssessment(BaseModel):
+    """风险评估与逻辑失效边界 (AI_SCHEMA properties.risk_assessment)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    key_risks: List[str] = Field(..., min_length=1, max_length=5, description="面临的核心风险因素列表")
+    invalidation_condition: str = Field(..., description="交易逻辑彻底失效的技术形态或价格条件")
+    max_holding_time_hours: float = Field(..., ge=0.5, le=720.0, description="建议最长持仓时间 (小时)")
+
+
+AIRiskAssessment = RiskAssessment  # 别名兼容
+
+
+class AIAnalysisResponse(BaseModel):
+    """AI 大模型完整结构化研判响应 (100% 对齐 AI_SCHEMA.json 与前端契约)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    analysis_id: str = Field(..., description="研判唯一标识符 (UUID v4)")
+    symbol: str = Field(..., description="交易标的代码，例如 'BTC-USDT-SWAP'")
+    timestamp: int = Field(..., description="研判生成时的 Unix 毫秒时间戳 (ms)")
+    market_regime: MarketRegime = Field(..., description="宏观盘面结构分类")
+    timeframe_analysis: TimeframeAnalysis = Field(..., description="多周期（15m, 1h, 4h, 1d）共振分析")
+    derivatives_sentiment: DerivativesSentiment = Field(..., description="衍生品与市场情绪专项研判")
+    signal: AISignal = Field(..., description="最终交易决策信号与置信度")
+    trade_plan: TradePlan = Field(..., description="建议交易计划与量化点位参数")
+    risk_assessment: RiskAssessment = Field(..., description="风险评估与逻辑失效边界")
+    reasoning_summary: str = Field(..., description="精炼中文研判结论与核心逻辑摘要 (150字以内)")
+    reasoning_details: str = Field(..., description="详尽的量化逻辑推导过程")
+    
+    # 网关与运行时扩展字段
+    model_used: Optional[str] = Field(None, description="实际使用的模型名称 (如 deepseek-reasoner)")
+    latency_ms: Optional[int] = Field(0, description="模型推理耗时 (毫秒)")
+    thinking_process: Optional[str] = Field(None, description="推理思维链完整内容 (<think> 标签内内容)")
+
+
+
+class TriggerAIAnalysisRequest(BaseModel):
+    """手动触发 AI 研判请求"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: Optional[str] = Field("BTC-USDT-SWAP", description="研判标的")
+    timeframe: Optional[str] = Field("1h", description="主研判周期")
+    include_thinking: bool = Field(True, description="是否返回思维链内容")
+
+
+class SSEStreamChunk(BaseModel):
+    """SSE 流式传输数据块 (AICoTStreamEvent)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    event: str = Field("chunk", description="事件类型: start, thinking, reasoning_chunk, schema_chunk, complete, done, error")
+    data: Union[str, AIAnalysisResponse, Dict[str, Any]] = Field(..., description="数据载荷")
+    reasoning_content: Optional[str] = Field(None, description="思维链增量文本")
+    structured_output: Optional[AIAnalysisResponse] = Field(None, description="解析出的完整研判对象")
+    error_message: Optional[str] = Field(None, description="错误信息")
+
+
+AICoTStreamEvent = SSEStreamChunk  # 别名兼容
+
+
+# =============================================================================
+# 8. 交易执行与订单持仓模型 (Trade, Order & Position Models)
+# =============================================================================
+
+class PlaceOrderRequest(BaseModel):
+    """统一委托下单请求 (对齐前端 OrderCreateRequest)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: str = Field(..., description="标的代码 (如 BTC-USDT-SWAP)")
+    inst_type: InstType = Field(InstType.SWAP, description="产品类型")
+    side: OrderSide = Field(..., description="买卖方向 (buy / sell)")
+    pos_side: PosSide = Field(PosSide.NET, description="持仓方向 (long / short / net)")
+    order_type: OrderType = Field(OrderType.LIMIT, description="订单类型")
+    price: Optional[float] = Field(None, description="委托价格 (市价单传 null)")
+    sz: float = Field(..., gt=0, alias="size", description="委托数量 (张数或币数)")
+    size: Optional[float] = Field(None, description="数量别名")
+    leverage: int = Field(1, ge=1, le=20, description="杠杆倍数")
+    # 附带止盈止损 (OCO)
+    tp_trigger_price: Optional[float] = Field(None, description="止盈触发价")
+    tp_ord_price: Optional[float] = Field(None, alias="tp_order_price", description="止盈委托价 (-1 或 null 为市价)")
+    tp_order_price: Optional[float] = Field(None, description="别名兼容")
+    sl_trigger_price: Optional[float] = Field(None, description="止损触发价")
+    sl_ord_price: Optional[float] = Field(None, alias="sl_order_price", description="止损委托价 (-1 或 null 为市价)")
+    sl_order_price: Optional[float] = Field(None, description="别名兼容")
+    reduce_only: Optional[bool] = Field(False, description="是否仅减仓")
+    client_order_id: Optional[str] = Field(None, description="客户端自定义订单 ID")
+    # 溯源与协同模式
+    copilot_mode: CopilotMode = Field(CopilotMode.MANUAL, description="触发此订单的模式")
+    ai_analysis_id: Optional[Union[int, str]] = Field(None, description="关联的 AI 研判 ID (若为一键采纳下单)")
+
+
+OrderCreateRequest = PlaceOrderRequest  # 别名兼容
+
+
+class AdoptAIPlanRequest(BaseModel):
+    """一键采纳 AI 建议交易计划下单请求 (对齐前端 AIAdoptPayload)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: str = Field("BTC-USDT-SWAP", description="标的代码")
+    action: Optional[SignalAction] = Field(None, description="交易方向")
+    analysis_id: Optional[Union[str, int]] = Field(None, alias="ai_analysis_id", description="所采纳的 AI 研判记录 ID (UUID 或 ID)")
+    ai_analysis_id: Optional[Union[int, str]] = Field(None, description="别名兼容")
+    selected_entry_price: Optional[float] = Field(None, alias="entry_price", description="选定的入场价")
+    entry_price: Optional[float] = Field(None, description="别名兼容")
+    stop_loss_price: Optional[float] = Field(None, description="止损价格")
+    take_profit_target_1: Optional[float] = Field(None, description="第一止盈目标位")
+    take_profit_target_2: Optional[float] = Field(None, description="第二止盈目标位")
+    order_type: OrderType = Field(OrderType.LIMIT, description="入场订单类型")
+    leverage: Optional[int] = Field(None, alias="suggested_leverage", description="杠杆倍数")
+    suggested_leverage: Optional[int] = Field(None, description="别名兼容")
+    notional_usdt: float = Field(..., gt=0, alias="notional_usd", description="本次计划下单名义金额 (USDT)")
+    notional_usd: Optional[float] = Field(None, description="别名兼容")
+    confidence_score: Optional[float] = Field(None, description="信号置信度")
+
+
+AIAdoptPayload = AdoptAIPlanRequest  # 别名兼容
+
+
+class CancelOrderRequest(BaseModel):
+    """撤单请求"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: str = Field(..., description="标的代码")
+    client_order_id: Optional[str] = Field(None, description="客户端订单 ID")
+    okx_order_id: Optional[str] = Field(None, alias="order_id", description="OKX 订单 ID")
+    order_id: Optional[str] = Field(None, description="别名兼容")
+
+
+OrderCancelRequest = CancelOrderRequest  # 别名兼容
+
+
+class BatchCancelOrdersRequest(BaseModel):
+    """批量撤单请求"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: Optional[str] = Field(None, description="指定标的代码 (若为空则撤销所有标的的挂单)")
+    order_ids: Optional[List[str]] = Field(None, description="指定撤销的订单 ID 列表")
+
+
+class OrderModel(BaseModel):
+    """订单完整详情模型 (对齐数据库与前端 OrderItem)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: Optional[int] = Field(None, description="数据库自增 ID")
+    client_order_id: str = Field(..., description="客户端唯一订单号")
+    okx_order_id: Optional[str] = Field(None, alias="order_id", description="OKX 平台订单号")
+    order_id: Optional[str] = Field(None, description="别名兼容")
+    symbol: str = Field(..., description="标的代码")
+    inst_type: InstType = Field(InstType.SWAP, description="产品类型")
+    side: OrderSide = Field(..., description="买卖方向")
+    pos_side: PosSide = Field(PosSide.NET, description="持仓方向")
+    order_type: OrderType = Field(..., description="订单类型")
+    price: Optional[float] = Field(None, description="委托价")
+    sz: float = Field(..., alias="size", description="委托数量")
+    size: Optional[float] = Field(None, description="数量别名")
+    notional_usdt: float = Field(0.0, alias="notional_usd", description="名义金额 (USDT)")
+    notional_usd: Optional[float] = Field(None, description="别名兼容")
+    filled_sz: float = Field(0.0, alias="filled_size", description="已成交数量")
+    filled_size: Optional[float] = Field(None, description="别名兼容")
+    avg_price: float = Field(0.0, alias="avg_px", description="成交均价")
+    avg_px: Optional[float] = Field(None, description="别名兼容")
+    state: OrderState = Field(..., description="订单状态")
+    leverage: int = Field(1, description="杠杆倍数")
+    tp_trigger_price: Optional[float] = Field(None, description="止盈触发价")
+    tp_ord_price: Optional[float] = Field(None, alias="tp_order_price", description="止盈委托价")
+    tp_order_price: Optional[float] = Field(None, description="别名兼容")
+    sl_trigger_price: Optional[float] = Field(None, description="止损触发价")
+    sl_ord_price: Optional[float] = Field(None, alias="sl_order_price", description="止损委托价")
+    sl_order_price: Optional[float] = Field(None, description="别名兼容")
+    fee: float = Field(0.0, description="手续费 (USDT)")
+    fee_currency: str = Field("USDT", description="手续费币种")
+    pnl: float = Field(0.0, description="实现盈亏 (USDT)")
+    risk_check_passed: bool = Field(True, description="是否通过风控")
+    risk_check_msg: Optional[str] = Field(None, alias="reject_reason", description="风控说明/拒绝原因")
+    reject_reason: Optional[str] = Field(None, description="别名兼容")
+    copilot_mode: CopilotMode = Field(CopilotMode.MANUAL, description="协同模式")
+    ai_analysis_id: Optional[Union[int, str]] = Field(None, description="关联 AI 研判 ID")
+    created_at: Union[int, datetime] = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="创建时间戳 (ms)")
+    updated_at: Union[int, datetime] = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="更新时间戳 (ms)")
+
+    @field_serializer("created_at", "updated_at")
+    def serialize_datetime(self, dt: Union[int, datetime]) -> int:
+        if isinstance(dt, datetime):
+            return int(dt.timestamp() * 1000)
+        return dt
+
+
+OrderItem = OrderModel  # 别名兼容
+
+
+class SetPositionTPSLRequest(BaseModel):
+    """针对现有持仓设置/修改止盈止损请求"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: str = Field(..., description="标的代码")
+    pos_side: PosSide = Field(..., description="持仓方向")
+    tp_trigger_price: Optional[float] = Field(None, description="新止盈触发价 (传 null 或 0 表示取消)")
+    tp_ord_price: Optional[float] = Field(None, alias="tp_order_price", description="止盈委托价 (默认为市价)")
+    tp_order_price: Optional[float] = Field(None, description="别名兼容")
+    sl_trigger_price: Optional[float] = Field(None, description="新止损触发价 (传 null 或 0 表示取消)")
+    sl_ord_price: Optional[float] = Field(None, alias="sl_order_price", description="止损委托价 (默认为市价)")
+    sl_order_price: Optional[float] = Field(None, description="别名兼容")
+
+
+PositionTPSLRequest = SetPositionTPSLRequest  # 别名兼容
+
+
+class ClosePositionRequest(BaseModel):
+    """单独平仓请求"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: str = Field(..., description="标的代码")
+    pos_side: PosSide = Field(..., description="持仓方向 (long / short / net)")
+    order_type: OrderType = Field(OrderType.MARKET, description="平仓类型 (market / limit)")
+    price: Optional[float] = Field(None, description="限价平仓价格")
+    sz: Optional[float] = Field(None, alias="size", description="平仓数量 (若为空则全部平仓)")
+    size: Optional[float] = Field(None, description="别名兼容")
+
+
+class PositionModel(BaseModel):
+    """当前持仓模型 (全称与缩写双向兼容映射，严格对齐前端 PositionItem)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: Optional[int] = Field(None, description="数据库主键")
+    pos_id: Optional[str] = Field(None, description="持仓唯一标识")
+    symbol: str = Field(..., description="标的代码")
+    inst_type: InstType = Field(InstType.SWAP, description="产品类型")
+    pos_side: PosSide = Field(..., description="持仓方向")
+    pos: float = Field(..., alias="pos_size", description="持仓数量")
+    pos_size: Optional[float] = Field(None, description="持仓数量别名")
+    avail_pos: float = Field(0.0, description="可平仓数量")
+    avg_px: float = Field(..., alias="avg_price", description="开仓均价")
+    avg_price: Optional[float] = Field(None, description="均价别名")
+    mark_px: float = Field(..., alias="mark_price", description="最新标记价格")
+    mark_price: Optional[float] = Field(None, description="标记价别名")
+    liq_px: Optional[float] = Field(None, alias="liquidation_price", description="预估强平价")
+    liquidation_price: Optional[float] = Field(None, description="强平价别名")
+    margin_ratio: float = Field(..., alias="mgn_ratio", description="当前保证金率")
+    mgn_ratio: Optional[float] = Field(None, description="保证金率别名")
+    maint_margin_ratio: float = Field(0.01, description="维持保证金率")
+    leverage: int = Field(..., description="持仓杠杆倍数")
+    notional_usd: Optional[float] = Field(None, description="名义持仓价值 (USDT)")
+    upl: float = Field(0.0, description="未实现盈亏 (USDT)")
+    upl_ratio: float = Field(0.0, description="未实现盈亏率 (例如 0.12 表示 +12%)")
+    realized_pnl: float = Field(0.0, description="已实现盈亏 (USDT)")
+    margin: float = Field(0.0, description="占用保证金 (USDT)")
+    tp_trigger_price: Optional[float] = Field(None, description="当前止盈价")
+    sl_trigger_price: Optional[float] = Field(None, description="当前止损价")
+    is_danger_alert: bool = Field(False, description="是否触发强平危险告警")
+    last_synced_at: Union[int, datetime] = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="与 OKX 同步时间")
+    created_at: Optional[Union[int, datetime]] = Field(None, description="开仓时间戳")
+    updated_at: Optional[Union[int, datetime]] = Field(None, description="最近更新时间戳")
+
+    @field_serializer("last_synced_at", "created_at", "updated_at")
+    def serialize_pos_dt(self, dt: Optional[Union[int, datetime]]) -> Optional[int]:
+        if dt is None:
+            return None
+        if isinstance(dt, datetime):
+            return int(dt.timestamp() * 1000)
+        return dt
+
+
+PositionItem = PositionModel  # 别名兼容
+
+
+class AccountBalanceModel(BaseModel):
+    """账户资产全景数据 (严格对齐前端 AccountBalance)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    total_equity_usdt: float = Field(..., description="账户总权益估值 (USDT)")
+    total_equity_btc: Optional[float] = Field(0.0, description="账户总权益折合 (BTC)")
+    available_margin_usdt: float = Field(..., alias="available_balance_usdt", description="可用保证金 (USDT)")
+    available_balance_usdt: Optional[float] = Field(None, description="别名兼容")
+    used_margin_usdt: float = Field(0.0, alias="margin_used_usdt", description="占用保证金 (USDT)")
+    margin_used_usdt: Optional[float] = Field(None, description="别名兼容")
+    frozen_balance_usdt: float = Field(0.0, description="挂单冻结金额 (USDT)")
+    unrealized_pnl_usdt: float = Field(0.0, description="未实现总盈亏 (USDT)")
+    today_realized_pnl_usdt: float = Field(0.0, alias="today_pnl_usdt", description="当日已实现盈亏 (USDT)")
+    today_pnl_usdt: Optional[float] = Field(None, description="别名兼容")
+    today_pnl_ratio: float = Field(0.0, alias="today_pnl_pct", description="当日收益率")
+    today_pnl_pct: Optional[float] = Field(None, description="别名兼容")
+    margin_ratio: float = Field(..., description="账户整体保证金率")
+    is_warning_margin: Optional[bool] = Field(False, description="是否处于强平警戒状态")
+    timestamp: int = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), alias="updated_at", description="资产更新毫秒时间戳")
+    updated_at: Optional[int] = Field(None, description="别名兼容")
+
+
+AccountBalance = AccountBalanceModel  # 别名兼容
+
+
+# =============================================================================
+# 9. 胜率归因与审计模型 (Attribution & Audit Models)
+# =============================================================================
+
+class AttributionLogModel(BaseModel):
+    """AI 信号归因跟踪模型 (严格对齐 AIHistoryLogItem)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: int = Field(..., description="主键 ID")
+    ai_analysis_id: Union[int, str] = Field(..., alias="analysis_uuid", description="对应的 AI 研判 ID / UUID")
+    analysis_uuid: Optional[str] = Field(None, description="别名兼容")
+    symbol: str = Field(..., description="标的代码")
+    timeframe: Optional[str] = Field("1h", description="研判周期")
+    signal_direction: SignalAction = Field(..., alias="signal_action", description="研判方向/动作")
+    signal_action: Optional[SignalAction] = Field(None, description="别名兼容")
+    confidence_score: Optional[int] = Field(80, description="信号置信度 (0~100)")
+    signal_price: float = Field(..., alias="actual_market_price", description="发信号时基准价格")
+    actual_market_price: Optional[float] = Field(None, description="别名兼容")
+    suggested_entry_price: Optional[float] = Field(None, description="建议入场均价")
+    target_1_price: float = Field(..., alias="take_profit_target_1", description="目标 1 价格")
+    take_profit_target_1: Optional[float] = Field(None, description="别名兼容")
+    target_2_price: Optional[float] = Field(0.0, description="目标 2 价格")
+    stop_loss_price: float = Field(..., description="止损价格")
+    is_adopted: bool = Field(False, alias="adopted", description="是否被实际采纳")
+    adopted: Optional[bool] = Field(None, description="别名兼容")
+    order_id: Optional[Union[int, str]] = Field(None, alias="adopted_order_id", description="关联订单 ID")
+    adopted_order_id: Optional[str] = Field(None, description="别名兼容")
+    entry_time: Union[int, datetime] = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="入场/生效时间戳 (ms)")
+    exit_time: Optional[Union[int, datetime]] = Field(None, description="平仓/退出时间戳 (ms)")
+    max_favorable_excursion: float = Field(0.0, alias="max_profit_after_signal", description="最大有利偏移 (MFE)")
+    max_profit_after_signal: Optional[float] = Field(None, description="别名兼容")
+    max_adverse_excursion: float = Field(0.0, alias="max_drawdown_after_signal", description="最大不利偏移 (MAE)")
+    max_drawdown_after_signal: Optional[float] = Field(None, description="别名兼容")
+    hit_target_1: bool = Field(False, description="是否命中目标1")
+    hit_target_2: bool = Field(False, description="是否命中目标2")
+    hit_stop_loss: bool = Field(False, description="是否命中止损")
+    realized_pnl: float = Field(0.0, description="实现盈亏 (USDT)")
+    realized_rr: float = Field(0.0, description="实际达成盈亏比")
+    is_win: Optional[bool] = Field(None, description="是否判定为盈利单")
+    outcome: Optional[AIAttributionOutcome] = Field(None, description="复盘归因结果 (WIN/LOSS/NEUTRAL/PENDING)")
+    attribution_status: AttributionStatus = Field(AttributionStatus.TRACKING, description="归因状态")
+    notes: Optional[str] = Field(None, description="复盘评语")
+    created_at: Optional[Union[int, datetime]] = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="创建时间戳 (ms)")
+
+    @field_serializer("entry_time", "exit_time", "created_at")
+    def serialize_attr_dt(self, dt: Optional[Union[int, datetime]]) -> Optional[int]:
+        if dt is None:
+            return None
+        if isinstance(dt, datetime):
+            return int(dt.timestamp() * 1000)
+        return dt
+
+
+AIHistoryLogItem = AttributionLogModel  # 别名兼容
+
+
+class RiskAuditLogModel(BaseModel):
+    """风控审计日志模型 (严格对齐前端 RiskAuditLogItem)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: int = Field(..., description="主键 ID")
+    event_type: RiskEventType = Field(..., description="事件类型")
+    severity: AuditSeverity = Field(AuditSeverity.WARNING, description="严重级别")
+    trigger_source: str = Field("RISK_ENGINE", description="触发源 (RISK_ENGINE, USER_MANUAL, OKX_GATEWAY)")
+    rule_name: Optional[str] = Field("RISK_RULE", description="触发规则名")
+    rule_limit_value: Optional[str] = Field("", description="规则设定阈值")
+    current_metric_value: Optional[str] = Field("", description="触发时实际值")
+    symbol: Optional[str] = Field(None, description="关联标的")
+    is_blocked: bool = Field(True, description="是否被硬阻断")
+    action_taken: Optional[str] = Field("BLOCKED", description="采取的动作")
+    details: Optional[Dict[str, Any]] = Field(default_factory=dict, description="详细元数据 JSON")
+    timestamp: int = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), alias="created_at", description="触发时间戳 (ms)")
+    created_at: Optional[Union[int, datetime]] = Field(None, description="别名兼容")
+
+    @field_serializer("created_at")
+    def serialize_audit_dt(self, dt: Optional[Union[int, datetime]]) -> Optional[int]:
+        if dt is None:
+            return None
+        if isinstance(dt, datetime):
+            return int(dt.timestamp() * 1000)
+        return dt
+
+
+RiskAuditLogItem = RiskAuditLogModel  # 别名兼容
+
+
+# =============================================================================
+# 10. WebSocket 实时通信协议模型 (WebSocket Protocol Envelopes)
+# 统一前后端订阅报文与广播载荷
+# =============================================================================
+
+class WSClientAction(str, Enum):
+    """客户端发送给服务端的 WS 动作"""
+    SUBSCRIBE = "subscribe"
+    UNSUBSCRIBE = "unsubscribe"
+    PING = "ping"
+    AUTH = "auth"
+
+
+class WSClientMessage(BaseModel):
+    """客户端发送给服务端的统一 WS 请求报文 (兼容量化通道与 OKX v5 op/args 格式)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    action: Optional[WSClientAction] = Field(None, alias="op", description="操作动作 (subscribe/unsubscribe/ping/auth)")
+    op: Optional[str] = Field(None, description="OKX 兼容操作指令")
+    channels: Optional[List[str]] = Field(None, description="标准订阅频道列表 (如 ['ticker:BTC-USDT-SWAP', 'positions'])")
+    args: Optional[List[Dict[str, Any]]] = Field(None, description="OKX 兼容参数列表")
+    token: Optional[str] = Field(None, description="鉴权 Token")
+    timestamp: Optional[int] = Field(None, description="客户端时间戳 (ms)")
+
+
+WSSubscribeMessage = WSClientMessage  # 别名兼容
+
+
+class WSPingMessage(BaseModel):
+    """客户端心跳 Ping 包"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    action: WSClientAction = Field(WSClientAction.PING, alias="op", description="心跳动作")
+    timestamp: int = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="客户端时间戳")
+
+
+class WSPongMessage(BaseModel):
+    """服务端心跳 Pong 响应"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    event: str = Field("pong", description="心跳响应事件")
+    timestamp: int = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="服务端时间戳")
+
+
+class WSServerEvent(str, Enum):
+    """服务端推送事件类型"""
+    SNAPSHOT = "snapshot"
+    UPDATE = "update"
+    ERROR = "error"
+    AUTH_SUCCESS = "auth_success"
+    SUBSCRIBED = "subscribed"
+    UNSUBSCRIBED = "unsubscribed"
+    PONG = "pong"
+    NOTICE = "notice"
+
+
+class WSPushPayload(BaseModel, Generic[T]):
+    """服务端标准 WebSocket 推送数据包 (100% 对齐前端 WSServerMessage / WSPushPayload)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    channel: Optional[str] = Field(None, description="所属频道 (如 ticker:BTC-USDT-SWAP, orders, positions)")
+    event: WSServerEvent = Field(WSServerEvent.UPDATE, description="事件类型")
+    data: Optional[Union[T, List[T]]] = Field(None, description="实时推送数据实体或数据列表")
+    timestamp: int = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="推送时间戳 (ms)")
+    code: Optional[int] = Field(0, description="状态码 (0 成功)")
+    msg: Optional[str] = Field("success", description="提示信息")
+    arg: Optional[Dict[str, Any]] = Field(None, description="订阅频道与参数元数据")
+
+
+WSServerMessage = WSPushPayload  # 别名兼容
+
+
+# =============================================================================
+# 11. 模拟操盘沙盒与系统模式切换模型 (Paper Trading & Mode Switch)
+# =============================================================================
+
+class PaperAccountInfo(BaseModel):
+    """模拟账户资产与统计信息"""
+    initial_equity_usdt: float = Field(10000.0, description="初始虚拟本金 (USDT)")
+    total_equity_usdt: float = Field(10000.0, description="当前模拟总权益 (USDT)")
+    available_margin_usdt: float = Field(10000.0, description="模拟可用保证金 (USDT)")
+    used_margin_usdt: float = Field(0.0, description="模拟占用保证金 (USDT)")
+    unrealized_pnl_usdt: float = Field(0.0, description="当前未实现浮动盈亏 (USDT)")
+    realized_pnl_usdt: float = Field(0.0, description="累计已实现盈亏 (USDT)")
+    today_realized_pnl_usdt: float = Field(0.0, description="今日已实现盈亏 (USDT)")
+    today_pnl_ratio: float = Field(0.0, description="今日收益率")
+    total_trades_count: int = Field(0, description="累计模拟成交笔数")
+    winning_trades_count: int = Field(0, description="盈利笔数")
+    win_rate: float = Field(0.0, description="模拟胜率 (0.0~1.0)")
+    created_at: int = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000))
+    updated_at: int = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000))
+
+
+class PaperResetRequest(BaseModel):
+    """重置模拟账户请求"""
+    initial_equity_usdt: float = Field(10000.0, ge=100.0, le=10000000.0, description="重置初始本金 (100 ~ 1,000,000 USDT)")
+
+
+class SwitchModeRequest(BaseModel):
+    """切换实盘 / 模拟操盘模式请求"""
+    target_live_mode: bool = Field(..., description="目标模式: True 实盘, False 模拟沙盒")
+    master_password: Optional[str] = Field(None, description="切换至实盘模式时需提供主密码进行凭证解密探测")
+
