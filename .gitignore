@@ -10,9 +10,12 @@ dist/
 .venv
 venv/
 *.db
+*.db-*
 *.sqlite
 *.sqlite3
+data/
 logs/
+
 *.log
 .pytest_cache/
 .coverage

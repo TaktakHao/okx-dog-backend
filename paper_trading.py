@@ -107,31 +107,74 @@ class PaperTradingEngine:
             pos.upl = upl
             pos.upl_ratio = (upl / pos.margin) if pos.margin > 0 else 0.0
 
-            # 1. 检查止盈 (Take Profit) 触发
+            # 1. 检查阶梯止盈 (Take Profit) 触发 (首次达到 TP1 执行 50% 平仓 + 自动移动保本止损)
             if pos.tp_trigger_price and pos.tp_trigger_price > 0:
-                if (is_long and price >= pos.tp_trigger_price) or (not is_long and price <= pos.tp_trigger_price):
-                    logger.info(f"【模拟操盘】标的 {symbol} 触及止盈价 ${pos.tp_trigger_price}，执行自动止盈平仓！")
+                is_tp_hit = False
+                if is_long and pos.tp_trigger_price > pos.avg_px and price >= pos.tp_trigger_price:
+                    is_tp_hit = True
+                elif (not is_long) and pos.tp_trigger_price < pos.avg_px and price <= pos.tp_trigger_price:
+                    is_tp_hit = True
+
+                if is_tp_hit:
+                    # 如果尚未执行过 50% 止盈，执行阶梯分批止盈并移动保本
+                    if not getattr(pos, "tp_triggered_50", False) and pos.pos >= 0.002:
+                        partial_close_sz = round(pos.pos * 0.5, 4)
+                        logger.info(
+                            f"【模拟操盘-分批止盈】标的 {symbol} 触及第一止盈位 ${pos.tp_trigger_price:.1f}！"
+                            f"执行自动平仓 50% ({partial_close_sz} BTC) 锁定利润，并将剩余仓位止损上移至保本价 ${pos.avg_px:.1f}"
+                        )
+                        close_res = self.close_position(
+                            symbol=symbol,
+                            pos_side=pos.pos_side,
+                            price=price,
+                            size=partial_close_sz,
+                            reason=f"触及第一止盈位 ${pos.tp_trigger_price:.1f} (平仓50%并锁定移动保本)"
+                        )
+                        triggered_events.append(close_res)
+
+                        # 在内存持仓中更新状态：标记保本，止损价移至开仓均价，清空 TP1
+                        pos.tp_triggered_50 = True
+                        pos.is_breakeven_locked = True
+                        pos.sl_trigger_price = pos.avg_px
+                        pos.tp_trigger_price = None
+                        continue
+                    else:
+                        logger.info(f"【模拟操盘】标的 {symbol} 触及终极止盈价 ${pos.tp_trigger_price:.1f}，全量获利平仓！")
+                        close_res = self.close_position(
+                            symbol=symbol,
+                            pos_side=pos.pos_side,
+                            price=price,
+                            reason=f"触及终极止盈价 ${pos.tp_trigger_price:.1f} 获利平仓"
+                        )
+                        triggered_events.append(close_res)
+                        continue
+
+            # 2. 检查止损 (Stop Loss) 触发 (包含移动保本触发)
+            if pos.sl_trigger_price and pos.sl_trigger_price > 0:
+                is_sl_hit = False
+                if is_long and price <= pos.sl_trigger_price:
+                    is_sl_hit = True
+                elif (not is_long) and price >= pos.sl_trigger_price:
+                    is_sl_hit = True
+
+                if is_sl_hit:
+                    is_be = getattr(pos, "is_breakeven_locked", False)
+                    reason_str = (
+                        f"触及移动保本价 ${pos.sl_trigger_price:.1f} (保本平仓)"
+                        if is_be else
+                        f"触及硬止损价 ${pos.sl_trigger_price:.1f} (硬止损平仓)"
+                    )
+                    logger.info(f"【模拟操盘】标的 {symbol} {reason_str}")
                     close_res = self.close_position(
                         symbol=symbol,
                         pos_side=pos.pos_side,
                         price=price,
-                        reason=f"触及止盈价 ${pos.tp_trigger_price} 自动平仓"
+                        reason=reason_str
                     )
                     triggered_events.append(close_res)
                     continue
 
-            # 2. 检查止损 (Stop Loss) 触发
-            if pos.sl_trigger_price and pos.sl_trigger_price > 0:
-                if (is_long and price <= pos.sl_trigger_price) or (not is_long and price >= pos.sl_trigger_price):
-                    logger.info(f"【模拟操盘】标的 {symbol} 触及止损价 ${pos.sl_trigger_price}，执行自动止损平仓！")
-                    close_res = self.close_position(
-                        symbol=symbol,
-                        pos_side=pos.pos_side,
-                        price=price,
-                        reason=f"触及止损价 ${pos.sl_trigger_price} 自动平仓"
-                    )
-                    triggered_events.append(close_res)
-                    continue
+
 
         return triggered_events
 
@@ -163,6 +206,23 @@ class PaperTradingEngine:
         # 扣减可用现金作为保证金
         self.cash -= required_margin
 
+        # 校验并清洗止盈/止损价，过滤方向倒置的无效点位
+        raw_tp = float(getattr(req, "tp_trigger_price", 0.0) or 0.0)
+        raw_sl = float(getattr(req, "sl_trigger_price", 0.0) or 0.0)
+        sanitized_tp: Optional[float] = None
+        sanitized_sl: Optional[float] = None
+
+        if pos_side == PosSide.LONG:
+            if raw_tp > exec_price:
+                sanitized_tp = raw_tp
+            if 0 < raw_sl < exec_price:
+                sanitized_sl = raw_sl
+        else:
+            if 0 < raw_tp < exec_price:
+                sanitized_tp = raw_tp
+            if raw_sl > exec_price:
+                sanitized_sl = raw_sl
+
         # 生成模拟订单
         order_id = f"sim_ord_{uuid.uuid4().hex[:12]}"
         client_order_id = getattr(req, "client_order_id", None) or f"sim_cl_{uuid.uuid4().hex[:8]}"
@@ -183,8 +243,8 @@ class PaperTradingEngine:
             notional_usdt=round(notional_usdt, 2),
             state=OrderState.FILLED,
             leverage=leverage,
-            tp_trigger_price=getattr(req, "tp_trigger_price", None),
-            sl_trigger_price=getattr(req, "sl_trigger_price", None),
+            tp_trigger_price=sanitized_tp,
+            sl_trigger_price=sanitized_sl,
             risk_check_passed=True,
             risk_check_msg="通过硬风控检查 (模拟操盘撮合)",
             copilot_mode=getattr(req, "copilot_mode", CopilotMode.MANUAL),
@@ -213,10 +273,10 @@ class PaperTradingEngine:
             old_pos.mark_price = exec_price
             old_pos.margin = new_margin
             old_pos.notional_usd = total_size * exec_price
-            if getattr(req, "tp_trigger_price", None):
-                old_pos.tp_trigger_price = req.tp_trigger_price
-            if getattr(req, "sl_trigger_price", None):
-                old_pos.sl_trigger_price = req.sl_trigger_price
+            if sanitized_tp:
+                old_pos.tp_trigger_price = sanitized_tp
+            if sanitized_sl:
+                old_pos.sl_trigger_price = sanitized_sl
             old_pos.liq_px = self._calculate_liq_price(new_avg_px, leverage, pos_side)
             old_pos.liquidation_price = old_pos.liq_px
         else:
@@ -245,11 +305,12 @@ class PaperTradingEngine:
                 upl=0.0,
                 upl_ratio=0.0,
                 realized_pnl=0.0,
-                tp_trigger_price=getattr(req, "tp_trigger_price", None),
-                sl_trigger_price=getattr(req, "sl_trigger_price", None),
+                tp_trigger_price=sanitized_tp,
+                sl_trigger_price=sanitized_sl,
                 timestamp=now_ms,
             )
             self.positions[pos_key] = new_pos
+
 
         logger.info(
             f"【模拟操盘】订单成交: {side.value} {size} BTC @ ${exec_price:.1f}, "
@@ -328,8 +389,10 @@ class PaperTradingEngine:
             "success": True,
             "msg": f"平仓成功，已实现盈亏: {total_realized_pnl:+.2f} USDT",
             "realized_pnl": total_realized_pnl,
-            "close_price": close_price
+            "close_price": close_price,
+            "reason": reason
         }
+
 
     def get_positions(self) -> List[PositionModel]:
         """获取当前活跃模拟持仓列表"""

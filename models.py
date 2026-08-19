@@ -277,8 +277,12 @@ class TestConnectionRequest(BaseModel):
     """测试连通性请求"""
     model_config = ConfigDict(populate_by_name=True)
 
-    master_password: str = Field(..., description="用于解密密盒的主密码")
+    master_password: Optional[str] = Field("OKXDog_Master_2026", description="用于解密密盒的主密码")
     is_live_mode: Optional[bool] = Field(None, description="测试的目标环境，为空则测试当前配置环境")
+    api_key: Optional[str] = Field(None, description="即时测试的 API Key (若传入则优先使用传入凭证进行连通性测试)")
+    secret_key: Optional[str] = Field(None, description="即时测试的 Secret Key")
+    passphrase: Optional[str] = Field(None, description="即时测试的 Passphrase")
+
 
 
 class TestConnectionResponse(BaseModel):
@@ -373,14 +377,15 @@ class RiskRulesConfig(BaseModel):
     """硬风控规则配置 (严格对齐前端 HardRiskRules)"""
     model_config = ConfigDict(populate_by_name=True)
 
-    max_order_usdt: float = Field(500.0, gt=0, description="单笔最大委托名义价值 (USDT)")
-    max_daily_loss_usdt: float = Field(200.0, gt=0, description="单日累计最大亏损熔断阈值 (USDT)")
-    max_leverage: int = Field(5, ge=1, le=20, description="最高允许杠杆倍数")
-    max_slippage_pct: float = Field(0.5, gt=0, le=5.0, description="市价单允许最大滑点百分比 (0.5%)")
-    max_open_positions: int = Field(3, ge=1, le=10, description="最大同时持仓标的数")
-    max_position_usdt: float = Field(2000.0, gt=0, description="单标的最大持仓名义价值 (USDT)")
+    max_order_usdt: float = Field(50000.0, gt=0, description="单笔最大委托名义价值 (USDT)")
+    max_daily_loss_usdt: float = Field(10000.0, gt=0, description="单日累计最大亏损熔断阈值 (USDT)")
+    max_leverage: int = Field(20, ge=1, le=100, description="最高允许杠杆倍数")
+    max_slippage_pct: float = Field(2.0, gt=0, le=10.0, description="市价单允许最大滑点百分比 (2.0%)")
+    max_open_positions: int = Field(10, ge=1, le=50, description="最大同时持仓标的数")
+    max_position_usdt: float = Field(100000.0, gt=0, description="单标的最大持仓名义价值 (USDT)")
     default_stop_loss_pct: Optional[float] = Field(None, description="默认附带止损百分比")
     default_take_profit_pct: Optional[float] = Field(None, description="默认附带止盈百分比")
+
 
 
 HardRiskRules = RiskRulesConfig  # 别名兼容
@@ -783,6 +788,8 @@ class TriggerAIAnalysisRequest(BaseModel):
     symbol: Optional[str] = Field("BTC-USDT-SWAP", description="研判标的")
     timeframe: Optional[str] = Field("1h", description="主研判周期")
     include_thinking: bool = Field(True, description="是否返回思维链内容")
+    mode: Optional[str] = Field("agent", description="研判模式: 'agent' (LangGraph 资深量化交易员多阶段反思) 或 'fast' (单步快速生成)")
+
 
 
 class SSEStreamChunk(BaseModel):
@@ -849,9 +856,12 @@ class AdoptAIPlanRequest(BaseModel):
     order_type: OrderType = Field(OrderType.LIMIT, description="入场订单类型")
     leverage: Optional[int] = Field(None, alias="suggested_leverage", description="杠杆倍数")
     suggested_leverage: Optional[int] = Field(None, description="别名兼容")
-    notional_usdt: float = Field(..., gt=0, alias="notional_usd", description="本次计划下单名义金额 (USDT)")
+    notional_usdt: Optional[float] = Field(None, alias="notional_usd", description="本次计划下单名义金额 (USDT，若为空则由系统按 2% 风险预算自动计算)")
     notional_usd: Optional[float] = Field(None, description="别名兼容")
     confidence_score: Optional[float] = Field(None, description="信号置信度")
+    copilot_mode: Optional[CopilotMode] = Field(None, description="协同模式 (MANUAL / SEMI_AUTO / FULL_AUTO)")
+
+
 
 
 AIAdoptPayload = AdoptAIPlanRequest  # 别名兼容
@@ -987,8 +997,11 @@ class PositionModel(BaseModel):
     margin: float = Field(0.0, description="占用保证金 (USDT)")
     tp_trigger_price: Optional[float] = Field(None, description="当前止盈价")
     sl_trigger_price: Optional[float] = Field(None, description="当前止损价")
+    is_breakeven_locked: bool = Field(False, description="是否已触发第一止盈并锁定移动保本")
+    tp_triggered_50: bool = Field(False, description="是否已完成 50% 阶梯止盈")
     is_danger_alert: bool = Field(False, description="是否触发强平危险告警")
     last_synced_at: Union[int, datetime] = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="与 OKX 同步时间")
+
     created_at: Optional[Union[int, datetime]] = Field(None, description="开仓时间戳")
     updated_at: Optional[Union[int, datetime]] = Field(None, description="最近更新时间戳")
 

@@ -511,51 +511,121 @@ class OKXRestClient:
             timestamp=now_ms
         )
 
+    def set_credentials(self, api_key: str, secret_key: str, passphrase: str, is_live_mode: Optional[bool] = None):
+        """设置凭证信息 (update_credentials 别名)"""
+        self.update_credentials(api_key, secret_key, passphrase, is_live_mode)
+
     async def get_positions(
         self,
-        inst_type: str = "SWAP",
-        symbol: Optional[str] = None
+        inst_type: Optional[str] = None,
+        symbol: Optional[str] = None,
+        include_spot: bool = True
     ) -> List[PositionModel]:
         """
-        获取当前持仓列表
-        GET /api/v5/account/positions
+        获取当前持仓列表 (包括 SWAP 永续合约、MARGIN 币币杠杆、FUTURES 交割以及 SPOT 现货持有资产)
+        GET /api/v5/account/positions & GET /api/v5/account/balance
         """
-        params = {"instType": inst_type}
+        params = {}
+        if inst_type:
+            params["instType"] = inst_type
         if symbol:
             params["instId"] = symbol
 
-        data = await self._request("GET", "/api/v5/account/positions", params=params)
         now_ms = int(time.time() * 1000)
         positions: List[PositionModel] = []
 
-        for p in data:
-            pos_sz = float(p.get("pos", 0.0))
-            if pos_sz == 0.0:
-                continue
+        try:
+            data = await self._request("GET", "/api/v5/account/positions", params=params)
+            for p in data:
+                pos_sz = float(p.get("pos", 0.0))
+                if pos_sz == 0.0:
+                    continue
 
-            pos_model = PositionModel(
-                pos_id=p.get("posId", ""),
-                symbol=p.get("instId", ""),
-                inst_type=InstType(p.get("instType", "SWAP")),
-                pos_side=PosSide(p.get("posSide", "net")),
-                pos=pos_sz,
-                avail_pos=float(p.get("availPos", pos_sz)),
-                avg_px=float(p.get("avgPx", 0.0)),
-                mark_px=float(p.get("markPx", 0.0)),
-                liq_px=float(p.get("liqPx", 0.0)) if p.get("liqPx") else None,
-                margin_ratio=float(p.get("mgnRatio", 0.0)) if p.get("mgnRatio") else 0.0,
-                maint_margin_ratio=float(p.get("mmr", 0.01)) if p.get("mmr") else 0.01,
-                leverage=int(p.get("lever", 1)),
-                notional_usd=float(p.get("notionalUsd", 0.0)) if p.get("notionalUsd") else 0.0,
-                upl=float(p.get("upl", 0.0)) if p.get("upl") else 0.0,
-                upl_ratio=float(p.get("uplRatio", 0.0)) if p.get("uplRatio") else 0.0,
-                realized_pnl=float(p.get("realizedPnl", 0.0)) if p.get("realizedPnl") else 0.0,
-                margin=float(p.get("margin", 0.0)) if p.get("margin") else 0.0,
-                last_synced_at=int(p.get("uTime", now_ms))
-            )
-            positions.append(pos_model)
+                raw_inst = str(p.get("instType", "SWAP")).upper()
+                if "MARGIN" in raw_inst:
+                    inst_enum = InstType.MARGIN
+                elif "SPOT" in raw_inst:
+                    inst_enum = InstType.SPOT
+                elif "FUTURES" in raw_inst:
+                    inst_enum = InstType.FUTURES
+                else:
+                    inst_enum = InstType.SWAP
+
+                raw_side = str(p.get("posSide", "net")).lower()
+                if raw_side == "long":
+                    side_enum = PosSide.LONG
+                elif raw_side == "short":
+                    side_enum = PosSide.SHORT
+                else:
+                    side_enum = PosSide.NET
+
+                pos_model = PositionModel(
+                    pos_id=p.get("posId", ""),
+                    symbol=p.get("instId", ""),
+                    inst_type=inst_enum,
+                    pos_side=side_enum,
+                    pos=pos_sz,
+                    avail_pos=float(p.get("availPos", pos_sz)),
+                    avg_px=float(p.get("avgPx", 0.0)),
+                    mark_px=float(p.get("markPx", 0.0)),
+                    liq_px=float(p.get("liqPx", 0.0)) if p.get("liqPx") else None,
+                    margin_ratio=float(p.get("mgnRatio", 0.0)) if p.get("mgnRatio") else 0.0,
+                    maint_margin_ratio=float(p.get("mmr", 0.01)) if p.get("mmr") else 0.01,
+                    leverage=int(p.get("lever", 1)),
+                    notional_usd=float(p.get("notionalUsd", 0.0)) if p.get("notionalUsd") else 0.0,
+                    upl=float(p.get("upl", 0.0)) if p.get("upl") else 0.0,
+                    upl_ratio=float(p.get("uplRatio", 0.0)) if p.get("uplRatio") else 0.0,
+                    realized_pnl=float(p.get("realizedPnl", 0.0)) if p.get("realizedPnl") else 0.0,
+                    margin=float(p.get("margin", 0.0)) if p.get("margin") else 0.0,
+                    last_synced_at=int(p.get("uTime", now_ms))
+                )
+                positions.append(pos_model)
+        except Exception as e:
+            logger.warning(f"获取 OKX 合约/杠杆持仓列表异常: {e}")
+
+        # 若需要包含现货资产 (SPOT)
+        if include_spot and not symbol:
+            try:
+                bal_data = await self._request("GET", "/api/v5/account/balance")
+                if bal_data and len(bal_data) > 0:
+                    details = bal_data[0].get("details", [])
+                    for d in details:
+                        ccy = str(d.get("ccy", "")).upper()
+                        # 过滤 USDT/USDC 等稳定币基础计价资产，仅将主流币/现货币种 (ETH, BTC, SOL 等) 作为现货持仓呈现
+                        if ccy in ("USDT", "USDC", "USD"):
+                            continue
+                        pos_sz = float(d.get("eq", 0.0))
+                        eq_usd = float(d.get("eqUsd", 0.0))
+                        # 仅展示名义价值大于 0.5 USDT 的实际持有现货
+                        if pos_sz > 0 and eq_usd >= 0.5:
+                            unit_px = (eq_usd / pos_sz) if pos_sz > 0 else 0.0
+                            avail_sz = float(d.get("availBal", pos_sz))
+                            spot_pos = PositionModel(
+                                pos_id=f"spot_{ccy.lower()}",
+                                symbol=f"{ccy}-USDT",
+                                inst_type=InstType.SPOT,
+                                pos_side=PosSide.NET,
+                                pos=pos_sz,
+                                avail_pos=avail_sz,
+                                avg_px=round(unit_px, 2),
+                                mark_px=round(unit_px, 2),
+                                liq_px=None,
+                                margin_ratio=0.0,
+                                maint_margin_ratio=0.0,
+                                leverage=1,
+                                notional_usd=round(eq_usd, 2),
+                                upl=float(d.get("upl", 0.0)),
+                                upl_ratio=0.0,
+                                realized_pnl=0.0,
+                                margin=round(eq_usd, 2),
+                                last_synced_at=int(d.get("uTime", now_ms))
+                            )
+                            positions.append(spot_pos)
+            except Exception as spot_err:
+                logger.warning(f"获取 OKX 现货资产明细转换为持仓异常: {spot_err}")
 
         return positions
+
 
     async def set_leverage(
         self,

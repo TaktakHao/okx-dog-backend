@@ -28,6 +28,7 @@ from models import (
     OrderSide,
     PosSide,
     OrderType,
+    OrderState,
     PlaceOrderRequest,
     PositionModel,
     RiskRulesConfig,
@@ -35,6 +36,7 @@ from models import (
     TickerData,
     PanicButtonRequest
 )
+
 from indicators import (
     calculate_ema,
     calculate_macd,
@@ -423,6 +425,62 @@ async def test_fastapi_rest_endpoints():
         print(f"  [OK] GET /api/v1/risk/audit-logs 查询到 {len(r_audit.json()['data'])} 条风控审计日志")
 
 
+async def test_paper_engine_smart_sizing_and_breakeven():
+    """测试 7: 模拟操盘沙盒 TP1 阶梯 50% 止盈与移动保本 (Breakeven) 状态机测试"""
+    print("\n--- [Test 7] 模拟操盘沙盒 TP1 阶梯 50% 止盈与移动保本测试 ---")
+    from paper_trading import PaperTradingEngine
+    engine = PaperTradingEngine(initial_equity=10000.0)
+
+
+    # 1. 模拟开仓: 做多 0.04 BTC @ 63000, 止盈 65000, 止损 61000
+    order_req = PlaceOrderRequest(
+        symbol="BTC-USDT-SWAP",
+        inst_type=InstType.SWAP,
+        side=OrderSide.BUY,
+        pos_side=PosSide.LONG,
+        order_type=OrderType.MARKET,
+        price=63000.0,
+        sz=0.04,
+        leverage=3,
+        tp_trigger_price=65000.0,
+        sl_trigger_price=61000.0,
+    )
+
+    ord_res = engine.place_order(order_req, current_market_price=63000.0)
+    assert ord_res.state == OrderState.FILLED
+
+    positions = engine.get_positions()
+    assert len(positions) == 1
+    pos = positions[0]
+    assert pos.pos == 0.04
+    assert pos.avg_px == 63000.0
+    assert pos.tp_trigger_price == 65000.0
+    assert pos.sl_trigger_price == 61000.0
+    assert pos.is_breakeven_locked is False
+
+    # 2. 模拟行情推升至 65000 (触及 TP1)
+    triggered = engine.update_market_price("BTC-USDT-SWAP", 65050.0)
+    assert len(triggered) == 1
+    assert "锁定移动保本" in triggered[0]["reason"] or "第一止盈位" in triggered[0]["reason"]
+
+    # 检查持仓是否剩 50% 且止损上移至保本价 63000
+    positions_after_tp = engine.get_positions()
+    assert len(positions_after_tp) == 1
+    active_pos = positions_after_tp[0]
+    assert abs(active_pos.pos - 0.02) < 1e-4
+    assert active_pos.is_breakeven_locked is True
+    assert active_pos.sl_trigger_price == 63000.0
+    assert active_pos.tp_trigger_price is None
+    print(f"  [OK] TP1 触及成功执行 50% 分批平仓，剩余 0.02 BTC 止损已上移至保本价 ${active_pos.sl_trigger_price}")
+
+    # 3. 模拟行情回撤跌破保本价 63000
+    triggered_be = engine.update_market_price("BTC-USDT-SWAP", 62990.0)
+    assert len(triggered_be) == 1
+    assert "保本" in triggered_be[0]["reason"]
+    assert len(engine.get_positions()) == 0
+    print(f"  [OK] 触及保本价自动离场，持仓平仓完毕，实现零本金回撤亏损！")
+
+
 async def main_test_runner():
     """主测试入口"""
     print("================================================================================")
@@ -436,11 +494,13 @@ async def main_test_runner():
     await test_indicators_math()
     await test_risk_controller_rules_and_panic()
     await test_fastapi_rest_endpoints()
+    await test_paper_engine_smart_sizing_and_breakeven()
 
     print("\n================================================================================")
-    print("🎉 ALL TESTS PASSED! 全部 6 组核心模块集成测试 100% 成功通过！")
+    print("🎉 ALL TESTS PASSED! 全部 7 组核心模块集成测试 100% 成功通过！")
     print("================================================================================")
 
 
 if __name__ == "__main__":
     asyncio.run(main_test_runner())
+

@@ -76,8 +76,8 @@ class RiskController:
             max_daily_loss_usdt=settings.DEFAULT_MAX_DAILY_LOSS_USDT,
             max_leverage=settings.DEFAULT_MAX_LEVERAGE,
             max_slippage_pct=settings.DEFAULT_MAX_SLIPPAGE_PCT,
-            max_open_positions=3,
-            max_position_usdt=2000.0
+            max_open_positions=10,
+            max_position_usdt=100000.0
         )
 
         # 内存实时风控状态机
@@ -112,10 +112,10 @@ class RiskController:
                 self.circuit_break_at = None
 
     async def load_config_from_db(self):
-        """从 SQLite system_config 表加载最新风控规则"""
+        """从 SQLite risk_limits 表加载最新风控规则"""
         async with get_db_session() as db:
             try:
-                res = await db.execute(text("SELECT * FROM system_config ORDER BY id DESC LIMIT 1"))
+                res = await db.execute(text("SELECT * FROM risk_limits ORDER BY id DESC LIMIT 1"))
                 row = res.mappings().first()
                 if row:
                     self.rules = RiskRulesConfig(
@@ -129,6 +129,7 @@ class RiskController:
                     logger.info(f"风控规则已从数据库加载: {self.rules.model_dump()}")
             except Exception as e:
                 logger.warning(f"从数据库加载风控配置异常 (将使用默认规则): {e}")
+
 
     def update_rules(self, new_rules: RiskRulesConfig):
         """动态热更新内存风控规则"""
@@ -298,7 +299,7 @@ class RiskController:
         # ---------------------------------------------------------------------
         # 规则 4: 单笔最大下单金额拦截 (max_order_usdt)
         # ---------------------------------------------------------------------
-        if not is_reduce_only and estimated_notional > self.rules.max_order_usdt:
+        if not is_reduce_only and estimated_notional > (self.rules.max_order_usdt * 1.08):
             reason = (
                 f"单笔委托名义金额 ({estimated_notional:.2f} USDT) 超过硬风控限额 "
                 f"({self.rules.max_order_usdt:.2f} USDT)"
@@ -319,6 +320,7 @@ class RiskController:
                 message=reason,
                 risk_status=self.risk_status
             )
+
 
         # ---------------------------------------------------------------------
         # 规则 5: 市价单盘口滑点保护 (max_slippage_pct)

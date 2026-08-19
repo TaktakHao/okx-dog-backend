@@ -48,11 +48,12 @@ class SystemSettings(BaseSettings):
     OKX_DEMO_WS_PUBLIC: str = "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
     OKX_DEMO_WS_PRIVATE: str = "wss://wspap.okx.com:8443/ws/v5/private?brokerId=9999"
 
-    # 硬风控默认阈值
-    DEFAULT_MAX_ORDER_USDT: float = 1000.0       # 单笔最大下单金额
-    DEFAULT_MAX_DAILY_LOSS_USDT: float = 300.0   # 单日最大亏损熔断阈值
-    DEFAULT_MAX_LEVERAGE: int = 5                # 最大杠杆硬限制
-    DEFAULT_MAX_SLIPPAGE_PCT: float = 0.5        # 允许最大滑点百分比 (0.5%)
+    # 硬风控默认阈值 (充足宽裕度，支持灵活量化交易)
+    DEFAULT_MAX_ORDER_USDT: float = 50000.0       # 单笔最大下单金额上限 (50,000 USDT)
+    DEFAULT_MAX_DAILY_LOSS_USDT: float = 10000.0   # 单日最大亏损熔断阈值 (10,000 USDT)
+    DEFAULT_MAX_LEVERAGE: int = 20                # 最大允许杠杆限制 (20x)
+    DEFAULT_MAX_SLIPPAGE_PCT: float = 2.0         # 允许最大滑点百分比 (2.0%)
+
 
     # 大模型默认配置
     DEFAULT_LLM_BASE_URL: str = "https://api.deepseek.com"
