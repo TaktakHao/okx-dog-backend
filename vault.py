@@ -49,9 +49,87 @@ class CredentialsVault:
         )
         return kdf.derive(self.master_password)
 
+    def encrypt_credentials(self, api_key: str, secret_key: str, passphrase: str) -> Dict[str, str]:
+        """
+        原子加密完整 OKX API 凭证三件套 (API Key, Secret Key, Passphrase)
+        - 共享 1 个随机派生盐 (16 字节)
+        - 采用基于主 Nonce 的确定性子 Nonce 派生，既杜绝 GCM Nonce 重用，又能通过单个 salt/nonce 完整持久化并精准解密
+        """
+        if not api_key or not secret_key or not passphrase:
+            raise ValueError("API Key / Secret Key / Passphrase 均不能为空")
+
+        salt = os.urandom(16)
+        key = self._derive_key(salt)
+        aesgcm = AESGCM(key)
+
+        import hashlib
+        nonce = os.urandom(12)
+        nonce_sec = hashlib.sha256(nonce + b":secret_key").digest()[:12]
+        nonce_pass = hashlib.sha256(nonce + b":passphrase").digest()[:12]
+
+        enc_key = aesgcm.encrypt(nonce, api_key.encode("utf-8"), None)
+        enc_sec = aesgcm.encrypt(nonce_sec, secret_key.encode("utf-8"), None)
+        enc_pass = aesgcm.encrypt(nonce_pass, passphrase.encode("utf-8"), None)
+
+        return {
+            "encrypted_api_key": base64.b64encode(enc_key).decode("utf-8"),
+            "encrypted_secret_key": base64.b64encode(enc_sec).decode("utf-8"),
+            "encrypted_passphrase": base64.b64encode(enc_pass).decode("utf-8"),
+            "salt": base64.b64encode(salt).decode("utf-8"),
+            "nonce": base64.b64encode(nonce).decode("utf-8"),
+        }
+
+    def decrypt_credentials(
+        self,
+        encrypted_api_key: str,
+        encrypted_secret_key: str,
+        encrypted_passphrase: str,
+        salt_b64: str,
+        nonce_b64: str
+    ) -> Tuple[str, str, str]:
+        """
+        解密 OKX API 凭证三件套
+        :return: (api_key, secret_key, passphrase)
+        """
+        try:
+            salt = base64.b64decode(salt_b64)
+            nonce = base64.b64decode(nonce_b64)
+            key = self._derive_key(salt)
+            aesgcm = AESGCM(key)
+
+            import hashlib
+            nonce_sec = hashlib.sha256(nonce + b":secret_key").digest()[:12]
+            nonce_pass = hashlib.sha256(nonce + b":passphrase").digest()[:12]
+
+            raw_k = base64.b64decode(encrypted_api_key)
+            raw_s = base64.b64decode(encrypted_secret_key)
+            raw_p = base64.b64decode(encrypted_passphrase)
+
+            # 方式 1: 派生 Nonce 解密
+            try:
+                dec_k = aesgcm.decrypt(nonce, raw_k, None).decode("utf-8")
+                dec_s = aesgcm.decrypt(nonce_sec, raw_s, None).decode("utf-8")
+                dec_p = aesgcm.decrypt(nonce_pass, raw_p, None).decode("utf-8")
+                return dec_k, dec_s, dec_p
+            except Exception:
+                pass
+
+            # 方式 2: 同 Nonce 解密兼容
+            try:
+                dec_k = aesgcm.decrypt(nonce, raw_k, None).decode("utf-8")
+                dec_s = aesgcm.decrypt(nonce, raw_s, None).decode("utf-8")
+                dec_p = aesgcm.decrypt(nonce, raw_p, None).decode("utf-8")
+                return dec_k, dec_s, dec_p
+            except Exception:
+                pass
+
+            raise SecurityException("主保护密码错误或凭证数据已被篡改")
+        except Exception as e:
+            raise SecurityException(f"凭证解密失败: {str(e)}")
+
     def encrypt_secret(self, plaintext: str) -> Dict[str, str]:
         """
-        加密明文敏感字段
+        加密单个明文敏感字段 (如 LLM API Key)
         :param plaintext: 待加密字符串
         :return: 包含密文、salt、nonce 的字典 (均为 Base64 编码)
         """
@@ -76,7 +154,7 @@ class CredentialsVault:
 
     def decrypt_secret(self, ciphertext_b64: str, salt_b64: str, nonce_b64: str) -> str:
         """
-        解密敏感字段
+        解密单个敏感字段
         :param ciphertext_b64: Base64 编码的密文
         :param salt_b64: Base64 编码的派生盐
         :param nonce_b64: Base64 编码的 Nonce
@@ -94,6 +172,7 @@ class CredentialsVault:
             return decrypted_bytes.decode("utf-8")
         except Exception as e:
             raise SecurityException(f"密盒凭证解密失败，主密码错误或密文已被篡改: {str(e)}")
+
 
     @staticmethod
     def mask_api_key(api_key: str) -> str:

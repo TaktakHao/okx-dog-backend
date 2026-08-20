@@ -55,11 +55,24 @@ async def test_vault_security():
     raw_secret = "SECRET_KEY_1234567890_HEX_VALUE"
     raw_passphrase = "MySecretPassphrase2026"
 
-    # 加密与解密
+    # 加密与解密单字段
     enc = vault.encrypt_secret(raw_api_key)
     dec = vault.decrypt_secret(enc["ciphertext"], enc["salt"], enc["nonce"])
     assert dec == raw_api_key, f"解密结果不匹配: {dec} != {raw_api_key}"
-    print("  [OK] AES-256-GCM 凭证加密与解密一致性验证通过")
+    print("  [OK] AES-256-GCM 凭证单字段加密与解密一致性验证通过")
+
+    # 加密与解密 OKX 凭证三件套 (原子共享 Salt/Nonce 与独立子 Nonce)
+    enc_bundle = vault.encrypt_credentials(raw_api_key, raw_secret, raw_passphrase)
+    dec_k, dec_s, dec_p = vault.decrypt_credentials(
+        enc_bundle["encrypted_api_key"],
+        enc_bundle["encrypted_secret_key"],
+        enc_bundle["encrypted_passphrase"],
+        enc_bundle["salt"],
+        enc_bundle["nonce"]
+    )
+    assert dec_k == raw_api_key and dec_s == raw_secret and dec_p == raw_passphrase
+    print("  [OK] AES-256-GCM OKX 凭证三件套原子加密与解密一致性验证通过")
+
 
     # 脱敏掩码
     masked = vault.mask_api_key(raw_api_key)

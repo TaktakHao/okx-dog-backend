@@ -186,16 +186,21 @@ async def lifespan(app: FastAPI):
             cred = res.mappings().first()
             if cred:
                 try:
-                    dec_key = vault.decrypt_secret(cred["encrypted_api_key"], cred["salt"], cred["nonce"])
-                    dec_sec = vault.decrypt_secret(cred["encrypted_secret_key"], cred["salt"], cred["nonce"])
-                    dec_pass = vault.decrypt_secret(cred["encrypted_passphrase"], cred["salt"], cred["nonce"])
+                    dec_key, dec_sec, dec_pass = vault.decrypt_credentials(
+                        cred["encrypted_api_key"],
+                        cred["encrypted_secret_key"],
+                        cred["encrypted_passphrase"],
+                        cred["salt"],
+                        cred["nonce"]
+                    )
                     is_live = bool(cred["is_live_mode"])
 
                     rest_client.update_credentials(dec_key, dec_sec, dec_pass, is_live)
                     ws_manager.update_credentials(dec_key, dec_sec, dec_pass)
                     logger.info(f"成功从本地密盒恢复 OKX 凭证 (实盘={is_live}, 脱敏Key={cred['api_key_masked']})")
                 except Exception as dec_err:
-                    logger.warning(f"自动解密本地凭证失败 (可能使用了不同的主密码): {dec_err}")
+                    logger.warning(f"自动解密本地凭证失败 (可能使用了自定义主密码，切换实盘时请输入主密码): {dec_err}")
+
 
         # 启动 WebSocket 管理器
         await ws_manager.start()
@@ -490,11 +495,9 @@ async def save_credentials(
     # 触发提现权限强拦截
     vault.verify_permissions(mock_permissions)
 
-    # 2. 加密敏感字段
+    # 2. 加密敏感字段 (采用派生子 Nonce 保证原子一致性与 GCM 安全性)
     custom_vault = vault if not req.master_password else vault.__class__(master_password=req.master_password)
-    enc_key = custom_vault.encrypt_secret(req.api_key)
-    enc_sec = custom_vault.encrypt_secret(req.secret_key)
-    enc_pass = custom_vault.encrypt_secret(req.passphrase)
+    enc_bundle = custom_vault.encrypt_credentials(req.api_key, req.secret_key, req.passphrase)
 
     masked_key = vault.mask_api_key(req.api_key)
     is_live_val = 1 if req.is_live_mode else 0
@@ -521,14 +524,15 @@ async def save_credentials(
 
     await db.execute(sql, {
         "is_live": is_live_val,
-        "enc_key": enc_key["ciphertext"],
-        "enc_sec": enc_sec["ciphertext"],
-        "enc_pass": enc_pass["ciphertext"],
+        "enc_key": enc_bundle["encrypted_api_key"],
+        "enc_sec": enc_bundle["encrypted_secret_key"],
+        "enc_pass": enc_bundle["encrypted_passphrase"],
         "masked_key": masked_key,
-        "salt": enc_key["salt"],
-        "nonce": enc_key["nonce"]
+        "salt": enc_bundle["salt"],
+        "nonce": enc_bundle["nonce"]
     })
     await db.commit()
+
 
     # 4. 热更新内存中 REST 与 WebSocket 客户端凭证
     rest_client.update_credentials(req.api_key, req.secret_key, req.passphrase, req.is_live_mode)
@@ -631,11 +635,16 @@ async def test_connection(
         # 解密
         custom_vault = vault if not req.master_password else vault.__class__(master_password=req.master_password)
         try:
-            dec_key = custom_vault.decrypt_secret(row["encrypted_api_key"], row["salt"], row["nonce"])
-            dec_sec = custom_vault.decrypt_secret(row["encrypted_secret_key"], row["salt"], row["nonce"])
-            dec_pass = custom_vault.decrypt_secret(row["encrypted_passphrase"], row["salt"], row["nonce"])
+            dec_key, dec_sec, dec_pass = custom_vault.decrypt_credentials(
+                row["encrypted_api_key"],
+                row["encrypted_secret_key"],
+                row["encrypted_passphrase"],
+                row["salt"],
+                row["nonce"]
+            )
         except Exception as e:
             return ApiResponse(
+
                 code=2002,
                 msg=f"主密码校验失败或凭证解密异常: {e}",
                 data=TestConnectionResponse(
@@ -2262,9 +2271,13 @@ async def switch_system_mode(
                     continue
                 try:
                     c_vault = vault if pwd == "OKXDog_Master_2026" else vault.__class__(master_password=pwd)
-                    dec_key = c_vault.decrypt_secret(row["encrypted_api_key"], row["salt"], row["nonce"])
-                    dec_sec = c_vault.decrypt_secret(row["encrypted_secret_key"], row["salt"], row["nonce"])
-                    dec_pass = c_vault.decrypt_secret(row["encrypted_passphrase"], row["salt"], row["nonce"])
+                    dec_key, dec_sec, dec_pass = c_vault.decrypt_credentials(
+                        row["encrypted_api_key"],
+                        row["encrypted_secret_key"],
+                        row["encrypted_passphrase"],
+                        row["salt"],
+                        row["nonce"]
+                    )
                     dec_success = True
                     break
                 except Exception:
@@ -2272,6 +2285,7 @@ async def switch_system_mode(
 
             if not dec_success:
                 raise HTTPException(status_code=400, detail="解密实盘凭证失败，主保护密码不正确！")
+
 
             rest_client.update_credentials(dec_key, dec_sec, dec_pass, is_live_mode=True)
             ws_manager.update_credentials(dec_key, dec_sec, dec_pass)
