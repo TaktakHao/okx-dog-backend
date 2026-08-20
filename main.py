@@ -2046,17 +2046,20 @@ async def get_orders_list(
 
     try:
         okx_orders = await rest_client.get_orders(symbol=symbol)
-        return ApiResponse(code=0, msg="success", data=okx_orders, timestamp=now_ms)
+        return ApiResponse(code=0, msg="【真实实盘】订单列表", data=okx_orders, timestamp=now_ms)
     except Exception as e:
         logger.warning(f"获取实盘订单列表异常: {e}")
-        return ApiResponse(code=0, msg=str(e), data=paper_engine.get_orders(), timestamp=now_ms)
+        return ApiResponse(code=0, msg=f"获取实盘订单列表异常: {e}", data=[], timestamp=now_ms)
 
 
 @app.get("/api/v1/trade/history", response_model=ApiResponse[List[Dict[str, Any]]], summary="查询历史平仓成交明细")
 async def get_trade_history():
     """获取历史已平仓交易记录 (统计胜率、盈亏与平仓原因)"""
     now_ms = int(time.time() * 1000)
-    return ApiResponse(code=0, msg="success", data=paper_engine.closed_trades, timestamp=now_ms)
+    is_live = rest_client.is_live_mode and bool(rest_client.api_key)
+    if not is_live:
+        return ApiResponse(code=0, msg="【模拟操盘】历史平仓记录", data=paper_engine.closed_trades, timestamp=now_ms)
+    return ApiResponse(code=0, msg="【真实实盘】历史平仓记录", data=[], timestamp=now_ms)
 
 
 @app.get("/api/v1/trade/positions", response_model=ApiResponse[List[PositionModel]], summary="查询当前持仓列表")
@@ -2070,12 +2073,14 @@ async def get_positions_list():
     try:
         # 全量拉取 SWAP 永续合约、MARGIN 杠杆持仓以及 SPOT 现货持有资产
         positions = await rest_client.get_positions(inst_type=None, include_spot=True)
+        ws_manager.latest_positions.clear()
         for p in positions:
             ws_manager.latest_positions[f"{p.symbol}:{p.pos_side}"] = p
-        return ApiResponse(code=0, msg="success", data=positions, timestamp=now_ms)
+        return ApiResponse(code=0, msg="【真实实盘】持仓列表", data=positions, timestamp=now_ms)
     except Exception as e:
         logger.warning(f"获取实盘持仓异常: {e}")
-        return ApiResponse(code=0, msg=str(e), data=paper_engine.get_positions(), timestamp=now_ms)
+        return ApiResponse(code=0, msg=f"获取实盘持仓异常: {e}", data=[], timestamp=now_ms)
+
 
 
 
@@ -2164,10 +2169,24 @@ async def get_account_balance():
 
     try:
         bal = await rest_client.get_account_balance()
-        return ApiResponse(code=0, msg="success", data=bal, timestamp=now_ms)
+        return ApiResponse(code=0, msg="【真实实盘】资产全景", data=bal, timestamp=now_ms)
     except Exception as e:
         logger.warning(f"获取实盘资产异常: {e}")
-        return ApiResponse(code=0, msg=str(e), data=paper_engine.get_account_balance(), timestamp=now_ms)
+        empty_bal = AccountBalanceModel(
+            total_equity_usdt=0.0,
+            available_margin_usdt=0.0,
+            used_margin_usdt=0.0,
+            frozen_balance_usdt=0.0,
+            unrealized_pnl_usdt=0.0,
+            today_realized_pnl_usdt=0.0,
+            today_pnl_ratio=0.0,
+            margin_ratio=10.0,
+            is_warning_margin=False,
+            timestamp=now_ms,
+            updated_at=now_ms
+        )
+        return ApiResponse(code=0, msg=f"获取实盘资产异常: {e}", data=empty_bal, timestamp=now_ms)
+
 
 
 # =============================================================================
@@ -2260,11 +2279,14 @@ async def switch_system_mode(
             rest_client.is_live_mode = True
 
         ws_manager.set_live_mode(True)
+        ws_manager.latest_positions.clear()
 
         # 尝试拉取实盘真实资产与持仓并广播给前端
         try:
             live_bal = await rest_client.get_account_balance()
             live_pos = await rest_client.get_positions(inst_type=None, include_spot=True)
+            for p in live_pos:
+                ws_manager.latest_positions[f"{p.symbol}:{p.pos_side}"] = p
             await ws_manager.broadcast_to_subscribers(WSPushPayload[AccountBalanceModel](
                 channel="account",
                 event=WSServerEvent.UPDATE,
@@ -2279,10 +2301,20 @@ async def switch_system_mode(
             ))
         except Exception as sync_err:
             logger.warning(f"切换实盘后同步真实资产异常: {sync_err}")
+            await ws_manager.broadcast_to_subscribers(WSPushPayload[List[PositionModel]](
+                channel="positions",
+                event=WSServerEvent.SNAPSHOT,
+                data=[],
+                timestamp=now_ms
+            ))
     else:
         # 切换至模拟沙盒
         rest_client.is_live_mode = False
         ws_manager.set_live_mode(False)
+        ws_manager.latest_positions.clear()
+        paper_pos = paper_engine.get_positions()
+        for p in paper_pos:
+            ws_manager.latest_positions[f"{p.symbol}:{p.pos_side}"] = p
         await ws_manager.broadcast_to_subscribers(WSPushPayload[AccountBalanceModel](
             channel="account",
             event=WSServerEvent.UPDATE,
@@ -2292,9 +2324,10 @@ async def switch_system_mode(
         await ws_manager.broadcast_to_subscribers(WSPushPayload[List[PositionModel]](
             channel="positions",
             event=WSServerEvent.SNAPSHOT,
-            data=paper_engine.get_positions(),
+            data=paper_pos,
             timestamp=now_ms
         ))
+
 
     mode_name = "【真实实盘】" if req.target_live_mode else "【模拟操盘沙盒】"
     logger.info(f"系统运行模式已切换为: {mode_name}")
