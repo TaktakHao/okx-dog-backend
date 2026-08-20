@@ -1971,30 +1971,49 @@ async def adopt_ai_trade_plan(
         if raw_sl > entry_px:
             valid_sl = raw_sl
 
-    # 动态科学仓位推算 (若未指定名义价值，按账户 2% 风险预算与止损距离自适应计算)
-    max_cap = risk_controller.rules.max_order_usdt if (risk_controller and risk_controller.rules) else 50000.0
-    notional_to_use = req.notional_usdt
-    if not notional_to_use or notional_to_use <= 0:
-        bal_equity = paper_engine.get_account_balance().total_equity_usdt
-        risk_budget = bal_equity * 0.02
-
-        stop_dist = abs(entry_px - valid_sl) if valid_sl else entry_px * 0.015
-        calc_coins = risk_budget / max(stop_dist, entry_px * 0.005)
-        raw_notional = calc_coins * entry_px
-        notional_to_use = min(raw_notional, max_cap * 0.95) # 预留 5% 安全边际
+    # 动态科学仓位推算 (严格基于实盘/模拟当前剩余可用资金与杠杆自适应计算)
+    is_live = rest_client.is_live_mode and bool(rest_client.api_key)
+    if is_live:
+        try:
+            live_bal = await rest_client.get_account_balance()
+            avail_margin = live_bal.available_margin_usdt if live_bal.available_margin_usdt > 0 else live_bal.total_equity_usdt
+            total_equity = live_bal.total_equity_usdt
+        except Exception as e:
+            logger.warning(f"获取实盘可用资产异常，使用安全兜底: {e}")
+            avail_margin = 100.0
+            total_equity = 100.0
     else:
-        # 若传入的名义价值高于风控上限，自动裁切至安全上限以内，避免误拦截
-        if notional_to_use > max_cap:
-            notional_to_use = max_cap * 0.95
-
-    import math
-    sz_val = max(0.001, math.floor((notional_to_use / entry_px) * 10000) / 10000.0) if entry_px > 0 else 0.01
-    # 终验：保证 sz_val * entry_px 严格在 max_cap 内部
-    if sz_val * entry_px > max_cap:
-        sz_val = max(0.001, math.floor((max_cap * 0.95 / entry_px) * 10000) / 10000.0)
+        paper_bal = paper_engine.get_account_balance()
+        avail_margin = paper_bal.available_margin_usdt if paper_bal.available_margin_usdt > 0 else paper_bal.total_equity_usdt
+        total_equity = paper_bal.total_equity_usdt
 
     max_lev = risk_controller.rules.max_leverage if (risk_controller and risk_controller.rules) else 20
     lev_to_use = min(req.leverage or req.suggested_leverage or 3, max_lev)
+
+    # 基于当前可用资金允许的最大名义开仓上限 (预留 5% 缓冲防止极端行情保证金不足)
+    max_affordable_notional = max(10.0, avail_margin * lev_to_use * 0.95)
+    max_cap = min(
+        risk_controller.rules.max_order_usdt if (risk_controller and risk_controller.rules) else 50000.0,
+        max_affordable_notional
+    )
+
+    notional_to_use = req.notional_usdt
+    if not notional_to_use or notional_to_use <= 0:
+        # 单笔 2% 风险预算 (基于可用资金与总权益中较小者进行保守风险核算)
+        risk_budget = max(5.0, min(total_equity, avail_margin) * 0.02)
+        stop_dist = abs(entry_px - valid_sl) if valid_sl else entry_px * 0.015
+        calc_coins = risk_budget / max(stop_dist, entry_px * 0.005)
+        raw_notional = calc_coins * entry_px
+        notional_to_use = min(raw_notional, max_cap)
+    else:
+        # 若传入的名义价值高于当前实盘可用保证金上限或风控上限，自动裁切至安全上限以内
+        notional_to_use = min(notional_to_use, max_cap)
+
+    import math
+    sz_val = max(0.001, math.floor((notional_to_use / entry_px) * 10000) / 10000.0) if entry_px > 0 else 0.01
+    # 终验：保证 sz_val * entry_px 严格在安全上限以内
+    if sz_val * entry_px > max_cap:
+        sz_val = max(0.001, math.floor((max_cap / entry_px) * 10000) / 10000.0)
 
     is_mkt = req.order_type == OrderType.MARKET or (isinstance(req.order_type, str) and req.order_type.lower() == "market")
     order_req = PlaceOrderRequest(
@@ -2013,6 +2032,7 @@ async def adopt_ai_trade_plan(
     )
 
     return await place_trade_order(order_req, db)
+
 
 
 
