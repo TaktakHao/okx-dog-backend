@@ -2168,6 +2168,7 @@ async def close_position_endpoint(req: ClosePositionRequest):
     return ApiResponse(code=0, msg="平仓指令已提交 OKX", data=res, timestamp=now_ms)
 
 
+
 @app.get("/api/v1/trade/account/balance", response_model=ApiResponse[AccountBalanceModel], summary="获取账户资产全景")
 async def get_account_balance():
     """获取账户总权益、可用保证金、已用保证金及保证金率"""
@@ -2246,112 +2247,117 @@ async def switch_system_mode(
     """切换系统全局运行模式 (实盘 LIVE vs 模拟沙盒 DEMO)"""
     now_ms = int(time.time() * 1000)
 
-    if req.target_live_mode:
-        # 切换至实盘：从数据库中查询实盘凭证
-        res = await db.execute(
-            text("SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_live_mode = 1 AND is_valid = 1 LIMIT 1")
-        )
-        row = res.mappings().first()
-        if not row:
-            # 兼容读取任何已保存的 OKX 凭证
-            res_any = await db.execute(
-                text("SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_valid = 1 LIMIT 1")
+    try:
+        if req.target_live_mode:
+            # 切换至实盘：从数据库中查询实盘凭证
+            res = await db.execute(
+                text("SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_live_mode = 1 AND is_valid = 1 LIMIT 1")
             )
-            row = res_any.mappings().first()
+            row = res.mappings().first()
+            if not row:
+                # 兼容读取任何已保存的 OKX 凭证
+                res_any = await db.execute(
+                    text("SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_valid = 1 LIMIT 1")
+                )
+                row = res_any.mappings().first()
 
-        if not row and not rest_client.api_key:
-            raise HTTPException(status_code=400, detail="未找到已配置的 OKX 凭证，请先在右上角【安全与 API 配置】中配置并保存实盘 API Key！")
+            if not row and not rest_client.api_key:
+                raise HTTPException(status_code=400, detail="未找到已配置的 OKX 凭证，请先在右上角【安全与 API 配置】中配置并保存实盘 API Key！")
 
-        if row:
-            pwd_candidates = [req.master_password, "OKXDog_Master_2026"] if req.master_password else ["OKXDog_Master_2026"]
-            dec_success = False
-            dec_key, dec_sec, dec_pass = None, None, None
-            for pwd in pwd_candidates:
-                if not pwd:
-                    continue
-                try:
-                    c_vault = vault if pwd == "OKXDog_Master_2026" else vault.__class__(master_password=pwd)
-                    dec_key, dec_sec, dec_pass = c_vault.decrypt_credentials(
-                        row["encrypted_api_key"],
-                        row["encrypted_secret_key"],
-                        row["encrypted_passphrase"],
-                        row["salt"],
-                        row["nonce"]
-                    )
-                    dec_success = True
-                    break
-                except Exception:
-                    continue
+            if row:
+                pwd_candidates = [req.master_password, "OKXDog_Master_2026"] if req.master_password else ["OKXDog_Master_2026"]
+                dec_success = False
+                dec_key, dec_sec, dec_pass = None, None, None
+                for pwd in pwd_candidates:
+                    if not pwd:
+                        continue
+                    try:
+                        c_vault = vault if pwd == "OKXDog_Master_2026" else vault.__class__(master_password=pwd)
+                        dec_key, dec_sec, dec_pass = c_vault.decrypt_credentials(
+                            row["encrypted_api_key"],
+                            row["encrypted_secret_key"],
+                            row["encrypted_passphrase"],
+                            row["salt"],
+                            row["nonce"]
+                        )
+                        dec_success = True
+                        break
+                    except Exception:
+                        continue
 
-            if not dec_success:
-                raise HTTPException(status_code=400, detail="解密实盘凭证失败，主保护密码不正确！")
+                if not dec_success:
+                    raise HTTPException(status_code=400, detail="解密实盘凭证失败，主保护密码不正确！")
 
+                rest_client.update_credentials(dec_key, dec_sec, dec_pass, is_live_mode=True)
+                ws_manager.update_credentials(dec_key, dec_sec, dec_pass)
+            else:
+                rest_client.is_live_mode = True
 
-            rest_client.update_credentials(dec_key, dec_sec, dec_pass, is_live_mode=True)
-            ws_manager.update_credentials(dec_key, dec_sec, dec_pass)
+            ws_manager.set_live_mode(True)
+            ws_manager.latest_positions.clear()
+
+            # 尝试拉取实盘真实资产与持仓并广播给前端
+            try:
+                live_bal = await rest_client.get_account_balance()
+                live_pos = await rest_client.get_positions(inst_type=None, include_spot=True)
+                for p in live_pos:
+                    ws_manager.latest_positions[f"{p.symbol}:{p.pos_side}"] = p
+                await ws_manager.broadcast_to_subscribers(WSPushPayload[AccountBalanceModel](
+                    channel="account",
+                    event=WSServerEvent.UPDATE,
+                    data=live_bal,
+                    timestamp=now_ms
+                ))
+                await ws_manager.broadcast_to_subscribers(WSPushPayload[List[PositionModel]](
+                    channel="positions",
+                    event=WSServerEvent.SNAPSHOT,
+                    data=live_pos,
+                    timestamp=now_ms
+                ))
+            except Exception as sync_err:
+                logger.warning(f"切换实盘后同步真实资产异常: {sync_err}")
+                await ws_manager.broadcast_to_subscribers(WSPushPayload[List[PositionModel]](
+                    channel="positions",
+                    event=WSServerEvent.SNAPSHOT,
+                    data=[],
+                    timestamp=now_ms
+                ))
         else:
-            rest_client.is_live_mode = True
-
-        ws_manager.set_live_mode(True)
-        ws_manager.latest_positions.clear()
-
-        # 尝试拉取实盘真实资产与持仓并广播给前端
-        try:
-            live_bal = await rest_client.get_account_balance()
-            live_pos = await rest_client.get_positions(inst_type=None, include_spot=True)
-            for p in live_pos:
+            # 切换至模拟沙盒
+            rest_client.is_live_mode = False
+            ws_manager.set_live_mode(False)
+            ws_manager.latest_positions.clear()
+            paper_pos = paper_engine.get_positions()
+            for p in paper_pos:
                 ws_manager.latest_positions[f"{p.symbol}:{p.pos_side}"] = p
             await ws_manager.broadcast_to_subscribers(WSPushPayload[AccountBalanceModel](
                 channel="account",
                 event=WSServerEvent.UPDATE,
-                data=live_bal,
+                data=paper_engine.get_account_balance(),
                 timestamp=now_ms
             ))
             await ws_manager.broadcast_to_subscribers(WSPushPayload[List[PositionModel]](
                 channel="positions",
                 event=WSServerEvent.SNAPSHOT,
-                data=live_pos,
+                data=paper_pos,
                 timestamp=now_ms
             ))
-        except Exception as sync_err:
-            logger.warning(f"切换实盘后同步真实资产异常: {sync_err}")
-            await ws_manager.broadcast_to_subscribers(WSPushPayload[List[PositionModel]](
-                channel="positions",
-                event=WSServerEvent.SNAPSHOT,
-                data=[],
-                timestamp=now_ms
-            ))
-    else:
-        # 切换至模拟沙盒
-        rest_client.is_live_mode = False
-        ws_manager.set_live_mode(False)
-        ws_manager.latest_positions.clear()
-        paper_pos = paper_engine.get_positions()
-        for p in paper_pos:
-            ws_manager.latest_positions[f"{p.symbol}:{p.pos_side}"] = p
-        await ws_manager.broadcast_to_subscribers(WSPushPayload[AccountBalanceModel](
-            channel="account",
-            event=WSServerEvent.UPDATE,
-            data=paper_engine.get_account_balance(),
+
+        mode_name = "【真实实盘】" if req.target_live_mode else "【模拟操盘沙盒】"
+        logger.info(f"系统运行模式已切换为: {mode_name}")
+
+        return ApiResponse(
+            code=0,
+            msg=f"已成功切换为 {mode_name} 模式",
+            data={"is_live_mode": req.target_live_mode},
             timestamp=now_ms
-        ))
-        await ws_manager.broadcast_to_subscribers(WSPushPayload[List[PositionModel]](
-            channel="positions",
-            event=WSServerEvent.SNAPSHOT,
-            data=paper_pos,
-            timestamp=now_ms
-        ))
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"切换运行模式发生未知异常: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"切换模式失败: {str(e)}")
 
-
-    mode_name = "【真实实盘】" if req.target_live_mode else "【模拟操盘沙盒】"
-    logger.info(f"系统运行模式已切换为: {mode_name}")
-
-    return ApiResponse(
-        code=0,
-        msg=f"已成功切换为 {mode_name} 模式",
-        data={"is_live_mode": req.target_live_mode},
-        timestamp=now_ms
-    )
 
 
 

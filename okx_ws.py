@@ -461,11 +461,16 @@ class OKXWSManager:
         self._consumer_task: Optional[asyncio.Task] = None
         self._is_running = False
 
+    def set_live_mode(self, is_live_mode: bool):
+        """设置实盘/模拟运行模式"""
+        self.is_live_mode = is_live_mode
+
     def update_credentials(self, api_key: str, secret_key: str, passphrase: str):
         """更新私有连接凭证"""
         self.private_client.set_credentials(api_key, secret_key, passphrase)
 
     def register_broadcast_subscriber(self, q: asyncio.Queue):
+
         """注册一个前端 WebSocket 广播订阅队列"""
         self.broadcast_subscribers.add(q)
 
