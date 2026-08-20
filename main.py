@@ -1336,7 +1336,17 @@ async def fetch_full_market_context_snapshot(
                 enc_data = json.loads(cfg["encrypted_llm_api_key"])
                 llm_key = vault.decrypt_secret(enc_data["ciphertext"], enc_data["salt"], enc_data["nonce"])
             except Exception as e:
-                logger.warning(f"解密 LLM 密钥失败: {e}")
+                logger.warning(f"解密系统配置中保存的 LLM 密钥失败 (将尝试环境变量): {e}")
+
+    # 支持环境变量兜底
+    if not llm_key:
+        llm_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
+
+    if llm_key:
+        logger.info(f"已成功加载 LLM 密钥 (前缀: {llm_key[:6]}...), 目标大模型: {model_name}, 端点: {base_url}")
+    else:
+        logger.info(f"未配置 LLM API 密钥，将采用内置多阶段量化反思规则引擎")
+
 
     # 2. 提取最新实时 Ticker
     ticker_obj = ws_manager.get_ticker_snapshot(symbol)
@@ -1521,20 +1531,10 @@ async def trigger_ai_analysis(
         "max_tokens": max_tokens,
     }
 
-    # 2. 优先执行 LangGraph 资深量化交易员多阶段反思 Agent
-    if agent_mode == "agent":
+    # 2. 若配置了有效 LLM API Key，优先发起真实大模型全景深度推理 (DeepSeek-R1 / OpenAI / Claude)
+    if llm_key and llm_key.strip():
         try:
-            logger.info(f"启动 LangGraph 资深量化交易员 Agent 研判: symbol={symbol}, model={model_name}")
-            agent_runner = QuantTraderAgentRunner(default_llm_config=llm_cfg)
-            analysis_res = await agent_runner.run(snapshot, llm_config=llm_cfg)
-            logger.info(f"LangGraph Agent 研判成功: symbol={symbol}, action={analysis_res.signal.action}, 耗时={analysis_res.latency_ms}ms")
-        except Exception as e:
-            logger.warning(f"LangGraph Agent 执行异常，平滑降级: {e}")
-            analysis_res = None
-
-    # 3. 若为 fast 模式或 Agent 未成功，尝试单步大模型推理
-    if not analysis_res and llm_key and llm_key.strip():
-        try:
+            logger.info(f"正在向大模型 API ({base_url}) 发起全景深度交易研判: model={model_name}, symbol={symbol}")
             builder = MarketPromptBuilder()
             messages = builder.build_messages(snapshot, scenario="standard", max_tokens=max_tokens)
 
@@ -1544,7 +1544,7 @@ async def trigger_ai_analysis(
                 model=model_name,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                timeout_seconds=35.0,
+                timeout_seconds=45.0,
                 max_retries=1
             )
             content, thinking, latency_ms, actual_model = await llm_client.generate(messages)
@@ -1554,16 +1554,27 @@ async def trigger_ai_analysis(
                 analysis_res = RobustJSONParser.parse(
                     content,
                     symbol=symbol,
-                    model_used=actual_model,
+                    model_used=actual_model or model_name,
                     latency_ms=latency_ms,
                     preset_thinking=thinking
                 )
-                logger.info(f"单步大模型研判成功解析: symbol={symbol}, action={analysis_res.signal.action}, 耗时={latency_ms}ms")
+                logger.info(f"大模型 API ({actual_model or model_name}) 研判成功返回: action={analysis_res.signal.action}, 置信度={analysis_res.signal.confidence}, 耗时={latency_ms}ms")
         except Exception as e:
-            logger.warning(f"大模型调用或解析异常，平滑降级至高保真量化规则决策引擎: {e}")
+            logger.warning(f"大模型 API 调用或解析异常，平滑降级至 LangGraph 量化反思状态机: {e}")
             analysis_res = None
 
-    # 4. 若无 Key 或大模型调用异常，基于当前标的实时价格与多周期指标生成纯量化决策
+    # 3. 若未配置 LLM 或大模型调用异常，执行 LangGraph 资深量化交易员反思状态机
+    if not analysis_res and agent_mode == "agent":
+        try:
+            logger.info(f"启动 LangGraph 资深量化交易员多阶段反思 Agent: symbol={symbol}")
+            agent_runner = QuantTraderAgentRunner(default_llm_config=llm_cfg)
+            analysis_res = await agent_runner.run(snapshot, llm_config=llm_cfg)
+            logger.info(f"LangGraph Agent 研判成功: symbol={symbol}, action={analysis_res.signal.action}, 耗时={analysis_res.latency_ms}ms")
+        except Exception as e:
+            logger.warning(f"LangGraph Agent 执行异常，平滑降级至高保真规则引擎: {e}")
+            analysis_res = None
+
+    # 4. 极端兜底：纯量化规则决策引擎
     if not analysis_res or (analysis_res.signal.action == SignalAction.HOLD_WAIT and analysis_res.signal.confidence == 0):
         analysis_res = generate_quantitative_rule_decision(
             symbol=symbol,
@@ -1622,7 +1633,7 @@ async def trigger_ai_analysis_stream(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    通过 Server-Sent Events (SSE) 实时流式输出 LangGraph 各节点思考链与结构化决策结果
+    通过 Server-Sent Events (SSE) 实时流式输出大模型 / LangGraph 思考链与结构化决策结果
     """
     now_ms = int(time.time() * 1000)
 
@@ -1653,23 +1664,8 @@ async def trigger_ai_analysis_stream(
 
         analysis_res: Optional[AIAnalysisResponse] = None
 
-        # 优先使用 LangGraph QuantTraderAgentRunner 进行流式推送
-        if mode == "agent":
-            try:
-                agent_runner = QuantTraderAgentRunner(default_llm_config=llm_cfg)
-                async for chunk in agent_runner.run_stream(snapshot, llm_config=llm_cfg):
-                    if chunk.event == "think":
-                        yield f"event: think\ndata: {json.dumps({'delta': chunk.data})}\n\n"
-                    elif chunk.event == "done" and chunk.structured_output:
-                        analysis_res = chunk.structured_output
-                        res_data = analysis_res.model_dump() if hasattr(analysis_res, "model_dump") else analysis_res.dict()
-                        yield f"event: done\ndata: {json.dumps(res_data)}\n\n"
-                        return
-            except Exception as e:
-                logger.warning(f"LangGraph SSE 流式生成异常，切换到量化推演: {e}")
-                analysis_res = None
-
-        if not analysis_res and llm_key and llm_key.strip():
+        # 1. 优先使用真实大模型 SSE 流式推送
+        if llm_key and llm_key.strip():
             try:
                 builder = MarketPromptBuilder()
                 messages = builder.build_messages(snapshot, scenario="standard", max_tokens=max_tokens)
@@ -1680,7 +1676,7 @@ async def trigger_ai_analysis_stream(
                     model=model_name,
                     temperature=temperature,
                     max_tokens=max_tokens,
-                    timeout_seconds=40.0
+                    timeout_seconds=45.0
                 )
 
                 async for event in llm_client.generate_stream(messages):
@@ -1701,10 +1697,26 @@ async def trigger_ai_analysis_stream(
                         )
                 await llm_client.close()
             except Exception as e:
-                logger.warning(f"流式 LLM 生成异常，切换到高保真量化流推演: {e}")
+                logger.warning(f"流式 LLM 生成异常，切换到 LangGraph / 量化流推演: {e}")
                 analysis_res = None
 
-        # 若仍无结果，通过量化决策推演
+        # 2. 若未配置 LLM 或 LLM 异常，通过 LangGraph QuantTraderAgentRunner 进行流式推送
+        if not analysis_res and mode == "agent":
+            try:
+                agent_runner = QuantTraderAgentRunner(default_llm_config=llm_cfg)
+                async for chunk in agent_runner.run_stream(snapshot, llm_config=llm_cfg):
+                    if chunk.event == "think":
+                        yield f"event: think\ndata: {json.dumps({'delta': chunk.data})}\n\n"
+                    elif chunk.event == "done" and chunk.structured_output:
+                        analysis_res = chunk.structured_output
+                        res_data = analysis_res.model_dump() if hasattr(analysis_res, "model_dump") else analysis_res.dict()
+                        yield f"event: done\ndata: {json.dumps(res_data)}\n\n"
+                        return
+            except Exception as e:
+                logger.warning(f"LangGraph SSE 流式生成异常，切换到量化推演: {e}")
+                analysis_res = None
+
+        # 3. 兜底量化推演
         if not analysis_res:
             analysis_res = generate_quantitative_rule_decision(
                 symbol=symbol,
@@ -1723,6 +1735,7 @@ async def trigger_ai_analysis_stream(
                     await asyncio.sleep(0.02)
 
         # 发送完成事件并附带结构化结果
+
         res_data = analysis_res.model_dump() if hasattr(analysis_res, "model_dump") else analysis_res.dict()
         yield f"event: done\ndata: {json.dumps(res_data)}\n\n"
 
