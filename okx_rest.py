@@ -476,40 +476,71 @@ class OKXRestClient:
             )
 
         item = data[0]
-        total_eq = float(item.get("totalEq", 0.0))
-        adj_eq = float(item.get("adjEq", 0.0))
+        total_eq = float(item.get("totalEq", 0.0) or 0.0)
+        adj_eq = float(item.get("adjEq", 0.0) or 0.0)
         mgn_ratio_str = item.get("mgnRatio", "")
         mgn_ratio = float(mgn_ratio_str) if mgn_ratio_str else 999.0
 
         details = item.get("details", [])
-        avail_margin = float(item.get("availMgn", 0.0)) if item.get("availMgn") else 0.0
-        used_margin = float(item.get("imr", 0.0)) if item.get("imr") else 0.0
-        frozen_bal = float(item.get("ordFzn", 0.0)) if item.get("ordFzn") else 0.0
-        upl = float(item.get("upl", 0.0)) if item.get("upl") else 0.0
+        avail_margin = float(item.get("availMgn", 0.0) or 0.0) if item.get("availMgn") else 0.0
+        used_margin = float(item.get("imr", 0.0) or 0.0) if item.get("imr") else 0.0
+        frozen_bal = float(item.get("ordFzn", 0.0) or 0.0) if item.get("ordFzn") else 0.0
+        upl = float(item.get("upl", 0.0) or 0.0) if item.get("upl") else 0.0
 
-        # 如果主字段为空，从 USDT 资产细节汇总
-        if avail_margin == 0.0 and details:
+        # 从各币种资产细节汇总 (防止 simple 模式或非跨币种全仓模式下 totalEq 为空)
+        if details:
+            details_eq_sum = 0.0
+            details_avail_sum = 0.0
+            details_upl_sum = 0.0
+            details_frozen_sum = 0.0
             for d in details:
+                eq_usd = float(d.get("eqUsd", 0.0) or 0.0)
+                eq_native = float(d.get("eq", d.get("cashBal", 0.0)) or 0.0)
+                details_eq_sum += eq_usd if eq_usd > 0 else (eq_native if d.get("ccy") == "USDT" else 0.0)
+                details_upl_sum += float(d.get("upl", 0.0) or 0.0)
+                details_frozen_sum += float(d.get("ordFrozen", d.get("frozenBal", 0.0)) or 0.0)
                 if d.get("ccy") == "USDT":
-                    avail_margin = float(d.get("availMgn", d.get("availBal", 0.0)))
-                    used_margin = float(d.get("imr", 0.0))
-                    frozen_bal = float(d.get("ordFzn", 0.0))
-                    upl = float(d.get("upl", 0.0))
-                    break
+                    avail_val = float(d.get("availMgn", d.get("availBal", d.get("cashBal", 0.0))) or 0.0)
+                    details_avail_sum += avail_val
+
+            if total_eq <= 0.0 and details_eq_sum > 0.0:
+                total_eq = details_eq_sum
+            if avail_margin <= 0.0 and details_avail_sum > 0.0:
+                avail_margin = details_avail_sum
+            if upl == 0.0 and details_upl_sum != 0.0:
+                upl = details_upl_sum
+            if frozen_bal <= 0.0 and details_frozen_sum > 0.0:
+                frozen_bal = details_frozen_sum
+
+        # 计算今日已实现盈亏与收益率 (从 OKX bills 账单流水中汇总当日平仓及资金费盈亏)
+        today_realized_pnl = 0.0
+        try:
+            today_start_dt = datetime.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            today_start_ms = int(today_start_dt.timestamp() * 1000)
+            bills_data = await self._request("GET", "/api/v5/account/bills", params={"begin": str(today_start_ms), "limit": "100"})
+            if bills_data:
+                for b in bills_data:
+                    today_realized_pnl += float(b.get("pnl", 0.0) or 0.0)
+        except Exception as bill_err:
+            logger.debug(f"拉取今日账单流水盈亏异常 (非阻塞): {bill_err}")
+
+        today_combined_pnl = today_realized_pnl + upl
+        today_pnl_ratio = today_combined_pnl / max(100.0, total_eq) if total_eq > 0 else 0.0
 
         return AccountBalanceModel(
-            total_equity_usdt=total_eq,
+            total_equity_usdt=round(total_eq, 4),
             total_equity_btc=0.0,
-            available_margin_usdt=avail_margin,
-            used_margin_usdt=used_margin,
-            frozen_balance_usdt=frozen_bal,
-            unrealized_pnl_usdt=upl,
-            today_realized_pnl_usdt=0.0,
-            today_pnl_ratio=0.0,
+            available_margin_usdt=round(avail_margin, 4),
+            used_margin_usdt=round(used_margin, 4),
+            frozen_balance_usdt=round(frozen_bal, 4),
+            unrealized_pnl_usdt=round(upl, 4),
+            today_realized_pnl_usdt=round(today_realized_pnl, 4),
+            today_pnl_ratio=round(today_pnl_ratio, 4),
             margin_ratio=mgn_ratio,
             is_warning_margin=mgn_ratio < 1.5 and mgn_ratio > 0,
             timestamp=now_ms
         )
+
 
     def set_credentials(self, api_key: str, secret_key: str, passphrase: str, is_live_mode: Optional[bool] = None):
         """设置凭证信息 (update_credentials 别名)"""
