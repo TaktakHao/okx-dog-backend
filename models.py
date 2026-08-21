@@ -157,6 +157,7 @@ class TradePlanOrderType(str, Enum):
 
 class LLMProvider(str, Enum):
     """支持的大模型服务商"""
+    ANTIGRAVITY = "antigravity"
     DEEPSEEK = "deepseek"
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
@@ -300,10 +301,10 @@ class LLMConfigRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     master_password: str = Field(..., description="主密码 (用于加密保存 LLM API Key)")
-    llm_provider: LLMProvider = Field(LLMProvider.DEEPSEEK, description="大模型服务提供商")
-    llm_base_url: str = Field("https://api.deepseek.com", description="OpenAI 兼容的基础 API URL")
-    llm_api_key: Optional[str] = Field(None, description="大模型 API Key (若不修改则传 null)")
-    llm_model: str = Field("deepseek-reasoner", description="模型名称 (如 deepseek-reasoner, deepseek-chat, gpt-4o)")
+    llm_provider: LLMProvider = Field(LLMProvider.ANTIGRAVITY, description="大模型服务提供商")
+    llm_base_url: str = Field("http://127.0.0.1:8001", description="OpenAI 兼容的基础 API URL 或本地服务地址")
+    llm_api_key: Optional[str] = Field(None, description="大模型 API Key (若使用 Antigravity 本地免 Key 驱动可传空)")
+    llm_model: str = Field("gemini-3.7-flash", description="模型名称 (如 gemini-3.7-flash, deepseek-reasoner, gpt-4o)")
     llm_temperature: float = Field(0.2, ge=0.0, le=2.0, description="采样温度")
     llm_max_tokens: int = Field(4096, ge=512, le=16384, description="最大生成 Token 数量")
 
@@ -1230,4 +1231,430 @@ class SwitchModeRequest(BaseModel):
     """切换实盘 / 模拟操盘模式请求"""
     target_live_mode: bool = Field(..., description="目标模式: True 实盘, False 模拟沙盒")
     master_password: Optional[str] = Field(None, description="切换至实盘模式时需提供主密码进行凭证解密探测")
+
+
+# =============================================================================
+# 12. 开启自动操盘后的全景盈利与状态模型 (Auto-Pilot Session & Profit Tracking)
+# =============================================================================
+
+class AutoPilotStatusModel(BaseModel):
+    """自动量化操盘实时状态与收益统计模型 (100% 契约对齐)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    is_running: bool = Field(False, description="当前是否处于自动操盘开启状态")
+    session_id: Optional[str] = Field(None, description="当前自动操盘会话唯一ID")
+    start_time: Optional[int] = Field(None, description="自动操盘开启时间戳 (ms)")
+    running_seconds: int = Field(0, description="开启以来的累计运行时长 (秒)")
+    start_equity_usdt: float = Field(10000.0, description="开启时的基准账户总权益 (USDT)")
+    current_equity_usdt: float = Field(10000.0, description="当前账户总权益 (USDT)")
+    total_pnl_usdt: float = Field(0.0, description="开启以来综合总盈亏 (USDT = 当前权益 - 开启基准权益)")
+    total_pnl_ratio: float = Field(0.0, description="开启以来综合收益率 (例如 0.052 表示 +5.2%)")
+    realized_pnl_usdt: float = Field(0.0, description="开启以来累计已实现盈亏 (USDT)")
+    unrealized_pnl_usdt: float = Field(0.0, description="当前持仓未实现浮动盈亏 (USDT)")
+    total_trades_count: int = Field(0, description="开启以来自动交易总笔数")
+    winning_trades_count: int = Field(0, description="盈利单数")
+    losing_trades_count: int = Field(0, description="亏损单数")
+    win_rate: float = Field(0.0, description="开启以来胜率 (0.0 ~ 1.0)")
+    profit_factor: float = Field(0.0, description="收益因子 / 盈亏比")
+    max_drawdown_pct: float = Field(0.0, description="开启以来最大回撤百分比")
+    active_symbol: str = Field("BTC-USDT-SWAP", description="当前主要关注标的")
+    symbols: List[str] = Field(default_factory=lambda: ["XAU-USDT-SWAP", "NVDA-USDT-SWAP", "TSLA-USDT-SWAP", "ONDO-USDT-SWAP", "BTC-USDT-SWAP", "ETH-USDT-SWAP"], description="多标的自动监控轮巡池")
+    max_concurrent_positions: int = Field(3, description="最大同时持仓标的数 (防过度分散)")
+    trailing_stop_enabled: bool = Field(True, description="是否启用动态移动保本与跟踪止损")
+    breakeven_trigger_ratio: float = Field(0.5, description="浮盈达到目标位比例时移至保本")
+    min_confidence: float = Field(0.70, description="自动跟单最低置信度门槛")
+    auto_leverage_enabled: bool = Field(True, description="是否启用自适应智能杠杆")
+    is_live_mode: bool = Field(False, description="是否为实盘环境")
+    last_patrol_time: Optional[int] = Field(None, description="最近一次后端自动巡检时间戳 (ms)")
+    last_patrol_log: Optional[str] = Field(None, description="最近一次后端自动巡检结果概要")
+    last_updated_at: int = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="最新统计更新时间戳 (ms)")
+
+
+class AutoPilotHistoryPoint(BaseModel):
+    """自动操盘时序收益曲线采样点"""
+    timestamp: int = Field(..., description="采样时间戳 (ms)")
+    equity: float = Field(..., description="该时刻账户总权益 (USDT)")
+    realized_pnl: float = Field(0.0, description="该时刻累计已实现盈亏 (USDT)")
+    unrealized_pnl: float = Field(0.0, description="该时刻持仓浮动盈亏 (USDT)")
+    total_pnl: float = Field(0.0, description="该时刻开启以来综合总盈亏 (USDT)")
+    pnl_ratio: float = Field(0.0, description="该时刻收益率")
+
+
+class AutoPilotTradeRecord(BaseModel):
+    """自动操盘产生的交易记录明细"""
+    id: Optional[str] = Field(None, description="记录 ID")
+    symbol: str = Field(..., description="标的代码")
+    pos_side: str = Field(..., description="持仓方向 long/short")
+    entry_price: float = Field(..., description="开仓均价")
+    exit_price: float = Field(..., description="平仓价格")
+    size: float = Field(..., description="成交数量 (币数)")
+    leverage: int = Field(1, description="杠杆倍数")
+    realized_pnl: float = Field(..., description="该笔已实现盈亏 (USDT)")
+    roi_pct: float = Field(0.0, description="该笔收益率 (%)")
+    reason: str = Field("AI策略自动平仓", description="平仓触发原因")
+    timestamp: int = Field(..., description="平仓完成时间戳 (ms)")
+
+
+class AutoPilotHistoryResponse(BaseModel):
+    """自动操盘历史收益与交易流水响应体"""
+    session_id: Optional[str] = Field(None, description="会话ID")
+    is_running: bool = Field(False, description="当前是否在运行")
+    curve: List[AutoPilotHistoryPoint] = Field(default_factory=list, description="时序收益走势采样点列表")
+    trades: List[AutoPilotTradeRecord] = Field(default_factory=list, description="自动操盘产生的平仓明细列表")
+
+
+class AutoPilotStartRequest(BaseModel):
+    """开启自动操盘请求"""
+    min_confidence: Optional[float] = Field(0.70, ge=0.50, le=0.99, description="自动跟单最低置信度门槛")
+    auto_leverage_enabled: Optional[bool] = Field(True, description="是否启用自适应智能杠杆")
+    symbol: Optional[str] = Field("BTC-USDT-SWAP", description="当前主标的")
+    symbols: Optional[List[str]] = Field(None, description="多标的自动监控轮巡池")
+    max_concurrent_positions: Optional[int] = Field(3, ge=1, le=10, description="最大同时持仓标的数")
+    trailing_stop_enabled: Optional[bool] = Field(True, description="是否启用动态移动保本与跟踪止损")
+    breakeven_trigger_ratio: Optional[float] = Field(0.5, ge=0.1, le=0.9, description="浮盈达到目标位比例时移至保本")
+
+
+class AutoPilotConfigUpdateRequest(BaseModel):
+    """更新自动操盘策略参数请求"""
+    min_confidence: Optional[float] = Field(None, ge=0.50, le=0.99, description="自动跟单最低置信度门槛")
+    auto_leverage_enabled: Optional[bool] = Field(None, description="是否启用自适应智能杠杆")
+    symbol: Optional[str] = Field(None, description="当前主标的")
+    symbols: Optional[List[str]] = Field(None, description="多标的自动监控轮巡池")
+    max_concurrent_positions: Optional[int] = Field(None, ge=1, le=10, description="最大同时持仓标的数")
+    trailing_stop_enabled: Optional[bool] = Field(None, description="是否启用动态移动保本与跟踪止损")
+    breakeven_trigger_ratio: Optional[float] = Field(None, ge=0.1, le=0.9, description="浮盈达到目标位比例时移至保本")
+
+
+# =============================================================================
+# 11. 标的元数据与自选分类模型 (Instrument & Symbol Metadata)
+# =============================================================================
+
+class InstrumentCategory(str, Enum):
+    """标的资产分类"""
+    TRADFI = "tradfi"            # 传统金融 / 美股代币 / 黄金白银大宗
+    RWA = "rwa"                  # 现实世界资产 (Real World Assets)
+    CRYPTO = "crypto"            # 主流加密资产
+    COMMODITIES = "commodities"  # 大宗商品 (黄金/白银/原油等)
+    EQUITIES = "equities"        # 美股/指数类代币化标的
+    POSITIONS = "positions"      # 用户当前持仓标的
+    CUSTOM = "custom"            # 自定义添加
+
+
+class InstrumentInfo(BaseModel):
+    """交易标的元数据信息"""
+    symbol: str = Field(..., description="标的代码 (如 BTC-USDT-SWAP, XAU-USDT-SWAP, NVDA-USDT-SWAP)")
+    inst_id: str = Field(..., description="OKX产品代码")
+    inst_type: InstType = Field(InstType.SWAP, description="产品类型 SPOT/SWAP/FUTURES")
+    base_ccy: str = Field(..., description="交易基础币种 (如 BTC, XAU, NVDA, ONDO)")
+    quote_ccy: str = Field("USDT", description="计价币种 (如 USDT, USD)")
+    name: str = Field(..., description="中文展示全称 (如 黄金永续, 英伟达代币化合约, 比特币永续)")
+    category: InstrumentCategory = Field(InstrumentCategory.CRYPTO, description="标的资产分类")
+    is_tradfi: bool = Field(False, description="是否属于 TradFi / RWA / 大宗 / 美股类标的")
+    ct_val: Optional[float] = Field(1.0, description="合约面值")
+    tick_sz: Optional[float] = Field(0.1, description="价格下单最小变动单位 (步长)")
+    lot_sz: Optional[float] = Field(0.01, description="数量下单最小变动单位 (步长)")
+    min_sz: Optional[float] = Field(0.01, description="最小下单数量")
+    state: Optional[str] = Field("live", description="交易状态 (live 正常交易)")
+
+
+class SymbolCategoryGroup(BaseModel):
+    """标的分组列表"""
+    category: InstrumentCategory = Field(..., description="分类枚举")
+    category_name: str = Field(..., description="分类中文名")
+    icon: str = Field("📊", description="分类图标")
+    symbols: List[InstrumentInfo] = Field(default_factory=list, description="该分类下的标的列表")
+
+
+class SymbolListResponse(BaseModel):
+    """标的列表全景响应体"""
+    categories: List[SymbolCategoryGroup] = Field(default_factory=list, description="分类推荐标的池")
+    total_count: int = Field(0, description="标的总数")
+
+
+# =============================================================================
+# 12. 模块 A：历史时序数据湖与回测沙盒模型 (Data Lake & Backtest Models)
+# =============================================================================
+
+class HistoricalKlineRecord(BaseModel):
+    """单根历史K线与衍生品特征记录"""
+    symbol: str = Field(..., description="交易标的 (如 BTC-USDT-SWAP)")
+    timeframe: str = Field(..., description="周期 (15m, 1h, 4h, 1d)")
+    timestamp: int = Field(..., description="毫秒时间戳")
+    open_price: float = Field(..., description="开盘价")
+    high_price: float = Field(..., description="最高价")
+    low_price: float = Field(..., description="最低价")
+    close_price: float = Field(..., description="收盘价")
+    volume: float = Field(..., description="成交量")
+    funding_rate: float = Field(0.0, description="资金费率")
+    open_interest: float = Field(0.0, description="持仓量")
+
+
+class DataLakeSyncRequest(BaseModel):
+    """数据湖同步拉取历史K线请求"""
+    symbol: str = Field(..., description="交易标的代码")
+    timeframes: List[str] = Field(default=["15m", "1h", "4h", "1d"], description="拉取周期列表")
+    days_back: int = Field(default=30, ge=1, le=1000, description="同步历史天数")
+
+
+class DataLakeStatusItem(BaseModel):
+    """单标的各周期数据湖存储现状"""
+    symbol: str = Field(..., description="标的代码")
+    timeframe: str = Field(..., description="周期")
+    count: int = Field(0, description="K线总根数")
+    start_time: Optional[int] = Field(None, description="最早时间戳")
+    end_time: Optional[int] = Field(None, description="最新时间戳")
+
+
+class DataLakeStatusResponse(BaseModel):
+    """数据湖状态全景响应体"""
+    total_klines: int = Field(0, description="全库K线总数")
+    items: List[DataLakeStatusItem] = Field(default_factory=list, description="各标的覆盖明细")
+
+
+class BacktestRunRequest(BaseModel):
+    """回测沙盒单次运行请求"""
+    strategy_name: str = Field(default="EMA_BREAKOUT", description="回测策略名称")
+    symbol: str = Field(default="BTC-USDT-SWAP", description="标的代码")
+    timeframe: str = Field(default="1h", description="回测主周期")
+    days_back: int = Field(default=60, ge=3, le=1000, description="回测回溯天数")
+    initial_balance: float = Field(default=10000.0, ge=100.0, description="回测初始本金(USDT)")
+    leverage: int = Field(default=3, ge=1, le=20, description="杠杆倍数")
+    taker_fee_rate: float = Field(default=0.0005, description="Taker 手续费率 (默认 0.05%)")
+    maker_fee_rate: float = Field(default=0.0002, description="Maker 手续费率 (默认 0.02%)")
+    slippage_pct: float = Field(default=0.0005, description="保守滑点模型 (默认 0.05%)")
+    atr_sl_multiplier: float = Field(default=2.0, ge=0.5, le=5.0, description="ATR 动态止损倍数")
+    breakeven_ratio: float = Field(default=0.5, ge=0.1, le=0.9, description="移动保本触发浮盈比例")
+    params: Dict[str, Any] = Field(default_factory=dict, description="额外策略参数")
+
+
+class BacktestTradeRecord(BaseModel):
+    """回测逐笔交易详情"""
+    trade_id: int = Field(..., description="交易序号")
+    entry_time: int = Field(..., description="入场时间戳")
+    exit_time: int = Field(..., description="出场时间戳")
+    pos_side: str = Field(..., description="long/short")
+    entry_price: float = Field(..., description="开仓价")
+    exit_price: float = Field(..., description="平仓价")
+    size: float = Field(..., description="开仓规模")
+    pnl: float = Field(..., description="该笔盈亏(USDT)")
+    roi_pct: float = Field(..., description="收益率%")
+    fee: float = Field(..., description="扣除手续费与滑点")
+    exit_reason: str = Field(..., description="平仓原因: TP/SL/BREAKEVEN/SIGNAL")
+    mfe_pct: float = Field(0.0, description="最大有利偏移 MFE%")
+    mae_pct: float = Field(0.0, description="最大不利偏移 MAE%")
+
+
+class BacktestEquityPoint(BaseModel):
+    """回测资金曲线采样点"""
+    timestamp: int = Field(..., description="毫秒时间戳")
+    equity: float = Field(..., description="账户净值")
+    drawdown_pct: float = Field(0.0, description="当时回撤百分比")
+
+
+class BacktestResultResponse(BaseModel):
+    """回测实验完整指标响应体"""
+    experiment_id: str = Field(..., description="实验UUID")
+    strategy_name: str = Field(..., description="策略名称")
+    symbol: str = Field(..., description="标的代码")
+    timeframe: str = Field(..., description="回测周期")
+    total_candles: int = Field(..., description="测试K线总根数")
+    initial_balance: float = Field(..., description="初始本金")
+    final_balance: float = Field(..., description="最终净值")
+    total_return_pct: float = Field(..., description="总收益率%")
+    annualized_return_pct: float = Field(..., description="年化收益率%")
+    max_drawdown_pct: float = Field(..., description="最大回撤%")
+    sharpe_ratio: float = Field(..., description="夏普比率")
+    calmar_ratio: float = Field(..., description="卡尔玛比率")
+    win_rate: float = Field(..., description="胜率")
+    profit_factor: float = Field(..., description="盈亏比 / Profit Factor")
+    total_trades: int = Field(..., description="总交易笔数")
+    winning_trades: int = Field(..., description="胜单数")
+    losing_trades: int = Field(..., description="负单数")
+    avg_trade_pnl: float = Field(..., description="单笔平均盈亏")
+    total_fee_paid: float = Field(..., description="累计摩擦成本(手续费+滑点)")
+    equity_curve: List[BacktestEquityPoint] = Field(default_factory=list, description="资金权益走势曲线")
+    trades: List[BacktestTradeRecord] = Field(default_factory=list, description="逐笔成交流水")
+    execution_time_ms: int = Field(..., description="回测执行耗时(毫秒)")
+
+
+class GridSearchRequest(BaseModel):
+    """参数网格搜索与优化请求"""
+    strategy_name: str = Field(default="EMA_BREAKOUT", description="策略名")
+    symbol: str = Field(default="BTC-USDT-SWAP", description="标的代码")
+    timeframe: str = Field(default="1h", description="周期")
+    days_back: int = Field(default=60, ge=7, le=365, description="优化回溯天数")
+    atr_multipliers: List[float] = Field(default=[1.5, 2.0, 2.5, 3.0], description="ATR止损乘数网格")
+    breakeven_ratios: List[float] = Field(default=[0.3, 0.5, 0.7], description="保本触发比例网格")
+    leverages: List[int] = Field(default=[2, 3, 5], description="杠杆网格")
+
+
+class GridSearchResultItem(BaseModel):
+    """网格搜索单项指标"""
+    params: Dict[str, Any] = Field(..., description="参数组合")
+    total_return_pct: float = Field(..., description="总收益率%")
+    sharpe_ratio: float = Field(..., description="夏普比率")
+    max_drawdown_pct: float = Field(..., description="最大回撤%")
+    win_rate: float = Field(..., description="胜率")
+    profit_factor: float = Field(..., description="盈亏比")
+    total_trades: int = Field(..., description="成交笔数")
+
+
+class GridSearchResponse(BaseModel):
+    """网格搜索全量结果"""
+    best_params: Dict[str, Any] = Field(..., description="最优参数组合")
+    items: List[GridSearchResultItem] = Field(default_factory=list, description="全部参数组合表现排序")
+
+
+# =============================================================================
+# 13. 模块 B：全网情报与热点新闻感知模型 (News & Intelligence Models)
+# =============================================================================
+
+class NewsEventItem(BaseModel):
+    """单条新闻资讯实体"""
+    id: str = Field(..., description="新闻哈希ID")
+    source: str = Field(..., description="来源: cryptopanic, rss, coindesk, manual")
+    title: str = Field(..., description="新闻标题")
+    content: Optional[str] = Field(None, description="摘要/正文")
+    url: Optional[str] = Field(None, description="原文链接")
+    published_at: int = Field(..., description="发布毫秒时间戳")
+    sentiment_score: float = Field(0.0, description="AI 情感倾向: -1.0(极度利空) ~ +1.0(极度利好)")
+    urgency: str = Field("P2", description="时效与等级: P0(突发黑天鹅/暴利好), P1(重要), P2(一般)")
+    related_symbols: List[str] = Field(default_factory=list, description="关联标的列表")
+    is_fud_or_rumor: bool = Field(False, description="是否为谣言或未经证实爆料")
+    summary_zh: Optional[str] = Field(None, description="AI 中文一句话核心提炼")
+
+
+class NewsFeedResponse(BaseModel):
+    """新闻情报流响应"""
+    news: List[NewsEventItem] = Field(default_factory=list, description="热点资讯列表")
+    total_count: int = Field(0, description="总数")
+
+
+class MacroCalendarEvent(BaseModel):
+    """宏观经济日历事件"""
+    event_id: str = Field(..., description="事件ID")
+    title: str = Field(..., description="事件名称 (如: 美联储利率决议 FOMC, 美国核心CPI, 非农就业)")
+    country: str = Field("US", description="国家代码")
+    impact_level: str = Field("HIGH", description="影响等级: HIGH/MEDIUM/LOW")
+    event_time: int = Field(..., description="发布时间戳(毫秒)")
+    previous_value: Optional[str] = Field(None, description="前值")
+    forecast_value: Optional[str] = Field(None, description="预测值")
+    actual_value: Optional[str] = Field(None, description="公布值")
+    is_imminent_risk: bool = Field(False, description="是否处于 15 分钟高危预警窗口内")
+
+
+class MacroCalendarResponse(BaseModel):
+    """宏观日历响应体"""
+    events: List[MacroCalendarEvent] = Field(default_factory=list, description="宏观日历事件列表")
+
+
+# =============================================================================
+# 14. 模块 C：每日自动复盘与知识演化模型 (Daily Review & Knowledge Base)
+# =============================================================================
+
+class DailyReviewDetail(BaseModel):
+    """每日深度复盘报告模型"""
+    review_date: str = Field(..., description="复盘日期 YYYY-MM-DD")
+    total_trades: int = Field(0, description="当日交易总笔数")
+    winning_trades: int = Field(0, description="胜单数")
+    losing_trades: int = Field(0, description="负单数")
+    win_rate: float = Field(0.0, description="胜率")
+    realized_pnl: float = Field(0.0, description="当日累计已实现盈亏(USDT)")
+    fee_paid: float = Field(0.0, description="当日手续费磨损(USDT)")
+    max_drawdown: float = Field(0.0, description="当日最大回撤%")
+    best_trade_pnl: float = Field(0.0, description="最佳单笔盈利(USDT)")
+    worst_trade_pnl: float = Field(0.0, description="最差单笔亏损(USDT)")
+    summary_markdown: str = Field(..., description="AI 生成的 Markdown 结构化深度复盘报告")
+    lessons_learned: List[str] = Field(default_factory=list, description="提炼的结构化避坑教训")
+    strategy_adjustments: Optional[Dict[str, Any]] = Field(None, description="策略参数权重优化建议")
+    created_at: str = Field(..., description="创建时间")
+
+
+class DailyReviewListResponse(BaseModel):
+    """复盘历史列表响应体"""
+    reviews: List[DailyReviewDetail] = Field(default_factory=list, description="历史复盘列表")
+
+
+class TradingKnowledgeRule(BaseModel):
+    """交易经验避坑规则模型"""
+    id: str = Field(..., description="规则UUID")
+    rule_type: str = Field(default="MISTAKE_AVOIDANCE", description="MISTAKE_AVOIDANCE/BEST_PRACTICE/MACRO_REGIME")
+    symbol_scope: str = Field(default="*", description="适用标的代码，'*' 为全部")
+    trigger_condition: str = Field(..., description="触发前置场景 (如: 4H RSI > 75 且 资金费率 > 0.08%)")
+    action_rule: str = Field(..., description="约束行动准则 (如: 坚决严禁追多，仅允许等待背离右侧空)")
+    confidence_score: float = Field(default=1.0, ge=0.1, le=1.0, description="置信权重")
+    source_review_date: Optional[str] = Field(None, description="来源复盘日期")
+    times_triggered: int = Field(default=0, description="命中拦截次数")
+    is_active: bool = Field(default=True, description="是否生效")
+    created_at: Optional[str] = Field(None, description="创建时间")
+
+
+class TradingKnowledgeListResponse(BaseModel):
+    """避坑规则库列表响应"""
+    rules: List[TradingKnowledgeRule] = Field(default_factory=list, description="避坑规则列表")
+    total_count: int = Field(0, description="总数")
+
+
+# =============================================================================
+# 15. 模块 D：多智能体对抗博弈与 Telegram 协同模型 (Consensus & Telegram)
+# =============================================================================
+
+class AgentDebateOpinion(BaseModel):
+    """单智能体辩论陈述"""
+    role_name: str = Field(..., description="角色名称 (如: 多头辩护专家, 空头风控专家, 宏观舆情专家)")
+    stance: str = Field(..., description="立场: BULLISH(看多), BEARISH(看空), NEUTRAL(中立观望)")
+    confidence: float = Field(..., description="置信度评分 (0.0~1.0)")
+    key_arguments: List[str] = Field(default_factory=list, description="核心论据列表")
+    risk_warnings: List[str] = Field(default_factory=list, description="识别的潜在风险点")
+
+
+class MultiAgentConsensusResponse(BaseModel):
+    """多智能体对抗博弈综合仲裁决策"""
+    consensus_id: str = Field(..., description="仲裁决策ID")
+    symbol: str = Field(..., description="研判标的")
+    timestamp: int = Field(..., description="研判时间戳")
+    consensus_score: int = Field(..., ge=0, le=100, description="首席量化仲裁官共识得分 (0~100)")
+    final_action: SignalAction = Field(..., description="最终执行动作 (BUY_LONG, SELL_SHORT, HOLD_WAIT, CLOSE_POSITION)")
+    is_approved_to_execute: bool = Field(..., description="是否达到准入红线 (分>=75 且 盈亏比>=1.8 且 无冷却锁)")
+    rejection_reason: Optional[str] = Field(None, description="未通过执行原因")
+    bull_opinion: AgentDebateOpinion = Field(..., description="多头辩护专家观点")
+    bear_opinion: AgentDebateOpinion = Field(..., description="空头风控专家观点")
+    macro_opinion: AgentDebateOpinion = Field(..., description="宏观舆情专家观点")
+    arbitration_summary: str = Field(..., description="首席仲裁官综合研判词")
+    injected_knowledge_rules: List[str] = Field(default_factory=list, description="本次研判动态注入的前车之鉴避坑规则")
+    suggested_trade_plan: Optional[Dict[str, Any]] = Field(None, description="建议交易计划 (含入场、止损、止盈与盈亏比)")
+
+
+class TelegramConfig(BaseModel):
+    """Telegram Bot 配置契约"""
+    bot_token_masked: Optional[str] = Field(None, description="脱敏的 Bot Token")
+    chat_id_masked: Optional[str] = Field(None, description="脱敏的 Chat ID")
+    is_enabled: bool = Field(False, description="是否启用 TG 实时通知")
+    is_panic_enabled: bool = Field(True, description="是否允许通过 TG 发送 /panic 紧急平仓")
+
+
+class TelegramConfigSaveRequest(BaseModel):
+    """保存 Telegram Bot 配置请求"""
+    bot_token: str = Field(..., description="Telegram Bot Token")
+    chat_id: str = Field(..., description="接收消息的 Chat ID")
+    is_enabled: bool = Field(True, description="是否启用")
+    is_panic_enabled: bool = Field(True, description="是否允许远程 Panic")
+
+
+class TelegramTestMessageRequest(BaseModel):
+    """发送 TG 测试消息请求"""
+    message: Optional[str] = Field("🚀 OKX-Dog v3.0 交易大脑移动端已成功连通！", description="测试消息文本")
+
+
+class TiltProtectionStatus(BaseModel):
+    """交易心理防上头与连续亏损冷却状态"""
+    is_in_cooldown: bool = Field(False, description="当前是否处于强制冷静期")
+    cooldown_until_ts: Optional[int] = Field(None, description="冷却锁解除毫秒时间戳")
+    cooldown_remaining_mins: int = Field(0, description="冷却剩余分钟数")
+    consecutive_loss_count: int = Field(0, description="2小时内连续止损笔数")
+    leverage_penalty_applied: bool = Field(False, description="是否已触发降杠杆惩罚(最大2x)")
+    reason: Optional[str] = Field(None, description="冷却或惩罚原因")
+
+
+
 

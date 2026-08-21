@@ -296,6 +296,44 @@ PRAGMA foreign_keys = ON;
   * **高频行情快照 (`market_snapshots`)**：采用批量写入缓冲区（Batch Buffer），每 1 秒或累计 50 条统一异步批量 Flush 落库，减少磁盘 I/O。
   * **订单与持仓 (`orders`, `positions`)**：采用严格的异步事务 `async with async_session.begin():` 确保 ACID 一致性。
 
+### 6.3 时序冷热分层与分析回测存储架构 (Tiered Hybrid Storage)
+为解决海量历史数据存储导致的磁盘膨胀与分析卡顿，系统在架构上明确冷热分层体系：
+
+```mermaid
+graph TD
+    subgraph "1. 热数据层 (Hot Tier - 内存与环形缓冲)"
+        WS[OKX WebSocket 实时行情] --> RingBuf["定长环形缓冲区 RingBuffer(maxlen=500)"]
+        RingBuf --> Indicator[O1 增量递推指标计算]
+        RingBuf --> AutoEngine[7x24h 毫秒级脱机巡检发单]
+    end
+    
+    subgraph "2. 温数据层 (Warm Tier - SQLite 3.38+ WAL 模式)"
+        Indicator --> SQLite[(SQLite okx_dog.db)]
+        News[全网突发新闻] --> SQLite
+        Review[每日盘后复盘报告] --> SQLite
+        KB[交易避坑规则库] --> SQLite
+        Trades[订单持仓流水] --> SQLite
+    end
+    
+    subgraph "3. 冷数据与分析层 (Cold Tier - Parquet + DuckDB)"
+        SQLite -.->|批量历史下载 / 归档| Parquet[(Parquet 列式压缩文件 /data/history/)]
+        Parquet --> DuckDB[DuckDB / Polars 向量化分析引擎]
+        DuckDB --> VectorizedBT[10万根 K 线向量化回测 < 0.05 秒]
+    end
+    
+    subgraph "4. AI 决策知识检索层 (RAG Memory Tier)"
+        SQLite --> KB_Retriever[BM25 / 标签过滤检索]
+        KB_Retriever --> PromptContext[动态 Token 预算裁剪组装器]
+        PromptContext --> LLM[DeepSeek / OpenAI 多智能体博弈决策]
+    end
+```
+
+#### 关键设计原则：
+1. **中低频 K 线无膨胀保证**：10 个标的 3 年的 15m/1h/4h/1d K 线仅约 150 万行，在 SQLite 中占用 $< 150\text{MB}$，在 Parquet 中压缩至 $< 30\text{MB}$。
+2. **严禁原始毫秒级 Raw Ticks 落盘**：原始毫秒高频数据在内存环形队列中聚合降采样为分钟级特征（如 VWAP、资金费率、大单买卖比）后再持久化。
+3. **极速向量化分析 (DuckDB + Parquet)**：策略回测与多周期特征挖掘由嵌入式 DuckDB 零拷贝读取本地 Parquet，10 万根 K 线的均线与收益率向量化计算耗时 $< 20\text{ms}$。
+4. **AI 动态 Token 预算 (P0~P3 裁剪)**：Prompt 仅注入 P0 关键指标与 P2 避坑规则（从知识库检索召回），单次 LLM 上下文严格限制在 $800 \sim 1,200$ Tokens。
+
 ---
 
 ## 7. 模块协同与端到端核心数据流向
@@ -339,9 +377,67 @@ sequenceDiagram
 
 ---
 
-## 8. 总结与部署规范
+## 8. 7x24h 后端脱机常驻自主巡检与移动保本引擎架构
 
-本架构设计规范已全面涵盖 OKX-Dog 后端系统的分层体系、安全密盒、网络长连接管理、硬风控中枢、紧急平仓机制以及高性能 SQLite 持久化方案。
+### 8.1 架构设计背景与浏览器解耦
+为保证量化操盘在交易员离线、电脑关机或网络断开时仍然全天候 7x24h 闭环运行，后端在 FastAPI Lifespan 生命周期中挂载了独立的后台守护协程 `auto_pilot_worker_loop()`，彻底解耦对前端浏览器存活的依赖。
+
+```mermaid
+flowchart TD
+    subgraph DaemonLoop ["7x24h 后台常驻守护进程 (Worker Loop)"]
+        Timer["每 15 秒定时触发器"]
+        CheckRunning{"AutoPilot 是否激活?"}
+        CheckPanic{"硬风控是否熔断 (PANIC)?"}
+        
+        Timer --> CheckRunning
+        CheckRunning -- Yes --> CheckPanic
+        CheckRunning -- No --> Sleep["休眠等待下一个周期"]
+        CheckPanic -- Normal --> PatrolStep["execute_patrol_step() 核心轮巡中枢"]
+        CheckPanic -- Locked --> LogSkip["记录日志并跳过巡检"]
+    end
+
+    subgraph PatrolEngine ["自主巡检与决策执行流水线"]
+        FetchState["1. 获取最新持仓与可用资金"]
+        BreakevenCheck["2. 持仓监控: 浮盈 ≥ 0.8% 触发移动保本 (Breakeven Locked)"]
+        PoolLoop["3. 遍历多标的监控池 (BTC/ETH/XAU/NVDA/ONDO)"]
+        SessionFilter{"4. TradFi 标的时段过滤 (如美股周末休市)"}
+        FetchInds["5. 实时拉取 15m/1h/4h/1d 技术指标与衍生品深度"]
+        QuantDecision["6. 高保真量化规则算法 / AI 思维链推导"]
+        ConfidenceCheck{"7. 置信度 ≥ 0.75 且方向明确?"}
+        CapCheck{"8. 当前持仓数 < max_concurrent_positions (如3仓)?"}
+        RiskCheck{"9. 硬风控拦截 (单笔限额/单日止损/杠杆/滑点)"}
+        ExecuteOrder["10. 发起市价/限价开仓并绑定动态 TP/SL"]
+        
+        PatrolStep --> FetchState --> BreakevenCheck --> PoolLoop
+        PoolLoop --> SessionFilter
+        SessionFilter -- 交易时段 --> FetchInds --> QuantDecision --> ConfidenceCheck
+        SessionFilter -- 休市/非交易时段 --> NextSym["跳过并轮巡下一标的"]
+        ConfidenceCheck -- 达标 --> CapCheck
+        CapCheck -- 允许开仓 --> RiskCheck
+        RiskCheck -- 通过 --> ExecuteOrder
+    end
+```
+
+### 8.2 动态移动保本 (Dynamic Breakeven Locked)
+1. **触发条件**：
+   - 启用 `trailing_stop_enabled=True`；
+   - 多头持仓浮盈比率 $(P_{mark} - P_{entry}) / P_{entry} \ge 0.8\%$；
+   - 空头持仓浮盈比率 $(P_{entry} - P_{mark}) / P_{entry} \ge 0.8\%$；
+2. **执行动作**：
+   - 将该持仓的止损价强制上移至开仓均价 $P_{entry}$（或略高于手续费成本位）；
+   - 在内存与数据库中标记 `_breakeven_applied_positions`，防止重复提交；
+   - 记录风控审计日志，并在前端看板点亮 `Breakeven Locked` 徽章。
+
+### 8.3 组合级持仓敞口控制 (Portfolio Risk Budgeting)
+- **多标的池**：支持在 `symbols` 列表中配置加密与 TradFi 多品类资产；
+- **并发持仓上限**：`max_concurrent_positions` 限制系统同时持有的最大标的数（默认 3 仓），防止多标的同向波动导致组合爆仓；
+- **资金占用预算**：单笔开仓资金不超过可用保证金的 $15\%$，且受硬风控 `max_order_usdt` 绝对值双重钳制。
+
+---
+
+## 9. 总结与部署规范
+
+本架构设计规范已全面涵盖 OKX-Dog 后端系统的分层体系、安全密盒、网络长连接管理、硬风控中枢、7x24h 脱机常驻巡检守护协程、移动保本引擎以及高性能 SQLite 持久化方案。
 * 所有接口契约已与 `okx-dog-backend/API_SPEC.md` 完全对应；
 * 所有数据实体已与 `okx-dog-backend/models.py` 及 `DATABASE_SCHEMA.sql` 保持一致；
 * 为前端 TypeScript 接口（`TYPES_CONTRACT.ts`）与 AI 模块（`AI_SCHEMA.json`）提供了标准的后端数据契约支持。

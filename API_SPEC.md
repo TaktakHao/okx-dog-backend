@@ -763,16 +763,87 @@ data: {"analysis_id": "c1f7a8b2-3e4d-4a11-8f92-5b9e7c102a01", "symbol": "BTC-USD
     "open_24h": 94100.0,
     "change_24h_pct": 1.21,
     "volume_24h": 128450.0,
-    "vol_currency_24h": 1223358000.0,
-    "timestamp": 1755216000000
-  },
-  "timestamp": 1755216000000
+### 2.11 AI 量化策略实验室与 Codex Harness 沙箱 (Quant Studio)
+
+#### 1. 获取经典量化策略模板库
+* **接口路径**：`GET /api/v1/studio/templates`
+* **接口说明**：获取系统预置的高质量、通过 AST 安全审查的经典量化因子与策略模板（布林带突破、RSI+资金费率动量、EMA+持仓量OI金叉）。
+* **响应体**：
+```json
+{
+  "code": 0,
+  "msg": "获取模板库成功",
+  "data": [
+    {
+      "id": "bollinger_breakout",
+      "name": "自适应布林带通道突破与挤压策略",
+      "description": "计算动态布林带上下轨，突破上轨且带宽高位扩张时开多，跌破下轨开空",
+      "code": "import numpy as np\n..."
+    }
+  ]
 }
 ```
 
+#### 2. AI 自然语言生成策略与自愈回测闭环
+* **接口路径**：`POST /api/v1/studio/generate-strategy`
+* **接口说明**：接收交易员自然语言需求，驱动 Codex 生成 Python 策略，进行 AST 安全审计与受限沙箱回测，报错自动自愈重试（上限3轮）。
+* **请求体** (`GenerateStrategyReq`)：
+```json
+{
+  "prompt": "基于 15m RSI 超卖且资金费率转正时开多",
+  "symbol": "BTC-USDT-SWAP",
+  "timeframe": "15m",
+  "max_retries": 3
+}
+```
+* **响应体**：
+```json
+{
+  "code": 0,
+  "msg": "策略生成与沙盒回测执行完成",
+  "data": {
+    "strategy_id": "uuid-v4",
+    "strategy_name": "AI-Quant-BTC-USDT-SWAP-15m-1",
+    "code": "import numpy as np\n...",
+    "ast_passed": true,
+    "status": "VERIFIED",
+    "metrics": {
+      "total_return_pct": 12.5,
+      "annualized_return_pct": 50.0,
+      "max_drawdown_pct": 4.2,
+      "sharpe_ratio": 1.85,
+      "calmar_ratio": 2.97,
+      "win_rate_pct": 62.5,
+      "profit_factor": 1.9,
+      "total_trades": 35,
+      "total_bars": 1000
+    },
+    "equity_curve": [{"timestamp": 1700000000000, "equity": 1.0, "price": 65000.0}],
+    "trade_signals": [{"timestamp": 1700000900000, "action": "BUY", "price": 65120.0}]
+  }
+}
+```
+
+#### 3. 自定义 Python 策略代码 AST 审计与沙箱回测
+* **接口路径**：`POST /api/v1/studio/backtest-custom`
+* **接口说明**：对交易员编写或修改的 Python 源码进行 AST 白名单静态扫描，通过后在独立进程沙箱中运行并返回回测指标。
+* **请求体** (`CustomBacktestReq`)：
+```json
+{
+  "code": "import numpy as np\n...",
+  "symbol": "BTC-USDT-SWAP",
+  "timeframe": "15m"
+}
+```
+
+#### 4. 黄金测试集模型防退化评测
+* **接口路径**：`POST /api/v1/studio/benchmark-eval`
+* **接口说明**：针对 500+ 极端行情典型用例批量压测 Prompt 与底层模型的生成合规率与回测评分。
+
 ---
 
-## 4. 系统错误码字典 (Error Code Table)
+## 3. WebSocket 实时双向通信协议规范
+
 
 | 错误码 (Code) | 错误枚举 (Error Identifier) | 错误原因与含义 | HTTP 状态码 | 处置建议与前端交互 |
 | :--- | :--- | :--- | :--- | :--- |

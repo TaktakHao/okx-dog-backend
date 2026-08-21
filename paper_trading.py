@@ -59,10 +59,27 @@ class PaperTradingEngine:
             "ETH-USDT-SWAP": 2680.0,
             "SOL-USDT-SWAP": 188.5,
             "DOGE-USDT-SWAP": 0.155,
+            "XAU-USDT-SWAP": 2650.0,
+            "XAG-USDT-SWAP": 31.5,
+            "EUR-USDT-SWAP": 1.085,
+            "GBP-USDT-SWAP": 1.295,
+            "NVDA-USDT-SWAP": 128.5,
+            "TSLA-USDT-SWAP": 245.0,
+            "AAPL-USDT-SWAP": 228.0,
+            "ONDO-USDT-SWAP": 0.725,
+            "PENDLE-USDT-SWAP": 4.85,
+            "PAXG-USDT": 2650.0,
+            "MKR-USDT-SWAP": 1650.0,
         }
 
 
+        self.trade_closed_callbacks = []
+
         logger.info(f"【模拟操盘沙盒】引擎初始化完成，初始虚拟资金: {self.initial_equity:.2f} USDT")
+
+    def register_trade_closed_callback(self, cb):
+        """注册平仓事件监听回调"""
+        self.trade_closed_callbacks.append(cb)
 
     def reset_account(self, initial_equity: float = 10000.0) -> PaperAccountInfo:
         """重置模拟操盘账户与持仓数据"""
@@ -358,8 +375,7 @@ class PaperTradingEngine:
             self.cash += (released_margin + pnl)
             total_realized_pnl += pnl
 
-            # 记录历史战绩
-            self.closed_trades.append({
+            trade_record = {
                 "symbol": symbol,
                 "pos_side": pos.pos_side.value if hasattr(pos.pos_side, "value") else str(pos.pos_side),
                 "entry_price": pos.avg_px,
@@ -370,7 +386,16 @@ class PaperTradingEngine:
                 "roi_pct": (pnl / released_margin * 100) if released_margin > 0 else 0.0,
                 "reason": reason,
                 "timestamp": now_ms,
-            })
+            }
+            # 记录历史战绩
+            self.closed_trades.append(trade_record)
+
+            # 触发平仓事件回调
+            for cb in self.trade_closed_callbacks:
+                try:
+                    cb(trade_record)
+                except Exception as cb_err:
+                    logger.warning(f"平仓回调执行异常: {cb_err}")
 
             if close_ratio >= 0.999:
                 del self.positions[k]

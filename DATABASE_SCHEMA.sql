@@ -20,7 +20,7 @@ PRAGMA temp_store = MEMORY;
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS credentials_vault (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    credential_type TEXT NOT NULL DEFAULT 'OKX_V5' CHECK (credential_type IN ('OKX_V5', 'OPENAI', 'CUSTOM_LLM')),
+    credential_type TEXT NOT NULL DEFAULT 'OKX_V5' CHECK (credential_type IN ('OKX_V5', 'OPENAI', 'ANTIGRAVITY', 'CUSTOM_LLM')),
     is_live_mode INTEGER NOT NULL DEFAULT 0 CHECK (is_live_mode IN (0, 1)), -- 0: 模拟盘(Demo), 1: 实盘(Live)
     encrypted_api_key TEXT NOT NULL,                                       -- AES-256-GCM 加密后的 Base64 密文
     encrypted_secret_key TEXT NOT NULL,                                    -- AES-256-GCM 加密后的 Base64 密文
@@ -50,9 +50,9 @@ CREATE TABLE IF NOT EXISTS system_config (
     copilot_mode TEXT NOT NULL DEFAULT 'MANUAL' CHECK (copilot_mode IN ('MANUAL', 'SEMI_AUTO', 'FULL_AUTO')),
     active_symbol TEXT NOT NULL DEFAULT 'BTC-USDT-SWAP',                    -- 当前监控与主交易标的
     supported_timeframes TEXT NOT NULL DEFAULT '["15m", "1h", "4h", "1d"]', -- 启用的多周期列表
-    llm_provider TEXT NOT NULL DEFAULT 'deepseek' CHECK (llm_provider IN ('deepseek', 'openai', 'anthropic', 'custom')),
-    llm_base_url TEXT NOT NULL DEFAULT 'https://api.deepseek.com',
-    llm_model TEXT NOT NULL DEFAULT 'deepseek-reasoner',                   -- 默认模型 (支持 deepseek-reasoner, deepseek-chat, gpt-4o 等)
+    llm_provider TEXT NOT NULL DEFAULT 'antigravity' CHECK (llm_provider IN ('antigravity', 'deepseek', 'openai', 'anthropic', 'custom')),
+    llm_base_url TEXT NOT NULL DEFAULT 'http://127.0.0.1:8001',
+    llm_model TEXT NOT NULL DEFAULT 'gemini-3.7-flash',                   -- 默认模型 (支持 gemini-3.7-flash, deepseek-reasoner, gpt-4o 等)
     encrypted_llm_api_key TEXT NULL,                                       -- AES-256 加密的 LLM 密钥
     llm_api_key_masked TEXT NULL,                                          -- LLM 密钥脱敏显示
     llm_temperature REAL NOT NULL DEFAULT 0.2 CHECK (llm_temperature >= 0.0 AND llm_temperature <= 2.0),
@@ -332,3 +332,179 @@ CREATE TABLE IF NOT EXISTS risk_audit_logs (
 
 CREATE INDEX IF NOT EXISTS idx_risk_audit_event ON risk_audit_logs(event_type, severity, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_risk_audit_created ON risk_audit_logs(created_at DESC);
+
+-- -----------------------------------------------------------------------------
+-- 10. 自动量化操盘会话与收益追踪表 (auto_pilot_sessions, snapshots & trades)
+-- 精准记录从开启操盘以来的初始本金、收益曲线、胜率、盈亏比与自动成交流水
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS auto_pilot_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL UNIQUE,                                       -- 会话追踪 UUID
+    is_live_mode INTEGER NOT NULL DEFAULT 0 CHECK (is_live_mode IN (0, 1)), -- 0: 模拟盘, 1: 实盘
+    is_running INTEGER NOT NULL DEFAULT 1 CHECK (is_running IN (0, 1)),    -- 是否运行中
+    start_time INTEGER NOT NULL,                                           -- 开启时间戳 (ms)
+    stop_time INTEGER NULL,                                                -- 停止时间戳 (ms)
+    start_equity REAL NOT NULL DEFAULT 10000.0,                            -- 开启时的基准账户净值 (USDT)
+    current_equity REAL NOT NULL DEFAULT 10000.0,                          -- 最新净值 (USDT)
+    realized_pnl REAL NOT NULL DEFAULT 0.0,                                -- 累计已实现盈亏 (USDT)
+    total_trades INTEGER NOT NULL DEFAULT 0,                               -- 总成交单数
+    win_trades INTEGER NOT NULL DEFAULT 0,                                 -- 胜单数
+    loss_trades INTEGER NOT NULL DEFAULT 0,                                -- 负单数
+    max_drawdown REAL NOT NULL DEFAULT 0.0,                                -- 最大回撤 (%)
+    symbol TEXT NOT NULL DEFAULT 'BTC-USDT-SWAP',                          -- 操盘标的
+    min_confidence REAL NOT NULL DEFAULT 0.70,                             -- 触发置信度
+    auto_leverage INTEGER NOT NULL DEFAULT 1 CHECK (auto_leverage IN (0, 1)), -- 是否开启自适应杠杆
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_auto_pilot_session_id ON auto_pilot_sessions(session_id);
+CREATE INDEX IF NOT EXISTS idx_auto_pilot_running ON auto_pilot_sessions(is_running, is_live_mode);
+
+CREATE TABLE IF NOT EXISTS auto_pilot_pnl_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,                                              -- 关联的操盘会话 ID
+    timestamp INTEGER NOT NULL,                                            -- 采样时间戳 (ms)
+    equity REAL NOT NULL,                                                  -- 该时刻账户权益 (USDT)
+    realized_pnl REAL NOT NULL DEFAULT 0.0,                                -- 该时刻已实现盈亏 (USDT)
+    unrealized_pnl REAL NOT NULL DEFAULT 0.0,                              -- 该时刻持仓浮动盈亏 (USDT)
+    total_pnl REAL NOT NULL DEFAULT 0.0,                                   -- 开启以来综合盈亏 (USDT)
+    pnl_ratio REAL NOT NULL DEFAULT 0.0,                                   -- 开启以来收益率
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES auto_pilot_sessions(session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_auto_pilot_snapshots_sess ON auto_pilot_pnl_snapshots(session_id, timestamp ASC);
+
+CREATE TABLE IF NOT EXISTS auto_pilot_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,                                              -- 关联的操盘会话 ID
+    order_id TEXT NULL,                                                    -- 关联的订单 ID
+    symbol TEXT NOT NULL,                                                  -- 标的代码
+    pos_side TEXT NOT NULL,                                                -- long/short
+    entry_price REAL NOT NULL,                                             -- 开仓均价
+    exit_price REAL NOT NULL,                                              -- 平仓价格
+    size REAL NOT NULL,                                                    -- 币数
+    leverage INTEGER NOT NULL DEFAULT 1,                                   -- 杠杆倍数
+    realized_pnl REAL NOT NULL DEFAULT 0.0,                                -- 该笔实现盈亏 (USDT)
+    roi_pct REAL NOT NULL DEFAULT 0.0,                                     -- 收益率 (%)
+    reason TEXT NOT NULL DEFAULT 'AI策略自动平仓',                         -- 平仓原因
+    timestamp INTEGER NOT NULL,                                            -- 平仓时间戳 (ms)
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES auto_pilot_sessions(session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_auto_pilot_trades_sess ON auto_pilot_trades(session_id, timestamp DESC);
+
+-- -----------------------------------------------------------------------------
+-- 11. 历史 K 线与衍生品时序数据湖表 (historical_klines)
+-- 支持多周期历史行情批量归档、断点续传与高精度回测检索
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS historical_klines (
+    symbol TEXT NOT NULL,                                                  -- 标的代码 (如 BTC-USDT-SWAP)
+    timeframe TEXT NOT NULL,                                               -- 周期 (15m, 1h, 4h, 1d)
+    timestamp INTEGER NOT NULL,                                            -- 毫秒时间戳 (Unix ms)
+    open_price REAL NOT NULL,
+    high_price REAL NOT NULL,
+    low_price REAL NOT NULL,
+    close_price REAL NOT NULL,
+    volume REAL NOT NULL,
+    funding_rate REAL NOT NULL DEFAULT 0.0,
+    open_interest REAL NOT NULL DEFAULT 0.0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (symbol, timeframe, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hist_klines_search ON historical_klines (symbol, timeframe, timestamp DESC);
+
+-- -----------------------------------------------------------------------------
+-- 12. 全网宏观与行业热点资讯表 (news_events)
+-- 汇总 CryptoPanic / RSS / 宏观日历，并记录 AI 结构化情感与时效评级
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS news_events (
+    id TEXT PRIMARY KEY,                                                   -- 资讯唯一哈希 ID
+    source TEXT NOT NULL,                                                  -- 来源: cryptopanic, rss, coindesk, manual
+    title TEXT NOT NULL,                                                   -- 新闻标题
+    content TEXT NULL,                                                     -- 正文/摘要
+    url TEXT NULL,                                                         -- 原文链接
+    published_at INTEGER NOT NULL,                                         -- 发布时间戳 (ms)
+    sentiment_score REAL NOT NULL DEFAULT 0.0,                             -- 情感偏向: -1.0(极度利空) ~ +1.0(极度利好)
+    urgency TEXT NOT NULL DEFAULT 'P2' CHECK (urgency IN ('P0', 'P1', 'P2')), -- P0: 黑天鹅/暴利好, P1: 重要, P2: 一般
+    related_symbols TEXT NULL,                                             -- 关联标的 JSON: '["BTC", "ETH"]'
+    is_fud_or_rumor INTEGER NOT NULL DEFAULT 0 CHECK (is_fud_or_rumor IN (0, 1)), -- 是否谣言/FUD
+    summary_zh TEXT NULL,                                                  -- AI 中文一句话核心提炼
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_news_published ON news_events (published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_news_urgency ON news_events (urgency, published_at DESC);
+
+-- -----------------------------------------------------------------------------
+-- 13. 每日盘后复盘报告表 (daily_reviews)
+-- 记录每日 UTC 00:00 全自动生成的战报统计、逐笔解剖、得失归因与教训提炼
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS daily_reviews (
+    review_date TEXT PRIMARY KEY,                                          -- 复盘日期 (格式: 'YYYY-MM-DD')
+    total_trades INTEGER NOT NULL DEFAULT 0,                               -- 当日总交易单数
+    winning_trades INTEGER NOT NULL DEFAULT 0,                             -- 胜单数
+    losing_trades INTEGER NOT NULL DEFAULT 0,                              -- 负单数
+    win_rate REAL NOT NULL DEFAULT 0.0,                                    -- 当日胜率
+    realized_pnl REAL NOT NULL DEFAULT 0.0,                                -- 当日累计已实现盈亏 (USDT)
+    fee_paid REAL NOT NULL DEFAULT 0.0,                                    -- 当日手续费磨损 (USDT)
+    max_drawdown REAL NOT NULL DEFAULT 0.0,                                -- 当日最大回撤 (%)
+    best_trade_pnl REAL NOT NULL DEFAULT 0.0,                              -- 当日最佳单笔盈利 (USDT)
+    worst_trade_pnl REAL NOT NULL DEFAULT 0.0,                             -- 当日最差单笔亏损 (USDT)
+    summary_markdown TEXT NOT NULL,                                        -- AI 自动生成的 Markdown 深度复盘报告
+    lessons_learned TEXT NULL,                                             -- 结构化教训 JSON: '["教训1", "教训2"]'
+    strategy_adjustments TEXT NULL,                                        -- 策略参数权重自适应调整建议 JSON
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_reviews_date ON daily_reviews (review_date DESC);
+
+-- -----------------------------------------------------------------------------
+-- 14. 交易员经验与避坑规则知识库 (trading_knowledge_base)
+-- 沉淀长期交易智慧与反向避坑规则，用于在 AI 研判时反向注入 (Negative Few-Shot)
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS trading_knowledge_base (
+    id TEXT PRIMARY KEY,                                                   -- 规则 UUID
+    rule_type TEXT NOT NULL CHECK (rule_type IN ('MISTAKE_AVOIDANCE', 'BEST_PRACTICE', 'MACRO_REGIME')),
+    symbol_scope TEXT NOT NULL DEFAULT '*',                                -- 适用标的，'*' 为全品类
+    trigger_condition TEXT NOT NULL,                                       -- 触发场景/前置条件
+    action_rule TEXT NOT NULL,                                             -- 约束规则/避坑准则
+    confidence_score REAL NOT NULL DEFAULT 1.0,                            -- 规则置信度 (0.0~1.0)
+    source_review_date TEXT NULL,                                          -- 来源于哪一天的复盘
+    times_triggered INTEGER NOT NULL DEFAULT 0,                            -- 历史命中拦截次数
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),      -- 是否激活
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_kb_rule_active ON trading_knowledge_base (rule_type, is_active);
+CREATE INDEX IF NOT EXISTS idx_kb_symbol ON trading_knowledge_base (symbol_scope, is_active);
+
+-- -----------------------------------------------------------------------------
+-- 15. 本地策略回测实验记录表 (backtest_experiments)
+-- 记录每一次向量化回测实验的参数、收益率、夏普比率与压力测试结果
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS backtest_experiments (
+    id TEXT PRIMARY KEY,                                                   -- 实验 UUID
+    strategy_name TEXT NOT NULL,                                           -- 策略名称
+    symbol TEXT NOT NULL,                                                  -- 标的代码
+    timeframe TEXT NOT NULL,                                               -- 回测周期
+    start_time INTEGER NOT NULL,                                           -- 回测起始时间戳 (ms)
+    end_time INTEGER NOT NULL,                                             -- 回测结束时间戳 (ms)
+    parameters TEXT NOT NULL,                                              -- 回测入参 JSON
+    total_return_pct REAL NOT NULL,                                        -- 总收益率 (%)
+    sharpe_ratio REAL NOT NULL,                                            -- 夏普比率
+    max_drawdown_pct REAL NOT NULL,                                        -- 最大回撤 (%)
+    win_rate REAL NOT NULL,                                                -- 胜率
+    profit_factor REAL NOT NULL,                                           -- 盈亏比 / Profit Factor
+    total_trades INTEGER NOT NULL,                                         -- 回测交易总笔数
+    metrics_detail TEXT NOT NULL,                                          -- 详尽多维统计指标 JSON
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_strategy ON backtest_experiments (strategy_name, symbol, created_at DESC);
+
+

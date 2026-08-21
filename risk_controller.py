@@ -91,6 +91,9 @@ class RiskController:
         self.today_realized_loss: float = 0.0
         self.today_unrealized_loss: float = 0.0
         self.consecutive_loss_count: int = 0
+        self.loss_timestamps: List[float] = []  # 记录止损时间戳 (秒)
+        self.cooldown_until_ts: Optional[int] = None  # 冷却截止时间戳 (ms)
+        self.cooldown_reason: Optional[str] = None
         self.last_reset_date: str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
 
         # 异步锁
@@ -103,6 +106,8 @@ class RiskController:
             logger.info(f"风控统计跨日切换: {self.last_reset_date} -> {current_date}，重置当日盈亏统计")
             self.today_realized_loss = 0.0
             self.today_unrealized_loss = 0.0
+            self.consecutive_loss_count = 0
+            self.loss_timestamps.clear()
             self.last_reset_date = current_date
             # 如果非人工锁定的熔断，跨日可恢复
             if self.risk_status == RiskStatus.CIRCUIT_BROKEN:
@@ -111,30 +116,67 @@ class RiskController:
                 self.circuit_break_reason = None
                 self.circuit_break_at = None
 
-    async def load_config_from_db(self):
-        """从 SQLite risk_limits 表加载最新风控规则"""
-        async with get_db_session() as db:
-            try:
-                res = await db.execute(text("SELECT * FROM risk_limits ORDER BY id DESC LIMIT 1"))
-                row = res.mappings().first()
-                if row:
-                    self.rules = RiskRulesConfig(
-                        max_order_usdt=float(row.get("max_order_usdt", self.rules.max_order_usdt)),
-                        max_daily_loss_usdt=float(row.get("max_daily_loss_usdt", self.rules.max_daily_loss_usdt)),
-                        max_leverage=int(row.get("max_leverage", self.rules.max_leverage)),
-                        max_slippage_pct=float(row.get("max_slippage_pct", self.rules.max_slippage_pct)),
-                        max_open_positions=int(row.get("max_open_positions", self.rules.max_open_positions)),
-                        max_position_usdt=float(row.get("max_position_usdt", self.rules.max_position_usdt))
+    def is_in_cooldown(self) -> Tuple[bool, int, Optional[str]]:
+        """
+        检查当前是否处于交易心理防上头强制冷静期
+        :return: (is_cooldown, remaining_mins, reason)
+        """
+        if not self.cooldown_until_ts:
+            return False, 0, None
+        now_ms = int(time.time() * 1000)
+        if now_ms < self.cooldown_until_ts:
+            rem_mins = int((self.cooldown_until_ts - now_ms) / (60 * 1000)) + 1
+            return True, rem_mins, self.cooldown_reason
+        else:
+            # 冷却结束，自动解除
+            self.cooldown_until_ts = None
+            self.cooldown_reason = None
+            return False, 0, None
+
+    def record_closed_trade_pnl(self, pnl: float, reason: str = ""):
+        """
+        记录已平仓订单盈亏，维护连续止损与防上头状态机
+        """
+        now_sec = time.time()
+        self._check_day_rollover()
+
+        if pnl < 0:
+            self.today_realized_loss += abs(pnl)
+            # 清理 2 小时 (7200s) 以前的止损历史
+            self.loss_timestamps = [t for t in self.loss_timestamps if (now_sec - t) <= 7200]
+            self.loss_timestamps.append(now_sec)
+            self.consecutive_loss_count = len(self.loss_timestamps)
+
+            # 若 2 小时内连续触发 2 笔止损单，强制锁定 60 分钟防上头
+            if self.consecutive_loss_count >= 2:
+                self.cooldown_until_ts = int((now_sec + 3600) * 1000)
+                self.cooldown_reason = f"2小时内连续触发 {self.consecutive_loss_count} 笔止损，系统激活 60 分钟防上头强制冷静锁"
+                logger.warning(f"【交易心理防上头触发】{self.cooldown_reason}")
+                # 触发当日亏损熔断判断
+                if self.today_realized_loss >= self.rules.max_daily_loss_usdt:
+                    self.trigger_daily_loss_circuit_breaker(
+                        self.today_realized_loss,
+                        f"当日累计亏损 {self.today_realized_loss:.2f} USDT 超过上限 {self.rules.max_daily_loss_usdt} USDT"
                     )
-                    logger.info(f"风控规则已从数据库加载: {self.rules.model_dump()}")
-            except Exception as e:
-                logger.warning(f"从数据库加载风控配置异常 (将使用默认规则): {e}")
+        else:
+            # 盈利单可缓解连续止损压力
+            if self.loss_timestamps:
+                self.loss_timestamps.pop(0)
+            self.consecutive_loss_count = len(self.loss_timestamps)
 
-
-    def update_rules(self, new_rules: RiskRulesConfig):
-        """动态热更新内存风控规则"""
-        self.rules = new_rules
-        logger.info(f"硬风控规则已热更新: {self.rules.model_dump()}")
+    def get_tilt_status(self) -> Dict[str, Any]:
+        """获取交易心理防上头状态"""
+        is_cd, rem_mins, cd_reason = self.is_in_cooldown()
+        # 是否触发降杠杆惩罚
+        leverage_penalty = self.today_realized_loss > 0
+        return {
+            "is_in_cooldown": is_cd,
+            "cooldown_until_ts": self.cooldown_until_ts,
+            "cooldown_remaining_mins": rem_mins,
+            "consecutive_loss_count": self.consecutive_loss_count,
+            "leverage_penalty_applied": leverage_penalty,
+            "reason": cd_reason or ("当日产生亏损，最大可用杠杆已自动降至 2x" if leverage_penalty else None)
+        }
 
     async def get_status(self) -> RiskStatusResponse:
         """获取当前风控中枢全景状态"""
@@ -204,6 +246,30 @@ class RiskController:
             logger.error(f"记录风控审计日志失败: {e}", exc_info=True)
             return 0
 
+    async def load_config_from_db(self):
+        """从 SQLite risk_limits 表加载最新风控规则"""
+        async with get_db_session() as db:
+            try:
+                res = await db.execute(text("SELECT * FROM risk_limits ORDER BY id DESC LIMIT 1"))
+                row = res.mappings().first()
+                if row:
+                    self.rules = RiskRulesConfig(
+                        max_order_usdt=float(row.get("max_order_usdt", self.rules.max_order_usdt)),
+                        max_daily_loss_usdt=float(row.get("max_daily_loss_usdt", self.rules.max_daily_loss_usdt)),
+                        max_leverage=int(row.get("max_leverage", self.rules.max_leverage)),
+                        max_slippage_pct=float(row.get("max_slippage_pct", self.rules.max_slippage_pct)),
+                        max_open_positions=int(row.get("max_open_positions", self.rules.max_open_positions)),
+                        max_position_usdt=float(row.get("max_position_usdt", self.rules.max_position_usdt))
+                    )
+                    logger.info(f"风控规则已从数据库加载: {self.rules.model_dump()}")
+            except Exception as e:
+                logger.warning(f"从数据库加载风控配置异常 (将使用默认规则): {e}")
+
+    def update_rules(self, new_rules: RiskRulesConfig):
+        """动态热更新内存风控规则"""
+        self.rules = new_rules
+        logger.info(f"硬风控规则已热更新: {self.rules.model_dump()}")
+
     async def check_order(
         self,
         order: PlaceOrderRequest,
@@ -220,6 +286,29 @@ class RiskController:
         self._check_day_rollover()
 
         is_reduce_only = bool(order.reduce_only)
+
+        # ---------------------------------------------------------------------
+        # 规则 0: 交易心理防上头强制冷静期 (TILT_PROTECTION) 拦截
+        # ---------------------------------------------------------------------
+        is_cd, rem_mins, cd_reason = self.is_in_cooldown()
+        if is_cd and not is_reduce_only:
+            reason = f"【防上头冷静期】系统正处于强制冷却中 (剩余 {rem_mins} 分钟)，已锁定禁止新开仓！原因: {cd_reason}"
+            await self.record_risk_event(
+                event_type=RiskEventType.ORDER_REJECTED,
+                rule_name="TILT_PROTECTION_LOCK",
+                limit_val=f"{rem_mins} mins remaining",
+                current_val="ORDER_ATTEMPT",
+                symbol=order.symbol,
+                is_blocked=True,
+                action_taken="REJECT_ORDER",
+                severity=AuditSeverity.WARNING
+            )
+            return RiskCheckResult(
+                passed=False,
+                rejected_rule="TILT_PROTECTION_LOCK",
+                message=reason,
+                risk_status=self.risk_status
+            )
 
         # ---------------------------------------------------------------------
         # 规则 1: 安全模式 (SAFE_MODE) 拦截
@@ -266,14 +355,22 @@ class RiskController:
             )
 
         # ---------------------------------------------------------------------
-        # 规则 3: 杠杆倍数硬锁上限拦截
+        # 规则 3: 杠杆倍数硬锁上限与单日亏损降杠杆惩罚
         # ---------------------------------------------------------------------
-        if order.leverage > self.rules.max_leverage:
-            reason = f"委托杠杆倍数 ({order.leverage}x) 超过系统硬风控上限 ({self.rules.max_leverage}x)"
+        effective_max_leverage = self.rules.max_leverage
+        if self.today_realized_loss > 0:
+            # 降杠杆惩罚: 限制最大 2x
+            effective_max_leverage = min(2, effective_max_leverage)
+
+        if order.leverage > effective_max_leverage:
+            reason = (
+                f"委托杠杆倍数 ({order.leverage}x) 超过当前有效上限 ({effective_max_leverage}x)"
+                + (" (因当日存在亏损，触发降杠杆保护至 2x)" if self.today_realized_loss > 0 else "")
+            )
             await self.record_risk_event(
                 event_type=RiskEventType.LEVERAGE_EXCEEDED,
                 rule_name="MAX_LEVERAGE",
-                limit_val=f"{self.rules.max_leverage}x",
+                limit_val=f"{effective_max_leverage}x",
                 current_val=f"{order.leverage}x",
                 symbol=order.symbol,
                 is_blocked=True,

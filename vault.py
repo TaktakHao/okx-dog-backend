@@ -16,6 +16,58 @@ from cryptography.hazmat.backends import default_backend
 from config import settings
 
 
+import re
+import logging
+
+logger = logging.getLogger("okx_dog.vault")
+
+
+class SensitiveDataFilter(logging.Filter):
+    """
+    敏感数据自动脱敏日志过滤器 (Log Sanitizer)
+    自动拦截并脱敏 OKX-API-KEY, OKX-PASSPHRASE, Secret Key, Signature 等
+    """
+    PATTERNS = [
+        (re.compile(r'(OKX-API-KEY["\']?\s*[:=]\s*["\']?)([^"\'\s,]{4})([^"\'\s,]+)([^"\'\s,]{4})', re.I), r'\1\2****\4'),
+        (re.compile(r'(OKX-PASSPHRASE["\']?\s*[:=]\s*["\']?)([^"\'\s,]+)', re.I), r'\1****'),
+        (re.compile(r'(OKX-SIGN["\']?\s*[:=]\s*["\']?)([^"\'\s,]+)', re.I), r'\1****'),
+        (re.compile(r'(secret_key["\']?\s*[:=]\s*["\']?)([^"\'\s,]+)', re.I), r'\1****'),
+        (re.compile(r'(passphrase["\']?\s*[:=]\s*["\']?)([^"\'\s,]+)', re.I), r'\1****'),
+        (re.compile(r'(api_key["\']?\s*[:=]\s*["\']?)([^"\'\s,]{4})([^"\'\s,]+)([^"\'\s,]{4})', re.I), r'\1\2****\4'),
+    ]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            for pattern, repl in self.PATTERNS:
+                record.msg = pattern.sub(repl, record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                clean_args = {}
+                for k, v in record.args.items():
+                    if isinstance(v, str):
+                        for pattern, repl in self.PATTERNS:
+                            v = pattern.sub(repl, v)
+                    clean_args[k] = v
+                record.args = clean_args
+            elif isinstance(record.args, tuple):
+                clean_args = []
+                for v in record.args:
+                    if isinstance(v, str):
+                        for pattern, repl in self.PATTERNS:
+                            v = pattern.sub(repl, v)
+                    clean_args.append(v)
+                record.args = tuple(clean_args)
+        return True
+
+
+def install_sensitive_data_filter():
+    """将敏感数据脱敏过滤器挂载至全局 Root Logger 与主流 Logger"""
+    sanitizer = SensitiveDataFilter()
+    logging.getLogger().addFilter(sanitizer)
+    for name in ["okx_dog", "uvicorn", "uvicorn.access", "uvicorn.error", "httpx"]:
+        logging.getLogger(name).addFilter(sanitizer)
+
+
 class SecurityException(Exception):
     """通用安全异常基类"""
     pass
@@ -32,27 +84,23 @@ class CredentialsVault:
     - 采用 AES-256-GCM 进行对称加密，保障机密性与完整性
     - 采用 PBKDF2-HMAC-SHA256 进行 100,000 次密钥派生
     - 提现权限物理隔离与主动检测
-    - 支持会话级活跃主密码自适应解密
+    - 严禁硬编码弱默认口令，仅使用用户配置及运行时显式注册的主密码
     """
-    # 进程级活跃密码池 (包含默认主密码与运行时用户输入密码)
-    KNOWN_PASSWORDS = {
-        settings.MASTER_PASSWORD,
-        "OKXDog_Master_2026",
-        "OKX_DOG_DEFAULT_MASTER_PASS_2026"
-    }
+    # 运行时动态认证通过的活跃密码集合 (不包含任何硬编码弱口令)
+    _active_passwords: set = set()
 
     def __init__(self, master_password: Optional[str] = None, iterations: int = 100_000):
         raw_pwd = master_password or settings.MASTER_PASSWORD
-        self.master_password = raw_pwd.encode("utf-8")
+        self.master_password = raw_pwd.encode("utf-8") if raw_pwd else b""
         self.iterations = iterations
-        if master_password:
-            self.KNOWN_PASSWORDS.add(master_password)
+        if raw_pwd:
+            self._active_passwords.add(raw_pwd.strip())
 
     @classmethod
     def register_master_password(cls, password: str):
-        """记录用户验证通过的主密码供系统后台无缝解密"""
+        """记录用户验证通过的主密码供系统后台解密"""
         if password and password.strip():
-            cls.KNOWN_PASSWORDS.add(password.strip())
+            cls._active_passwords.add(password.strip())
 
     def _derive_key_from_pwd(self, pwd_bytes: bytes, salt: bytes) -> bytes:
         kdf = PBKDF2HMAC(
@@ -121,7 +169,9 @@ class CredentialsVault:
         raw_s = base64.b64decode(encrypted_secret_key)
         raw_p = base64.b64decode(encrypted_passphrase)
 
-        candidate_pwds = [self.master_password.decode("utf-8", "ignore")] + list(self.KNOWN_PASSWORDS)
+        candidate_pwds = set(self._active_passwords)
+        if self.master_password:
+            candidate_pwds.add(self.master_password.decode("utf-8", "ignore"))
 
         for pwd in candidate_pwds:
             if not pwd:
@@ -191,7 +241,9 @@ class CredentialsVault:
         nonce = base64.b64decode(nonce_b64)
         ciphertext = base64.b64decode(ciphertext_b64)
 
-        candidate_pwds = [self.master_password.decode("utf-8", "ignore")] + list(self.KNOWN_PASSWORDS)
+        candidate_pwds = set(self._active_passwords)
+        if self.master_password:
+            candidate_pwds.add(self.master_password.decode("utf-8", "ignore"))
 
         for pwd in candidate_pwds:
             if not pwd:

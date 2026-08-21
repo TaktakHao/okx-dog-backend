@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import logging
+import secrets
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 import httpx
@@ -716,10 +717,9 @@ class OKXRestClient:
         pos_side_val = pos_side.value if isinstance(pos_side, PosSide) else pos_side
         ord_type_val = order_type.value if isinstance(order_type, OrderType) else order_type
 
-        # 如果没有指定 client_order_id，自动生成
+        # 如果没有指定 client_order_id，自动生成金融级防碰撞全局唯一 ID (OKXD + 13位毫秒时间戳 + 8位安全随机数，总长25字符 <= 32)
         if not client_order_id:
-            now_str = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S%f")[:17]
-            client_order_id = f"OKXD_{now_str}"
+            client_order_id = f"OKXD{int(time.time()*1000)}{secrets.token_hex(4)}"
 
         body: Dict[str, Any] = {
             "instId": symbol,
@@ -749,11 +749,12 @@ class OKXRestClient:
 
         if sl_trigger_price is not None and sl_trigger_price > 0:
             sl_ord_px_str = str(sl_order_price) if (sl_order_price and sl_order_price > 0) else "-1"
+            # 止损默认采用 mark (标记价格) 防恶意深度插针
             attach_algos.append({
                 "attachAlgoId": "",
                 "slTriggerPx": str(sl_trigger_price),
                 "slOrdPx": sl_ord_px_str,
-                "slTriggerPxType": "last"
+                "slTriggerPxType": "mark"
             })
 
         if attach_algos:
@@ -765,11 +766,11 @@ class OKXRestClient:
             if tp_obj:
                 attach_data["tpTriggerPx"] = tp_obj["tpTriggerPx"]
                 attach_data["tpOrdPx"] = tp_obj["tpOrdPx"]
-                attach_data["tpTriggerPxType"] = "last"
+                attach_data["tpTriggerPxType"] = tp_obj.get("tpTriggerPxType", "last")
             if sl_obj:
                 attach_data["slTriggerPx"] = sl_obj["slTriggerPx"]
                 attach_data["slOrdPx"] = sl_obj["slOrdPx"]
-                attach_data["slTriggerPxType"] = "last"
+                attach_data["slTriggerPxType"] = sl_obj.get("slTriggerPxType", "mark")
 
             body["attachAlgoOrds"] = [attach_data]
 
