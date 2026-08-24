@@ -13,6 +13,7 @@ from pydantic import Field
 
 # 项目根路径与数据持久化目录
 BASE_DIR = Path(__file__).resolve().parent
+ROOT_DIR = BASE_DIR.parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -55,14 +56,15 @@ class SystemSettings(BaseSettings):
     DEFAULT_MAX_SLIPPAGE_PCT: float = 2.0         # 允许最大滑点百分比 (2.0%)
 
 
-    # 大模型默认配置
-    DEFAULT_LLM_BASE_URL: str = "https://api.deepseek.com"
-    DEFAULT_LLM_MODEL: str = "deepseek-reasoner"
+    # 大模型默认配置 (默认使用本地 Antigravity CLI 驱动)
+    DEFAULT_LLM_PROVIDER: str = "antigravity"
+    DEFAULT_LLM_BASE_URL: str = "http://127.0.0.1:8001"
+    DEFAULT_LLM_MODEL: str = "gemini-3.7-flash"
     DEFAULT_LLM_TEMPERATURE: float = 0.2
     DEFAULT_LLM_MAX_TOKENS: int = 4096
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=[str(ROOT_DIR / ".env"), str(BASE_DIR / ".env")],
         env_file_encoding="utf-8",
         extra="ignore"
     )

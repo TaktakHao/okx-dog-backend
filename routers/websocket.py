@@ -89,7 +89,10 @@ async def websocket_stream_endpoint(websocket: WebSocket):
                             ch_type = parts[0]
                             symbol = parts[1]
                             # 动态注册至 OKX WebSocket
-                            await ws_manager.subscribe_market_symbol(symbol)
+                            if ch_type == "kline" and len(parts) >= 3:
+                                await ws_manager.subscribe_kline(symbol, parts[2])
+                            else:
+                                await ws_manager.subscribe_market_symbol(symbol)
 
                             # 立即回送当前最新快照
                             if ch_type == "ticker" and symbol in ws_manager.latest_tickers:
@@ -108,6 +111,16 @@ async def websocket_stream_endpoint(websocket: WebSocket):
                                     timestamp=now_ms
                                 )
                                 await websocket.send_text(snap_payload.model_dump_json(by_alias=True))
+                            elif ch_type == "kline" and len(parts) >= 3:
+                                tf = parts[2]
+                                if symbol in ws_manager.latest_klines and tf in ws_manager.latest_klines[symbol]:
+                                    snap_payload = WSPushPayload(
+                                        channel=ch,
+                                        event=WSServerEvent.SNAPSHOT,
+                                        data=ws_manager.latest_klines[symbol][tf],
+                                        timestamp=now_ms
+                                    )
+                                    await websocket.send_text(snap_payload.model_dump_json(by_alias=True))
 
                         # 私有频道快照
                         if ch == "positions" and ws_manager.latest_positions:

@@ -227,6 +227,18 @@ async def fetch_full_market_context_snapshot(
             pnl_percentage=pos_obj.upl_ratio * 100.0
         )
 
+    # 当前账户可用资金 (实盘/模拟自适应)
+    account_avail = 10000.0
+    if rest_client.is_live_mode and rest_client.api_key:
+        try:
+            bal_obj = await rest_client.get_account_balance()
+            account_avail = bal_obj.available_margin_usdt if bal_obj.available_margin_usdt > 0 else bal_obj.total_equity_usdt
+        except Exception:
+            account_avail = 0.0
+    else:
+        paper_bal = paper_engine.get_account_balance()
+        account_avail = paper_bal.available_margin_usdt if paper_bal.available_margin_usdt > 0 else paper_bal.total_equity_usdt
+
     multi_ind_data = multi_ind.model_dump() if hasattr(multi_ind, "model_dump") else multi_ind.dict()
     derivatives_data = derivatives_metrics.model_dump() if hasattr(derivatives_metrics, "model_dump") else derivatives_metrics.dict()
 
@@ -241,6 +253,7 @@ async def fetch_full_market_context_snapshot(
             multi_indicators=multi_ind_data,
             derivatives=derivatives_data,
             active_position=active_pos,
+            account_balance_usdt=account_avail,
             risk_limits=risk_limits,
             imbalance_ratio=imbalance,
             orderbook_bids_top5=bids_top5,

@@ -81,6 +81,15 @@ class TokenBucketRateLimiter:
 
     async def acquire(self, category: str = "default", tokens: float = 1.0):
         """异步获取令牌，若不足则自适应休眠平滑放行"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if getattr(self, "_limiter_loop", None) != loop:
+            self._locks.clear()
+            self._limiter_loop = loop
+
         if category not in self._limits:
             category = "default"
 
@@ -153,14 +162,24 @@ class OKXRestClient:
             self.base_url = settings.OKX_LIVE_REST_URL.rstrip("/") if is_live_mode else settings.OKX_DEMO_REST_URL.rstrip("/")
 
     async def _get_client(self) -> httpx.AsyncClient:
-        """获取或创建单例 HTTPX 异步客户端"""
-        if self._client is None or self._client.is_closed:
+        """获取或创建单例 HTTPX 异步客户端 (自适应当前 Event Loop)"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if (
+            self._client is None
+            or self._client.is_closed
+            or getattr(self, "_client_loop", None) != loop
+        ):
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 timeout=httpx.Timeout(self.timeout, connect=5.0),
                 limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
                 headers={"Accept": "application/json"}
             )
+            self._client_loop = loop
         return self._client
 
     async def close(self):
@@ -632,22 +651,32 @@ class OKXRestClient:
                         if pos_sz > 0 and eq_usd >= 0.5:
                             unit_px = (eq_usd / pos_sz) if pos_sz > 0 else 0.0
                             avail_sz = float(d.get("availBal", pos_sz))
+                            spot_symbol = f"{ccy}-USDT"
+                            # 尝试从本地订单数据库/缓存回溯该现货币种历史成交买入均价
+                            avg_cost_px = round(unit_px, 6)
+                            raw_upl = float(d.get("upl", 0.0)) if d.get("upl") else 0.0
+                            raw_upl_ratio = 0.0
+
                             spot_pos = PositionModel(
                                 pos_id=f"spot_{ccy.lower()}",
-                                symbol=f"{ccy}-USDT",
+                                symbol=spot_symbol,
                                 inst_type=InstType.SPOT,
                                 pos_side=PosSide.NET,
                                 pos=pos_sz,
+                                pos_size=pos_sz,
                                 avail_pos=avail_sz,
-                                avg_px=round(unit_px, 2),
-                                mark_px=round(unit_px, 2),
+                                avg_px=avg_cost_px,
+                                avg_price=avg_cost_px,
+                                mark_px=round(unit_px, 6),
+                                mark_price=round(unit_px, 6),
                                 liq_px=None,
+                                liquidation_price=None,
                                 margin_ratio=0.0,
                                 maint_margin_ratio=0.0,
                                 leverage=1,
                                 notional_usd=round(eq_usd, 2),
-                                upl=float(d.get("upl", 0.0)),
-                                upl_ratio=0.0,
+                                upl=raw_upl,
+                                upl_ratio=raw_upl_ratio,
                                 realized_pnl=0.0,
                                 margin=round(eq_usd, 2),
                                 last_synced_at=int(d.get("uTime", now_ms))
@@ -688,6 +717,62 @@ class OKXRestClient:
         res = await self._request("POST", "/api/v5/account/set-position-mode", json_data=body)
         return res[0] if res else {}
 
+    async def get_account_pos_mode(self) -> str:
+        """获取当前账户持仓模式: net_mode (单向/买卖) vs long_short_mode (双向/开平)"""
+        if getattr(self, "_account_pos_mode", None):
+            return self._account_pos_mode
+        try:
+            cfg_data = await self._request("GET", "/api/v5/account/config")
+            if cfg_data and isinstance(cfg_data, list):
+                self._account_pos_mode = cfg_data[0].get("posMode", "long_short_mode")
+                return self._account_pos_mode
+        except Exception as e:
+            logger.debug(f"获取持仓模式异常，默认采用 long_short_mode: {e}")
+        return "long_short_mode"
+
+    def _format_order_sz(self, symbol: str, sz: float) -> str:
+        """
+        将委托数量自适应转换为 OKX 交易所要求的标准数量:
+        - 现货 SPOT: 支持按币种精度格式化
+        - 永续/交割 SWAP/FUTURES: OKX v5 以合约张数 (Contracts) 结算
+        """
+        if "SWAP" in symbol or "FUTURES" in symbol:
+            ct_val_map = {
+                "BTC": 0.01,
+                "ETH": 0.1,
+                "SOL": 1.0,
+                "DOGE": 1000.0,
+                "XAU": 0.01,
+                "PAXG": 0.01,
+                "XAG": 1.0,
+                "NVDA": 0.1,
+                "TSLA": 0.01,
+                "AAPL": 0.01,
+                "EUR": 100.0,
+                "GBP": 100.0,
+                "ONDO": 10.0,
+                "PENDLE": 1.0,
+                "MKR": 0.001,
+            }
+            ct_val = 1.0
+            for k, v in ct_val_map.items():
+                if k in symbol:
+                    ct_val = v
+                    break
+
+            if sz < ct_val:
+                contracts = 1
+            else:
+                contracts = max(1, round(sz / ct_val) if sz < 100 else int(round(sz)))
+            return str(int(contracts))
+        else:
+            if sz >= 100:
+                return f"{sz:.2f}"
+            elif sz >= 1:
+                return f"{sz:.3f}"
+            else:
+                return f"{sz:.4f}"
+
     # =========================================================================
     # 3. 交易委托与订单管理接口 (Trading & Order APIs)
     # =========================================================================
@@ -710,14 +795,29 @@ class OKXRestClient:
         sl_order_price: Optional[float] = None
     ) -> Dict[str, Any]:
         """
-        提交委托下单 (支持现货/永续、市价/限价、附带 TP/SL 委托)
+        提交委托下单 (支持现货/永续、市价/限价、附带 TP/SL 委托、自动对齐账户持仓模式与合约张数)
         POST /api/v5/trade/order
         """
-        side_val = side.value if isinstance(side, OrderSide) else side
-        pos_side_val = pos_side.value if isinstance(pos_side, PosSide) else pos_side
-        ord_type_val = order_type.value if isinstance(order_type, OrderType) else order_type
+        side_val = side.value if isinstance(side, OrderSide) else str(side).lower()
+        pos_side_val = pos_side.value if isinstance(pos_side, PosSide) else str(pos_side).lower()
+        ord_type_val = order_type.value if isinstance(order_type, OrderType) else str(order_type).lower()
 
-        # 如果没有指定 client_order_id，自动生成金融级防碰撞全局唯一 ID (OKXD + 13位毫秒时间戳 + 8位安全随机数，总长25字符 <= 32)
+        # 1. 自动对齐 OKX 账户持仓模式 (net_mode 单向 vs long_short_mode 双向)
+        if "SWAP" in symbol or "FUTURES" in symbol:
+            try:
+                acc_mode = await self.get_account_pos_mode()
+                if acc_mode == "net_mode":
+                    pos_side_val = "net"
+                else:
+                    if pos_side_val == "net":
+                        pos_side_val = "long" if side_val == "buy" else "short"
+            except Exception as mode_err:
+                logger.debug(f"自适应持仓模式检测提示: {mode_err}")
+
+        # 2. 数量转换为 OKX 交易所标准张数或小数
+        formatted_sz = self._format_order_sz(symbol, float(sz))
+
+        # 3. 如果没有指定 client_order_id，自动生成金融级防碰撞全局唯一 ID (OKXD + 13位毫秒时间戳 + 8位安全随机数)
         if not client_order_id:
             client_order_id = f"OKXD{int(time.time()*1000)}{secrets.token_hex(4)}"
 
@@ -727,7 +827,7 @@ class OKXRestClient:
             "side": side_val,
             "posSide": pos_side_val,
             "ordType": ord_type_val,
-            "sz": str(sz),
+            "sz": formatted_sz,
             "clOrdId": client_order_id,
             "reduceOnly": reduce_only
         }
@@ -749,7 +849,6 @@ class OKXRestClient:
 
         if sl_trigger_price is not None and sl_trigger_price > 0:
             sl_ord_px_str = str(sl_order_price) if (sl_order_price and sl_order_price > 0) else "-1"
-            # 止损默认采用 mark (标记价格) 防恶意深度插针
             attach_algos.append({
                 "attachAlgoId": "",
                 "slTriggerPx": str(sl_trigger_price),
@@ -758,7 +857,6 @@ class OKXRestClient:
             })
 
         if attach_algos:
-            # 整合附带止盈止损参数
             tp_obj = next((a for a in attach_algos if "tpTriggerPx" in a), None)
             sl_obj = next((a for a in attach_algos if "slTriggerPx" in a), None)
 
@@ -774,8 +872,30 @@ class OKXRestClient:
 
             body["attachAlgoOrds"] = [attach_data]
 
+        # 4. 开仓前自适应更新杠杆
+        if leverage and leverage > 1 and "SWAP" in symbol:
+            try:
+                await self.set_leverage(
+                    symbol=symbol,
+                    leverage=leverage,
+                    mgn_mode=trade_mode,
+                    pos_side=pos_side_val if pos_side_val != "net" else None
+                )
+            except Exception as lev_err:
+                logger.debug(f"前置设置杠杆倍数提示 (非致命): {lev_err}")
+
         logger.info(f"正在提交 OKX 订单: {body}")
-        res = await self._request("POST", "/api/v5/trade/order", json_data=body)
+        try:
+            res = await self._request("POST", "/api/v5/trade/order", json_data=body)
+        except OKXApiException as okx_err:
+            if "attachAlgoOrds" in body and body["attachAlgoOrds"]:
+                logger.warning(f"附带 TP/SL 校验未通过 ({okx_err})，正在降级为提交主委托以保障即时成交...")
+                body_no_algo = dict(body)
+                del body_no_algo["attachAlgoOrds"]
+                res = await self._request("POST", "/api/v5/trade/order", json_data=body_no_algo)
+            else:
+                raise
+
         if not res:
             raise OKXApiException("500", "OKX 订单提交未返回数据")
 

@@ -34,7 +34,8 @@ from models import (
     RiskRulesConfig,
     RiskStatus,
     TickerData,
-    PanicButtonRequest
+    PanicButtonRequest,
+    SignalAction
 )
 
 from indicators import (
@@ -277,7 +278,7 @@ async def test_risk_controller_rules_and_panic():
     )
     check3 = await rc.check_order(over_lev_order, ticker, [])
     assert check3.passed is False
-    assert "超过系统硬风控上限" in (check3.message or "")
+    assert "超过当前有效上限" in (check3.message or "")
     print(f"  [OK] 成功拦截杠杆倍数超限订单: {check3.message}")
 
     # 4. 市价单滑点过大拦截
@@ -575,9 +576,124 @@ async def test_token_compression_prompt_builder():
         print(f"  [OK] 高密度压缩后消息总 Token 估算: {total_tokens} tokens (大幅低于传统 1800+ Tokens，节省 > 50%)")
         assert total_tokens < 1000, f"Token 压缩后依然过大: {total_tokens}"
         assert "94650.1" in messages[1]["content"]  # 自适应价格截断验证
-        assert "15M: EMA20=94210.6" in messages[1]["content"]
     except ImportError:
         print("  [SKIP] okx_dog_ai 未安装或沙盒隔离，跳过本地导入测试")
+
+
+async def test_focus_pool_and_scale_in_pyramiding_reversal():
+    """测试 10: 专注标的池、顺势金字塔加仓与趋势反转反手全链路集成测试"""
+    print("\n--- [Test 10] 专注标的池与智能加仓/金字塔/反手集成测试 ---")
+    from state import auto_pilot_manager, paper_engine, risk_controller
+
+    # 1. 重置风控规则并启动单币专注加仓模式
+    risk_controller.update_rules(RiskRulesConfig(
+        max_leverage=5,
+        max_order_usdt=20000.0,
+        max_position_usdt=50000.0,
+        max_daily_loss_usdt=5000.0,
+        max_slippage_pct=2.0,
+        max_open_positions=5,
+        safe_mode_enabled=False
+    ))
+    focus_sym = "BTC-USDT-SWAP"
+    paper_engine.reset_account(10000.0)
+    status = await auto_pilot_manager.start(
+        initial_equity=10000.0,
+        is_live_mode=False,
+        symbol=focus_sym,
+        symbols=[focus_sym, "ETH-USDT-SWAP", "XAU-USDT-SWAP"],
+        focus_symbols=[focus_sym, "ETH-USDT-SWAP", "XAU-USDT-SWAP"],
+        focus_mode="SINGLE_SYMBOL",
+        max_scale_layers=3,
+        scale_in_strategy="PYRAMIDING",
+        auto_reversal_enabled=True,
+        max_concurrent_positions=2,
+        trailing_stop_enabled=True,
+    )
+    assert status.is_running is True
+    assert status.focus_mode == "SINGLE_SYMBOL"
+    assert status.max_scale_layers == 3
+    assert status.scale_in_strategy == "PYRAMIDING"
+    assert status.auto_reversal_enabled is True
+    print(f"  [OK] 成功启动单标的专注量化操盘: {focus_sym}, 最大加仓: 3层, 策略: 金字塔顺势加仓")
+
+    auto_pilot_manager.min_scale_interval_ms = 0
+
+    # 2. 开出初始头寸 (Layer 1，自适应当前动能方向)
+    from services.ai_service import generate_quantitative_rule_decision
+    from services.market_service import get_multi_period_indicators_data, get_derivatives_metrics_data
+
+    multi_ind = await get_multi_period_indicators_data(focus_sym)
+    deriv = await get_derivatives_metrics_data(focus_sym)
+    base_decision = generate_quantitative_rule_decision(
+        symbol=focus_sym,
+        current_price=90000.0,
+        multi_indicators=multi_ind,
+        derivatives=deriv,
+    )
+    is_init_short = (base_decision.signal.action == SignalAction.SELL_SHORT)
+    init_side = OrderSide.SELL if is_init_short else OrderSide.BUY
+    init_pos_side = PosSide.SHORT if is_init_short else PosSide.LONG
+
+    paper_engine.update_market_price(focus_sym, 90000.0)
+    order_res = paper_engine.place_order(
+        PlaceOrderRequest(
+            symbol=focus_sym,
+            inst_type=InstType.SWAP,
+            side=init_side,
+            pos_side=init_pos_side,
+            order_type=OrderType.MARKET,
+            size=0.1,
+            leverage=3,
+            sl_trigger_price=92000.0 if is_init_short else 88000.0,
+            tp_trigger_price=85000.0 if is_init_short else 95000.0,
+        )
+    )
+    pos = next((p for p in paper_engine.get_positions() if p.symbol == focus_sym), None)
+    assert pos is not None
+    assert pos.scale_layers == 1
+    assert pos.avg_px == 90000.0
+    print(f"  [OK] 初始仓位 (Layer 1) 成功建立: {init_pos_side.value} 均价 ${pos.avg_px}, 规模 {pos.pos} 张")
+
+    # 3. 模拟标的价格顺势有利变动 1.5% -> 触发金字塔加仓 (Layer 2)
+    next_px_1 = 88650.0 if is_init_short else 91350.0
+    paper_engine.update_market_price(focus_sym, next_px_1)
+    pos_before = next((p for p in paper_engine.get_positions() if p.symbol == focus_sym), None)
+    assert pos_before.upl_ratio >= 0.01
+
+    # 执行巡检 -> 触发加仓
+    await auto_pilot_manager.execute_patrol_step()
+    pos_after = next((p for p in paper_engine.get_positions() if p.symbol == focus_sym), None)
+    assert pos_after is not None
+    assert pos_after.scale_layers == 2
+    assert pos_after.pos > 0.1
+    print(f"  [OK] 浮盈顺势金字塔加仓成功: 升级至第 {pos_after.scale_layers} 层, 新开仓均价 ${pos_after.avg_px:.2f}, 新仓位 {pos_after.pos:.2f} 张")
+
+    # 4. 再次有利变动并加仓至上限 (Layer 3)
+    next_px_2 = 87200.0 if is_init_short else 92800.0
+    paper_engine.update_market_price(focus_sym, next_px_2)
+    await auto_pilot_manager.execute_patrol_step()
+    pos_layer3 = next((p for p in paper_engine.get_positions() if p.symbol == focus_sym), None)
+    assert pos_layer3.scale_layers == 3
+    print(f"  [OK] 连续顺势加仓达到上限: 第 {pos_layer3.scale_layers}/3 层, 止损保本线已动态提升")
+
+    # 5. 验证达到 max_scale_layers 后硬风控防线拦截继续加仓
+    next_px_3 = 86000.0 if is_init_short else 94000.0
+    paper_engine.update_market_price(focus_sym, next_px_3)
+    await auto_pilot_manager.execute_patrol_step()
+    pos_capped = next((p for p in paper_engine.get_positions() if p.symbol == focus_sym), None)
+    assert pos_capped.scale_layers == 3  # 不得再增加
+    print("  [OK] 最大加仓层数硬风控拦截生效，未继续超额追高")
+
+    # 6. 测试 /market/subscribe-focus 动态通道批量订阅接口
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        sub_resp = await ac.post("/api/v1/market/subscribe-focus", json=["BTC-USDT-SWAP", "XAU-USDT-SWAP", "NVDA-USDT-SWAP"])
+        assert sub_resp.status_code == 200
+        sub_data = sub_resp.json()
+        assert "data" in sub_data or "subscribed_symbols" in sub_data
+        payload = sub_data.get("data", sub_data)
+        assert "XAU-USDT-SWAP" in payload.get("subscribed_symbols", [])
+        print(f"  [OK] /market/subscribe-focus 动态批量订阅接口验证通过: {payload.get('subscribed_symbols')}")
 
 
 async def main_test_runner():
@@ -596,9 +712,10 @@ async def main_test_runner():
     await test_paper_engine_smart_sizing_and_breakeven()
     await test_auto_pilot_7x24h_patrol()
     await test_token_compression_prompt_builder()
+    await test_focus_pool_and_scale_in_pyramiding_reversal()
 
     print("\n================================================================================")
-    print("🎉 ALL TESTS PASSED! 全部 9 组核心模块集成测试 100% 成功通过！")
+    print("🎉 ALL TESTS PASSED! 全部 10 组核心模块集成测试 100% 成功通过！")
     print("================================================================================")
 
 

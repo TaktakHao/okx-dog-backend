@@ -123,12 +123,14 @@ async def trigger_ai_analysis(
 
     # 4. 极端兜底：纯量化规则决策引擎
     if not analysis_res or (analysis_res.signal.action == SignalAction.HOLD_WAIT and analysis_res.signal.confidence == 0):
+        avail_u = getattr(snapshot, "account_balance_usdt", None) if snapshot else None
         analysis_res = generate_quantitative_rule_decision(
             symbol=symbol,
             current_price=current_price,
             multi_indicators=multi_ind,
             derivatives=derivatives_metrics,
             risk_limits=getattr(snapshot, "risk_limits", None) if snapshot else None,
+            available_funds=avail_u,
             model_name=model_name if (llm_key and llm_key.strip()) else "quantitative-rule-v2"
         )
 

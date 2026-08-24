@@ -526,7 +526,9 @@ class OKXWSManager:
         快捷订阅指定标的的完整行情通道：
         1. tickers (行情)
         2. books5 (买卖前5档深度)
-        3. candle15m, candle1H, candle4H, candle1D (多周期K线)
+        3. trades (逐笔成交)
+        4. funding-rate (资金费率)
+        5. open-interest (持仓总量)
         """
         args = [
             {"channel": "tickers", "instId": symbol},
@@ -537,6 +539,23 @@ class OKXWSManager:
         ]
         await self.public_client.subscribe(args)
         logger.info(f"已为标的 {symbol} 注册全套公共行情 WebSocket 订阅")
+
+    async def subscribe_kline(self, symbol: str, timeframe: str = "1h"):
+        """动态订阅指定标的与周期的 K 线频道 (candle15m / candle1H / candle4H / candle1D)"""
+        tf_map = {
+            "1m": "candle1m",
+            "5m": "candle5m",
+            "15m": "candle15m",
+            "30m": "candle30m",
+            "1h": "candle1H",
+            "4h": "candle4H",
+            "1d": "candle1D",
+            "1D": "candle1D",
+        }
+        ch = tf_map.get(timeframe.lower(), "candle1H")
+        args = [{"channel": ch, "instId": symbol}]
+        await self.public_client.subscribe(args)
+        logger.info(f"已为标的 {symbol} 注册 {ch} K 线 WebSocket 订阅")
 
     async def subscribe_private_channels(self, inst_type: str = "SWAP"):
         """快捷订阅私有通道：orders, positions, account"""

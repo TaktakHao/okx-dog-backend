@@ -22,6 +22,20 @@ if str(AI_DIR) not in sys.path:
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
+# 动态别名兼容: 将 okx-dog-ai 注册为 okx_dog_ai 模块，解决 Python 标识符连字符问题
+import importlib.util
+if "okx_dog_ai" not in sys.modules:
+    init_file = AI_DIR / "__init__.py"
+    if init_file.exists():
+        try:
+            spec = importlib.util.spec_from_file_location("okx_dog_ai", str(init_file), submodule_search_locations=[str(AI_DIR)])
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules["okx_dog_ai"] = mod
+                spec.loader.exec_module(mod)
+        except Exception as _e:
+            pass
+
 try:
     import okx_dog_ai
 except (ImportError, PermissionError, Exception):
@@ -43,9 +57,14 @@ from services.consensus_service import ConsensusService
 from services.telegram_bot import TelegramBotService
 
 try:
-    from okx_dog_ai import antigravity_bridge, AntigravityBridge
+    if okx_dog_ai and hasattr(okx_dog_ai, "antigravity_bridge"):
+        antigravity_bridge = okx_dog_ai.antigravity_bridge
+        AntigravityBridge = getattr(okx_dog_ai, "AntigravityBridge", None)
+    else:
+        from antigravity_bridge import antigravity_bridge, AntigravityBridge
 except (ImportError, PermissionError, Exception):
     antigravity_bridge = None
+    AntigravityBridge = None
 
 # 日志记录器
 logger = logging.getLogger("okx_dog.gateway")

@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, Generic, List, Optional, TypeVar, Union
-from pydantic import BaseModel, Field, ConfigDict, field_validator, field_serializer
+from pydantic import BaseModel, Field, ConfigDict, field_validator, field_serializer, model_validator
 
 
 # =============================================================================
@@ -530,16 +530,24 @@ class KlineCandle(BaseModel):
     """单个 K 线 Bar 数据 (对齐 Lightweight Charts 与前端 CandleStick)"""
     model_config = ConfigDict(populate_by_name=True)
 
-    timestamp: int = Field(..., alias="time", description="Bar 开盘时间戳 (ms)")
-    time: Optional[int] = Field(None, description="时间轴字段别名")
+    timestamp: int = Field(..., description="Bar 开盘时间戳 (ms)")
     open: float = Field(..., description="开盘价")
     high: float = Field(..., description="最高价")
     low: float = Field(..., description="最低价")
     close: float = Field(..., description="收盘价")
     volume: float = Field(..., description="成交量")
-    vol_currency: float = Field(0.0, description="成交额 (USDT)")
-    is_closed: bool = Field(True, alias="confirmed", description="该 Bar 是否已收线确认")
-    confirmed: Optional[bool] = Field(None, description="别名兼容")
+    vol_currency: Optional[float] = Field(0.0, description="成交额 (USDT)")
+    is_closed: bool = Field(True, description="该 Bar 是否已收线确认")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_candle_inputs(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "timestamp" not in data and "time" in data and data["time"] is not None:
+                data["timestamp"] = data["time"]
+            if "is_closed" not in data and "confirmed" in data and data["confirmed"] is not None:
+                data["is_closed"] = data["confirmed"]
+        return data
 
 
 CandleStick = KlineCandle  # 别名兼容
@@ -895,7 +903,7 @@ class OrderModel(BaseModel):
 
     id: Optional[int] = Field(None, description="数据库自增 ID")
     client_order_id: str = Field(..., description="客户端唯一订单号")
-    okx_order_id: Optional[str] = Field(None, alias="order_id", description="OKX 平台订单号")
+    okx_order_id: Optional[str] = Field(None, description="OKX 平台订单号")
     order_id: Optional[str] = Field(None, description="别名兼容")
     symbol: str = Field(..., description="标的代码")
     inst_type: InstType = Field(InstType.SWAP, description="产品类型")
@@ -903,32 +911,98 @@ class OrderModel(BaseModel):
     pos_side: PosSide = Field(PosSide.NET, description="持仓方向")
     order_type: OrderType = Field(..., description="订单类型")
     price: Optional[float] = Field(None, description="委托价")
-    sz: float = Field(..., alias="size", description="委托数量")
+    sz: float = Field(0.0, description="委托数量")
     size: Optional[float] = Field(None, description="数量别名")
-    notional_usdt: float = Field(0.0, alias="notional_usd", description="名义金额 (USDT)")
+    notional_usdt: float = Field(0.0, description="名义金额 (USDT)")
     notional_usd: Optional[float] = Field(None, description="别名兼容")
-    filled_sz: float = Field(0.0, alias="filled_size", description="已成交数量")
+    filled_sz: float = Field(0.0, description="已成交数量")
     filled_size: Optional[float] = Field(None, description="别名兼容")
-    avg_price: float = Field(0.0, alias="avg_px", description="成交均价")
+    avg_price: float = Field(0.0, description="成交均价")
     avg_px: Optional[float] = Field(None, description="别名兼容")
     state: OrderState = Field(..., description="订单状态")
     leverage: int = Field(1, description="杠杆倍数")
     tp_trigger_price: Optional[float] = Field(None, description="止盈触发价")
-    tp_ord_price: Optional[float] = Field(None, alias="tp_order_price", description="止盈委托价")
+    tp_ord_price: Optional[float] = Field(None, description="止盈委托价")
     tp_order_price: Optional[float] = Field(None, description="别名兼容")
     sl_trigger_price: Optional[float] = Field(None, description="止损触发价")
-    sl_ord_price: Optional[float] = Field(None, alias="sl_order_price", description="止损委托价")
+    sl_ord_price: Optional[float] = Field(None, description="止损委托价")
     sl_order_price: Optional[float] = Field(None, description="别名兼容")
     fee: float = Field(0.0, description="手续费 (USDT)")
     fee_currency: str = Field("USDT", description="手续费币种")
     pnl: float = Field(0.0, description="实现盈亏 (USDT)")
     risk_check_passed: bool = Field(True, description="是否通过风控")
-    risk_check_msg: Optional[str] = Field(None, alias="reject_reason", description="风控说明/拒绝原因")
+    risk_check_msg: Optional[str] = Field(None, description="风控说明/拒绝原因")
     reject_reason: Optional[str] = Field(None, description="别名兼容")
     copilot_mode: CopilotMode = Field(CopilotMode.MANUAL, description="协同模式")
     ai_analysis_id: Optional[Union[int, str]] = Field(None, description="关联 AI 研判 ID")
     created_at: Union[int, datetime] = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="创建时间戳 (ms)")
     updated_at: Union[int, datetime] = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="更新时间戳 (ms)")
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_order_before(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "order_id" in data and "okx_order_id" not in data:
+                data["okx_order_id"] = data["order_id"]
+            if "size" in data and "sz" not in data:
+                data["sz"] = data["size"]
+            if "notional_usd" in data and "notional_usdt" not in data:
+                data["notional_usdt"] = data["notional_usd"]
+            if "filled_size" in data and "filled_sz" not in data:
+                data["filled_sz"] = data["filled_size"]
+            if "avg_px" in data and "avg_price" not in data:
+                data["avg_price"] = data["avg_px"]
+            if "tp_order_price" in data and "tp_ord_price" not in data:
+                data["tp_ord_price"] = data["tp_order_price"]
+            if "sl_order_price" in data and "sl_ord_price" not in data:
+                data["sl_ord_price"] = data["sl_order_price"]
+            if "reject_reason" in data and "risk_check_msg" not in data:
+                data["risk_check_msg"] = data["reject_reason"]
+        return data
+
+    @model_validator(mode="after")
+    def sync_order_after(self) -> "OrderModel":
+        if self.order_id is None:
+            self.order_id = self.okx_order_id
+        if self.okx_order_id is None:
+            self.okx_order_id = self.order_id
+
+        if self.size is None:
+            self.size = self.sz
+        if self.sz == 0.0 and self.size:
+            self.sz = self.size
+
+        if self.notional_usd is None:
+            self.notional_usd = self.notional_usdt
+        if self.notional_usdt == 0.0 and self.notional_usd:
+            self.notional_usdt = self.notional_usd
+
+        if self.filled_size is None:
+            self.filled_size = self.filled_sz
+        if self.filled_sz == 0.0 and self.filled_size:
+            self.filled_sz = self.filled_size
+
+        if self.avg_px is None:
+            self.avg_px = self.avg_price
+        if self.avg_price == 0.0 and self.avg_px:
+            self.avg_price = self.avg_px
+
+        if self.tp_order_price is None:
+            self.tp_order_price = self.tp_ord_price
+        if self.tp_ord_price is None:
+            self.tp_ord_price = self.tp_order_price
+
+        if self.sl_order_price is None:
+            self.sl_order_price = self.sl_ord_price
+        if self.sl_ord_price is None:
+            self.sl_ord_price = self.sl_order_price
+
+        if self.reject_reason is None:
+            self.reject_reason = self.risk_check_msg
+        if self.risk_check_msg is None:
+            self.risk_check_msg = self.reject_reason
+
+        return self
 
     @field_serializer("created_at", "updated_at")
     def serialize_datetime(self, dt: Union[int, datetime]) -> int:
@@ -978,19 +1052,19 @@ class PositionModel(BaseModel):
     symbol: str = Field(..., description="标的代码")
     inst_type: InstType = Field(InstType.SWAP, description="产品类型")
     pos_side: PosSide = Field(..., description="持仓方向")
-    pos: float = Field(..., alias="pos_size", description="持仓数量")
+    pos: float = Field(0.0, description="持仓数量")
     pos_size: Optional[float] = Field(None, description="持仓数量别名")
     avail_pos: float = Field(0.0, description="可平仓数量")
-    avg_px: float = Field(..., alias="avg_price", description="开仓均价")
+    avg_px: float = Field(0.0, description="开仓均价")
     avg_price: Optional[float] = Field(None, description="均价别名")
-    mark_px: float = Field(..., alias="mark_price", description="最新标记价格")
+    mark_px: float = Field(0.0, description="最新标记价格")
     mark_price: Optional[float] = Field(None, description="标记价别名")
-    liq_px: Optional[float] = Field(None, alias="liquidation_price", description="预估强平价")
+    liq_px: Optional[float] = Field(None, description="预估强平价")
     liquidation_price: Optional[float] = Field(None, description="强平价别名")
-    margin_ratio: float = Field(..., alias="mgn_ratio", description="当前保证金率")
+    margin_ratio: float = Field(0.0, description="当前保证金率")
     mgn_ratio: Optional[float] = Field(None, description="保证金率别名")
     maint_margin_ratio: float = Field(0.01, description="维持保证金率")
-    leverage: int = Field(..., description="持仓杠杆倍数")
+    leverage: int = Field(1, description="持仓杠杆倍数")
     notional_usd: Optional[float] = Field(None, description="名义持仓价值 (USDT)")
     upl: float = Field(0.0, description="未实现盈亏 (USDT)")
     upl_ratio: float = Field(0.0, description="未实现盈亏率 (例如 0.12 表示 +12%)")
@@ -1000,11 +1074,64 @@ class PositionModel(BaseModel):
     sl_trigger_price: Optional[float] = Field(None, description="当前止损价")
     is_breakeven_locked: bool = Field(False, description="是否已触发第一止盈并锁定移动保本")
     tp_triggered_50: bool = Field(False, description="是否已完成 50% 阶梯止盈")
+    scale_layers: int = Field(1, description="当前已加仓层数 (初始建仓为1)")
+    last_scale_price: Optional[float] = Field(None, description="上一次加仓价格")
+    last_scale_time: Optional[int] = Field(None, description="上一次加仓时间戳 (ms)")
     is_danger_alert: bool = Field(False, description="是否触发强平危险告警")
     last_synced_at: Union[int, datetime] = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="与 OKX 同步时间")
 
     created_at: Optional[Union[int, datetime]] = Field(None, description="开仓时间戳")
     updated_at: Optional[Union[int, datetime]] = Field(None, description="最近更新时间戳")
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_pos_before(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "avg_price" in data and "avg_px" not in data:
+                data["avg_px"] = data["avg_price"]
+            if "mark_price" in data and "mark_px" not in data:
+                data["mark_px"] = data["mark_price"]
+            if "pos_size" in data and "pos" not in data:
+                data["pos"] = data["pos_size"]
+            if "liquidation_price" in data and "liq_px" not in data:
+                data["liq_px"] = data["liquidation_price"]
+            if "mgn_ratio" in data and "margin_ratio" not in data:
+                data["margin_ratio"] = data["mgn_ratio"]
+        return data
+
+    @model_validator(mode="after")
+    def sync_pos_after(self) -> "PositionModel":
+        if self.avg_price is None:
+            self.avg_price = self.avg_px
+        if self.avg_px == 0.0 and self.avg_price != 0.0:
+            self.avg_px = self.avg_price
+
+        if self.mark_price is None:
+            self.mark_price = self.mark_px
+        if self.mark_px == 0.0 and self.mark_price != 0.0:
+            self.mark_px = self.mark_price
+
+        if self.pos_size is None:
+            self.pos_size = self.pos
+        if self.pos == 0.0 and self.pos_size != 0.0:
+            self.pos = self.pos_size
+
+        if self.liquidation_price is None:
+            self.liquidation_price = self.liq_px
+        if self.liq_px is None and self.liquidation_price is not None:
+            self.liq_px = self.liquidation_price
+
+        if self.mgn_ratio is None:
+            self.mgn_ratio = self.margin_ratio
+        if self.margin_ratio == 0.0 and self.mgn_ratio != 0.0:
+            self.margin_ratio = self.mgn_ratio
+
+        if self.notional_usd is None or self.notional_usd == 0.0:
+            px = self.mark_px or self.avg_px or 0.0
+            sz = self.pos or self.pos_size or 0.0
+            self.notional_usd = round(px * sz, 2)
+
+        return self
 
     @field_serializer("last_synced_at", "created_at", "updated_at")
     def serialize_pos_dt(self, dt: Optional[Union[int, datetime]]) -> Optional[int]:
@@ -1024,20 +1151,50 @@ class AccountBalanceModel(BaseModel):
 
     total_equity_usdt: float = Field(..., description="账户总权益估值 (USDT)")
     total_equity_btc: Optional[float] = Field(0.0, description="账户总权益折合 (BTC)")
-    available_margin_usdt: float = Field(..., alias="available_balance_usdt", description="可用保证金 (USDT)")
+    available_margin_usdt: float = Field(..., description="可用保证金 (USDT)")
     available_balance_usdt: Optional[float] = Field(None, description="别名兼容")
-    used_margin_usdt: float = Field(0.0, alias="margin_used_usdt", description="占用保证金 (USDT)")
+    used_margin_usdt: float = Field(0.0, description="占用保证金 (USDT)")
     margin_used_usdt: Optional[float] = Field(None, description="别名兼容")
     frozen_balance_usdt: float = Field(0.0, description="挂单冻结金额 (USDT)")
     unrealized_pnl_usdt: float = Field(0.0, description="未实现总盈亏 (USDT)")
-    today_realized_pnl_usdt: float = Field(0.0, alias="today_pnl_usdt", description="当日已实现盈亏 (USDT)")
+    today_realized_pnl_usdt: float = Field(0.0, description="当日已实现盈亏 (USDT)")
     today_pnl_usdt: Optional[float] = Field(None, description="别名兼容")
-    today_pnl_ratio: float = Field(0.0, alias="today_pnl_pct", description="当日收益率")
+    today_pnl_ratio: float = Field(0.0, description="当日收益率")
     today_pnl_pct: Optional[float] = Field(None, description="别名兼容")
     margin_ratio: float = Field(..., description="账户整体保证金率")
     is_warning_margin: Optional[bool] = Field(False, description="是否处于强平警戒状态")
-    timestamp: int = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), alias="updated_at", description="资产更新毫秒时间戳")
+    timestamp: int = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="资产更新毫秒时间戳")
     updated_at: Optional[int] = Field(None, description="别名兼容")
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_bal_before(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "available_balance_usdt" in data and "available_margin_usdt" not in data:
+                data["available_margin_usdt"] = data["available_balance_usdt"]
+            if "margin_used_usdt" in data and "used_margin_usdt" not in data:
+                data["used_margin_usdt"] = data["margin_used_usdt"]
+            if "today_pnl_usdt" in data and "today_realized_pnl_usdt" not in data:
+                data["today_realized_pnl_usdt"] = data["today_pnl_usdt"]
+            if "today_pnl_pct" in data and "today_pnl_ratio" not in data:
+                data["today_pnl_ratio"] = data["today_pnl_pct"]
+            if "updated_at" in data and "timestamp" not in data:
+                data["timestamp"] = data["updated_at"]
+        return data
+
+    @model_validator(mode="after")
+    def sync_bal_after(self) -> "AccountBalanceModel":
+        if self.available_balance_usdt is None:
+            self.available_balance_usdt = self.available_margin_usdt
+        if self.margin_used_usdt is None:
+            self.margin_used_usdt = self.used_margin_usdt
+        if self.today_pnl_usdt is None:
+            self.today_pnl_usdt = self.today_realized_pnl_usdt
+        if self.today_pnl_pct is None:
+            self.today_pnl_pct = self.today_pnl_ratio
+        if self.updated_at is None:
+            self.updated_at = self.timestamp
+        return self
 
 
 AccountBalance = AccountBalanceModel  # 别名兼容
@@ -1258,12 +1415,19 @@ class AutoPilotStatusModel(BaseModel):
     profit_factor: float = Field(0.0, description="收益因子 / 盈亏比")
     max_drawdown_pct: float = Field(0.0, description="开启以来最大回撤百分比")
     active_symbol: str = Field("BTC-USDT-SWAP", description="当前主要关注标的")
-    symbols: List[str] = Field(default_factory=lambda: ["XAU-USDT-SWAP", "NVDA-USDT-SWAP", "TSLA-USDT-SWAP", "ONDO-USDT-SWAP", "BTC-USDT-SWAP", "ETH-USDT-SWAP"], description="多标的自动监控轮巡池")
+    symbols: List[str] = Field(default_factory=lambda: ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "XAU-USDT-SWAP", "NVDA-USDT-SWAP", "ONDO-USDT-SWAP"], description="多标的自动监控轮巡池")
+    focus_symbols: List[str] = Field(default_factory=lambda: ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "XAU-USDT-SWAP", "NVDA-USDT-SWAP", "ONDO-USDT-SWAP"], description="自选与专注标的池")
+    focus_mode: str = Field("SINGLE_SYMBOL", description="操盘专注模式: SINGLE_SYMBOL 单标的专注量化 / MULTI_SYMBOL_POOL 多标的池")
+    max_scale_layers: int = Field(3, description="最大加仓层数 (1~5层)")
+    scale_in_strategy: str = Field("SMART_HYBRID", description="加仓策略类型: PYRAMIDING 顺势金字塔 / PULLBACK_DCA 动态回调 / SMART_HYBRID 智能混合")
+    auto_reversal_enabled: bool = Field(True, description="强反向信号是否自动反手平反开")
     max_concurrent_positions: int = Field(3, description="最大同时持仓标的数 (防过度分散)")
     trailing_stop_enabled: bool = Field(True, description="是否启用动态移动保本与跟踪止损")
     breakeven_trigger_ratio: float = Field(0.5, description="浮盈达到目标位比例时移至保本")
     min_confidence: float = Field(0.70, description="自动跟单最低置信度门槛")
     auto_leverage_enabled: bool = Field(True, description="是否启用自适应智能杠杆")
+    stop_loss_equity_floor: Optional[float] = Field(None, description="最低保留本金底线 (USDT，亏损至该值自动熔断停止操盘)")
+    max_loss_limit_usdt: Optional[float] = Field(None, description="最大允许亏损金额 (USDT)")
     is_live_mode: bool = Field(False, description="是否为实盘环境")
     last_patrol_time: Optional[int] = Field(None, description="最近一次后端自动巡检时间戳 (ms)")
     last_patrol_log: Optional[str] = Field(None, description="最近一次后端自动巡检结果概要")
@@ -1307,8 +1471,15 @@ class AutoPilotStartRequest(BaseModel):
     """开启自动操盘请求"""
     min_confidence: Optional[float] = Field(0.70, ge=0.50, le=0.99, description="自动跟单最低置信度门槛")
     auto_leverage_enabled: Optional[bool] = Field(True, description="是否启用自适应智能杠杆")
+    stop_loss_equity_floor: Optional[float] = Field(None, description="最低保留本金底线 (USDT，如当前8000U设7000U，亏损至该值自动停止操盘)")
+    max_loss_limit_usdt: Optional[float] = Field(None, description="最大允许亏损金额 (USDT)")
     symbol: Optional[str] = Field("BTC-USDT-SWAP", description="当前主标的")
     symbols: Optional[List[str]] = Field(None, description="多标的自动监控轮巡池")
+    focus_symbols: Optional[List[str]] = Field(None, description="自选与专注标的列表")
+    focus_mode: Optional[str] = Field("SINGLE_SYMBOL", description="操盘专注模式: SINGLE_SYMBOL / MULTI_SYMBOL_POOL")
+    max_scale_layers: Optional[int] = Field(3, ge=1, le=5, description="最大加仓层数 (1~5)")
+    scale_in_strategy: Optional[str] = Field("SMART_HYBRID", description="加仓策略类型")
+    auto_reversal_enabled: Optional[bool] = Field(True, description="强反向信号是否自动反手")
     max_concurrent_positions: Optional[int] = Field(3, ge=1, le=10, description="最大同时持仓标的数")
     trailing_stop_enabled: Optional[bool] = Field(True, description="是否启用动态移动保本与跟踪止损")
     breakeven_trigger_ratio: Optional[float] = Field(0.5, ge=0.1, le=0.9, description="浮盈达到目标位比例时移至保本")
@@ -1318,8 +1489,15 @@ class AutoPilotConfigUpdateRequest(BaseModel):
     """更新自动操盘策略参数请求"""
     min_confidence: Optional[float] = Field(None, ge=0.50, le=0.99, description="自动跟单最低置信度门槛")
     auto_leverage_enabled: Optional[bool] = Field(None, description="是否启用自适应智能杠杆")
+    stop_loss_equity_floor: Optional[float] = Field(None, description="最低保留本金底线 (USDT，亏损至该值自动熔断停止操盘)")
+    max_loss_limit_usdt: Optional[float] = Field(None, description="最大允许亏损金额 (USDT)")
     symbol: Optional[str] = Field(None, description="当前主标的")
     symbols: Optional[List[str]] = Field(None, description="多标的自动监控轮巡池")
+    focus_symbols: Optional[List[str]] = Field(None, description="自选与专注标的列表")
+    focus_mode: Optional[str] = Field(None, description="操盘专注模式: SINGLE_SYMBOL / MULTI_SYMBOL_POOL")
+    max_scale_layers: Optional[int] = Field(None, ge=1, le=5, description="最大加仓层数 (1~5)")
+    scale_in_strategy: Optional[str] = Field(None, description="加仓策略类型")
+    auto_reversal_enabled: Optional[bool] = Field(None, description="强反向信号是否自动反手")
     max_concurrent_positions: Optional[int] = Field(None, ge=1, le=10, description="最大同时持仓标的数")
     trailing_stop_enabled: Optional[bool] = Field(None, description="是否启用动态移动保本与跟踪止损")
     breakeven_trigger_ratio: Optional[float] = Field(None, ge=0.1, le=0.9, description="浮盈达到目标位比例时移至保本")

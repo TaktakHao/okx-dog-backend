@@ -542,3 +542,16 @@ async def get_multi_period_indicators(symbol: str = Query("BTC-USDT-SWAP", descr
         indicators=indicators_map
     )
     return ApiResponse(code=0, msg="success", data=multi_ind, timestamp=now_ms)
+
+
+@router.post("/subscribe-focus", response_model=ApiResponse[Dict[str, Any]], summary="批量订阅专注标的行情通道")
+async def subscribe_focus_symbols(symbols: List[str]):
+    """批量订阅前端自选与专注标的的 WebSocket 行情"""
+    now_ms = int(time.time() * 1000)
+    subscribed = []
+    for sym in symbols:
+        clean_sym = sym.strip().upper()
+        if clean_sym:
+            await ws_manager.subscribe_market_symbol(clean_sym)
+            subscribed.append(clean_sym)
+    return ApiResponse(code=0, msg=f"成功订阅 {len(subscribed)} 个专注标的", data={"subscribed_symbols": subscribed}, timestamp=now_ms)

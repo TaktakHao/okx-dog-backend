@@ -272,7 +272,12 @@ class PaperTradingEngine:
         self.orders[order_id] = order_model
 
         # 更新持仓
-        pos_key = f"{symbol}:{pos_side.value}"
+        is_spot_order = getattr(req, "inst_type", None) == InstType.SPOT or ("SWAP" not in symbol and "FUTURES" not in symbol)
+        final_inst_type = InstType.SPOT if is_spot_order else (getattr(req, "inst_type", None) or InstType.SWAP)
+        final_pos_side = PosSide.NET if is_spot_order else pos_side
+        final_leverage = 1 if is_spot_order else leverage
+
+        pos_key = f"{symbol}:{final_pos_side.value if hasattr(final_pos_side, 'value') else str(final_pos_side)}"
         if pos_key in self.positions:
             # 加仓：计算加权均价
             old_pos = self.positions[pos_key]
@@ -289,21 +294,24 @@ class PaperTradingEngine:
             old_pos.mark_px = exec_price
             old_pos.mark_price = exec_price
             old_pos.margin = new_margin
-            old_pos.notional_usd = total_size * exec_price
+            old_pos.notional_usd = round(total_size * exec_price, 2)
+            old_pos.scale_layers = (getattr(old_pos, "scale_layers", None) or 1) + 1
+            old_pos.last_scale_price = exec_price
+            old_pos.last_scale_time = now_ms
             if sanitized_tp:
                 old_pos.tp_trigger_price = sanitized_tp
             if sanitized_sl:
                 old_pos.sl_trigger_price = sanitized_sl
-            old_pos.liq_px = self._calculate_liq_price(new_avg_px, leverage, pos_side)
+            old_pos.liq_px = None if is_spot_order else self._calculate_liq_price(new_avg_px, final_leverage, final_pos_side)
             old_pos.liquidation_price = old_pos.liq_px
         else:
             # 新开仓
-            liq_px = self._calculate_liq_price(exec_price, leverage, pos_side)
+            liq_px = None if is_spot_order else self._calculate_liq_price(exec_price, final_leverage, final_pos_side)
             new_pos = PositionModel(
                 pos_id=f"sim_pos_{uuid.uuid4().hex[:10]}",
                 symbol=symbol,
-                inst_type=InstType.SWAP,
-                pos_side=pos_side,
+                inst_type=final_inst_type,
+                pos_side=final_pos_side,
                 pos=size,
                 pos_size=size,
                 avail_pos=size,
@@ -314,17 +322,22 @@ class PaperTradingEngine:
                 liq_px=liq_px,
                 liquidation_price=liq_px,
                 margin=required_margin,
-                margin_ratio=1.0,
-                mgn_ratio=1.0,
+                margin_ratio=1.0 if not is_spot_order else 0.0,
+                mgn_ratio=1.0 if not is_spot_order else 0.0,
                 maint_margin_ratio=0.01,
-                leverage=leverage,
-                notional_usd=notional_usdt,
+                leverage=final_leverage,
+                notional_usd=round(notional_usdt, 2),
                 upl=0.0,
                 upl_ratio=0.0,
                 realized_pnl=0.0,
                 tp_trigger_price=sanitized_tp,
                 sl_trigger_price=sanitized_sl,
-                timestamp=now_ms,
+                is_breakeven_locked=False,
+                tp_triggered_50=False,
+                scale_layers=1,
+                last_scale_price=exec_price,
+                last_scale_time=now_ms,
+                last_synced_at=now_ms,
             )
             self.positions[pos_key] = new_pos
 
@@ -418,6 +431,31 @@ class PaperTradingEngine:
             "reason": reason
         }
 
+
+    def update_position_stops(
+        self,
+        symbol: str,
+        pos_side: Optional[PosSide] = None,
+        stop_loss_price: Optional[float] = None,
+        take_profit_price: Optional[float] = None,
+        is_breakeven_locked: Optional[bool] = None,
+    ) -> bool:
+        """更新模拟持仓的止盈止损价与移动保本锁定标记"""
+        updated = False
+        for pos_key, pos in self.positions.items():
+            if pos.symbol == symbol:
+                if pos_side is not None and pos.pos_side != pos_side:
+                    continue
+                if stop_loss_price is not None:
+                    pos.sl_trigger_price = stop_loss_price
+                if take_profit_price is not None:
+                    pos.tp_trigger_price = take_profit_price
+                if is_breakeven_locked is not None:
+                    pos.is_breakeven_locked = is_breakeven_locked
+                elif stop_loss_price is not None:
+                    pos.is_breakeven_locked = True
+                updated = True
+        return updated
 
     def get_positions(self) -> List[PositionModel]:
         """获取当前活跃模拟持仓列表"""

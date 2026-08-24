@@ -14,6 +14,7 @@ from database import get_db
 from models import (
     AccountBalanceModel,
     ApiResponse,
+    AutoPilotStatusModel,
     PaperAccountInfo,
     PaperResetRequest,
     PositionModel,
@@ -22,6 +23,7 @@ from models import (
     WSServerEvent,
 )
 from state import (
+    auto_pilot_manager,
     logger,
     paper_engine,
     rest_client,
@@ -93,27 +95,17 @@ async def switch_system_mode(
                 raise HTTPException(status_code=400, detail="未找到已配置的 OKX 凭证，请先在右上角【安全与 API 配置】中配置并保存实盘 API Key！")
 
             if row:
-                pwd_candidates = [req.master_password, "OKXDog_Master_2026"] if req.master_password else ["OKXDog_Master_2026"]
-                dec_success = False
-                dec_key, dec_sec, dec_pass = None, None, None
-                for pwd in pwd_candidates:
-                    if not pwd:
-                        continue
-                    try:
-                        c_vault = vault if pwd == "OKXDog_Master_2026" else vault.__class__(master_password=pwd)
-                        dec_key, dec_sec, dec_pass = c_vault.decrypt_credentials(
-                            row["encrypted_api_key"],
-                            row["encrypted_secret_key"],
-                            row["encrypted_passphrase"],
-                            row["salt"],
-                            row["nonce"]
-                        )
-                        dec_success = True
-                        break
-                    except Exception:
-                        continue
-
-                if not dec_success:
+                c_vault = vault if not req.master_password else vault.__class__(master_password=req.master_password)
+                try:
+                    dec_key, dec_sec, dec_pass = c_vault.decrypt_credentials(
+                        row["encrypted_api_key"],
+                        row["encrypted_secret_key"],
+                        row["encrypted_passphrase"],
+                        row["salt"],
+                        row["nonce"]
+                    )
+                except Exception as e:
+                    logger.warning(f"解密实盘凭证失败: {e}")
                     raise HTTPException(status_code=400, detail="解密实盘凭证失败，主保护密码不正确！")
 
                 rest_client.update_credentials(dec_key, dec_sec, dec_pass, is_live_mode=True)
@@ -174,6 +166,25 @@ async def switch_system_mode(
         mode_name = "【真实实盘】" if req.target_live_mode else "【模拟操盘沙盒】"
         logger.info(f"系统运行模式已切换为: {mode_name}")
 
+        # 联动自动操盘中枢切换环境并安全暂停原环境
+        current_eq = None
+        if req.target_live_mode:
+            if 'live_bal' in locals() and live_bal:
+                current_eq = live_bal.total_equity_usdt
+        else:
+            current_eq = paper_engine.get_account_balance().total_equity_usdt
+
+        ap_status = await auto_pilot_manager.switch_environment(
+            target_live_mode=req.target_live_mode,
+            current_equity=current_eq
+        )
+        await ws_manager.broadcast_to_subscribers(WSPushPayload[AutoPilotStatusModel](
+            channel="auto_pilot",
+            event=WSServerEvent.UPDATE,
+            data=ap_status,
+            timestamp=now_ms
+        ))
+
         return ApiResponse(
             code=0,
             msg=f"已成功切换为 {mode_name} 模式",
@@ -185,3 +196,4 @@ async def switch_system_mode(
     except Exception as e:
         logger.error(f"切换运行模式发生未知异常: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=f"切换模式失败: {str(e)}")
+

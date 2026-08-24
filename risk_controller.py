@@ -92,8 +92,9 @@ class RiskController:
         self.today_unrealized_loss: float = 0.0
         self.consecutive_loss_count: int = 0
         self.loss_timestamps: List[float] = []  # 记录止损时间戳 (秒)
-        self.cooldown_until_ts: Optional[int] = None  # 冷却截止时间戳 (ms)
+        self.cooldown_until_ts: Optional[int] = None  # 全局防上头冷却截止时间戳 (ms)
         self.cooldown_reason: Optional[str] = None
+        self.symbol_cooldowns: Dict[str, int] = {}    # 标的级别止损冷静期: symbol -> cooldown_until_ms
         self.last_reset_date: str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
 
         # 异步锁
@@ -125,13 +126,33 @@ class RiskController:
             return False, 0, None
         now_ms = int(time.time() * 1000)
         if now_ms < self.cooldown_until_ts:
-            rem_mins = int((self.cooldown_until_ts - now_ms) / (60 * 1000)) + 1
+            rem_mins = max(1, int((self.cooldown_until_ts - now_ms + 59999) // 60000))
             return True, rem_mins, self.cooldown_reason
         else:
             # 冷却结束，自动解除
             self.cooldown_until_ts = None
             self.cooldown_reason = None
             return False, 0, None
+
+    def record_symbol_stop_loss(self, symbol: str, cooldown_minutes: int = 30, reason: str = "触发止损平仓"):
+        """记录单币种止损，触发 30 分钟防洗盘追单冷静期"""
+        now_ms = int(time.time() * 1000)
+        until_ms = now_ms + cooldown_minutes * 60 * 1000
+        self.symbol_cooldowns[symbol] = until_ms
+        logger.warning(f"【标的止损冷静锁激活】标的 {symbol} 已锁定 {cooldown_minutes} 分钟防洗盘追单 (原因: {reason})")
+
+    def is_symbol_in_cooldown(self, symbol: str) -> Tuple[bool, int]:
+        """检查指定标的是否处于止损冷静期中"""
+        now_ms = int(time.time() * 1000)
+        until_ms = self.symbol_cooldowns.get(symbol)
+        if not until_ms:
+            return False, 0
+        if now_ms < until_ms:
+            rem_mins = max(1, int((until_ms - now_ms + 59999) // 60000))
+            return True, rem_mins
+        else:
+            self.symbol_cooldowns.pop(symbol, None)
+            return False, 0
 
     def record_closed_trade_pnl(self, pnl: float, reason: str = ""):
         """
@@ -306,6 +327,29 @@ class RiskController:
             return RiskCheckResult(
                 passed=False,
                 rejected_rule="TILT_PROTECTION_LOCK",
+                message=reason,
+                risk_status=self.risk_status
+            )
+
+        # ---------------------------------------------------------------------
+        # 规则 0.5: 单标的止损防洗盘冷静期 (SYMBOL_STOP_LOSS_COOLDOWN) 拦截
+        # ---------------------------------------------------------------------
+        is_sym_cd, sym_rem_mins = self.is_symbol_in_cooldown(order.symbol)
+        if is_sym_cd and not is_reduce_only:
+            reason = f"【标的止损冷静期】标的 {order.symbol} 刚触发止损平仓，正处于 {sym_rem_mins} 分钟防洗盘冷静期，已拦截开仓！"
+            await self.record_risk_event(
+                event_type=RiskEventType.ORDER_REJECTED,
+                rule_name="SYMBOL_STOP_LOSS_COOLDOWN_LOCK",
+                limit_val=f"{sym_rem_mins} mins remaining",
+                current_val="ORDER_ATTEMPT",
+                symbol=order.symbol,
+                is_blocked=True,
+                action_taken="REJECT_ORDER",
+                severity=AuditSeverity.WARNING
+            )
+            return RiskCheckResult(
+                passed=False,
+                rejected_rule="SYMBOL_STOP_LOSS_COOLDOWN_LOCK",
                 message=reason,
                 risk_status=self.risk_status
             )

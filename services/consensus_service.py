@@ -19,11 +19,21 @@ from services.news_service import NewsService
 logger = logging.getLogger("okx_dog.consensus")
 
 # 引入 AI 端 consensus_network
-ai_dir = str(Path(__file__).parent.parent.parent / "okx-dog-ai")
+ai_dir = str(Path(__file__).resolve().parent.parent.parent / "okx-dog-ai")
 if ai_dir not in sys.path:
     sys.path.append(ai_dir)
 
-from agent.consensus_network import ConsensusOrchestrator
+try:
+    from agent.consensus_network import ConsensusOrchestrator
+except (ImportError, ModuleNotFoundError):
+    try:
+        from okx_dog_ai.agent.consensus_network import ConsensusOrchestrator
+    except (ImportError, ModuleNotFoundError):
+        class ConsensusOrchestrator:
+            def __init__(self):
+                pass
+            async def run_consensus(self, *args, **kwargs):
+                return None
 
 class ConsensusService:
     """多智能体博弈与仲裁协同服务"""

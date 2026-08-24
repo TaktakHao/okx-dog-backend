@@ -79,8 +79,12 @@ async def place_trade_order(
                 timestamp=now_ms
             )
 
-    is_live = rest_client.is_live_mode and bool(rest_client.api_key)
-    current_positions = list(ws_manager.latest_positions.values()) if is_live else paper_engine.get_positions()
+    if rest_client.is_live_mode:
+        if not rest_client.api_key:
+            raise HTTPException(status_code=400, detail="当前处于实盘环境但未配置 OKX API Key，请先在右上角配置并保存 API 凭证！")
+        current_positions = list(ws_manager.latest_positions.values())
+    else:
+        current_positions = paper_engine.get_positions()
 
     # 1. 触发不可绕过的硬风控拦截
     risk_check = await risk_controller.check_order(req, current_ticker, current_positions)
@@ -94,7 +98,7 @@ async def place_trade_order(
         )
 
     # 2. 模拟沙盒撮合处理
-    if not is_live:
+    if not rest_client.is_live_mode:
         mkt_px = current_ticker.last_price if (current_ticker and current_ticker.last_price > 0) else fallback_px
 
         try:
@@ -243,14 +247,16 @@ async def get_orders_list(
 ):
     """获取当前委托挂单与订单列表 (实盘模式查询 OKX，模拟模式查询 PaperEngine)"""
     now_ms = int(time.time() * 1000)
-    is_live = rest_client.is_live_mode and bool(rest_client.api_key)
-    if not is_live:
+    if not rest_client.is_live_mode:
         orders = paper_engine.get_orders()
         if symbol:
             orders = [o for o in orders if o.symbol == symbol]
         if state:
             orders = [o for o in orders if (o.state.value if hasattr(o.state, "value") else str(o.state)).lower() == state.lower()]
         return ApiResponse(code=0, msg="【模拟操盘】订单列表", data=orders, timestamp=now_ms)
+
+    if not rest_client.api_key:
+        return ApiResponse(code=0, msg="【真实实盘】未配置 OKX API Key", data=[], timestamp=now_ms)
 
     try:
         okx_orders = await rest_client.get_orders(symbol=symbol)
@@ -264,9 +270,12 @@ async def get_orders_list(
 async def get_trade_history():
     """获取历史已平仓交易记录 (统计胜率、盈亏与平仓原因)"""
     now_ms = int(time.time() * 1000)
-    is_live = rest_client.is_live_mode and bool(rest_client.api_key)
-    if not is_live:
+    if not rest_client.is_live_mode:
         return ApiResponse(code=0, msg="【模拟操盘】历史平仓记录", data=paper_engine.closed_trades, timestamp=now_ms)
+
+    if not rest_client.api_key:
+        return ApiResponse(code=0, msg="【真实实盘】未配置 OKX API Key", data=[], timestamp=now_ms)
+
     return ApiResponse(code=0, msg="【真实实盘】历史平仓记录", data=[], timestamp=now_ms)
 
 
@@ -274,9 +283,11 @@ async def get_trade_history():
 async def get_positions_list():
     """获取当前持仓列表 (实盘模式查询 OKX 合约/杠杆/现货全景，模拟模式查询 PaperEngine)"""
     now_ms = int(time.time() * 1000)
-    is_live = rest_client.is_live_mode and bool(rest_client.api_key)
-    if not is_live:
+    if not rest_client.is_live_mode:
         return ApiResponse(code=0, msg="【模拟操盘】持仓列表", data=paper_engine.get_positions(), timestamp=now_ms)
+
+    if not rest_client.api_key:
+        return ApiResponse(code=0, msg="【真实实盘】未配置 OKX API Key，请先配置并保存实盘凭证", data=[], timestamp=now_ms)
 
     try:
         positions = await rest_client.get_positions(inst_type=None, include_spot=True)
@@ -293,8 +304,7 @@ async def get_positions_list():
 async def set_position_tpsl(req: SetPositionTPSLRequest):
     """为现有持仓修改止盈止损触发价"""
     now_ms = int(time.time() * 1000)
-    is_live = rest_client.is_live_mode and bool(rest_client.api_key)
-    if not is_live:
+    if not rest_client.is_live_mode:
         key = f"{req.symbol}:long"
         if key in paper_engine.positions:
             paper_engine.positions[key].tp_trigger_price = req.tp_trigger_price
@@ -315,6 +325,9 @@ async def set_position_tpsl(req: SetPositionTPSLRequest):
             timestamp=now_ms
         )
 
+    if not rest_client.api_key:
+        raise HTTPException(status_code=400, detail="实盘模式未配置 OKX API Key！")
+
     return ApiResponse(
         code=0,
         msg="止盈止损参数已成功更新",
@@ -331,8 +344,7 @@ async def set_position_tpsl(req: SetPositionTPSLRequest):
 async def close_position_endpoint(req: ClosePositionRequest):
     """对指定持仓进行快捷市价/限价平仓"""
     now_ms = int(time.time() * 1000)
-    is_live = rest_client.is_live_mode and bool(rest_client.api_key)
-    if not is_live:
+    if not rest_client.is_live_mode:
         res = paper_engine.close_position(
             symbol=req.symbol,
             pos_side=req.pos_side,
@@ -354,6 +366,9 @@ async def close_position_endpoint(req: ClosePositionRequest):
         ))
         return ApiResponse(code=0, msg=res["msg"], data=res, timestamp=now_ms)
 
+    if not rest_client.api_key:
+        raise HTTPException(status_code=400, detail="实盘模式未配置 OKX API Key！")
+
     res = await rest_client.close_position(
         symbol=req.symbol,
         mgn_mode="cross",
@@ -367,9 +382,24 @@ async def close_position_endpoint(req: ClosePositionRequest):
 async def get_account_balance():
     """获取账户总权益、可用保证金、已用保证金及保证金率"""
     now_ms = int(time.time() * 1000)
-    is_live = rest_client.is_live_mode and bool(rest_client.api_key)
-    if not is_live:
+    if not rest_client.is_live_mode:
         return ApiResponse(code=0, msg="【模拟操盘】资产全景", data=paper_engine.get_account_balance(), timestamp=now_ms)
+
+    if not rest_client.api_key:
+        empty_bal = AccountBalanceModel(
+            total_equity_usdt=0.0,
+            available_margin_usdt=0.0,
+            used_margin_usdt=0.0,
+            frozen_balance_usdt=0.0,
+            unrealized_pnl_usdt=0.0,
+            today_realized_pnl_usdt=0.0,
+            today_pnl_ratio=0.0,
+            margin_ratio=10.0,
+            is_warning_margin=False,
+            timestamp=now_ms,
+            updated_at=now_ms
+        )
+        return ApiResponse(code=0, msg="【真实实盘】未配置 OKX API Key", data=empty_bal, timestamp=now_ms)
 
     try:
         bal = await rest_client.get_account_balance()

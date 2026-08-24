@@ -220,6 +220,11 @@ flowchart TD
    若 $\text{Slippage} > \text{max\_slippage\_pct}$（默认 0.5%），自动将市价单转换为当前深度第 3 档限价单（IOC）或直接拒绝，杜绝深度不足时的插针流动性损耗。
 5. **持仓规模与标的数硬拦截 (`max_open_positions` & `max_position_usdt`)**：
    防止过度分散或过度加仓单一标的。
+6. **标的止损 30 分钟防洗盘追单冷静期 (`SYMBOL_STOP_LOSS_COOLDOWN_LOCK`)**：
+   当某标的被触发止损平仓（产生实际亏损）后，风控中枢自动对该标的激活 30 分钟交易冷却锁，拦截所有开仓追单，防止震荡市假突破反复止损被割。
+7. **执行摩擦优化与动态移动保本 (`POST_ONLY & Breakeven Lock`)**：
+   - 自动操盘优先采用 `POST_ONLY` 被动做市挂单（Maker），将单边手续费由 Taker 0.05% 降低至 Maker 0.02%（节省 60% 摩擦）；
+   - 开仓浮盈达 0.8%（或 0.5R）时，引擎自动将止损单无损平移至开仓均价（Breakeven Lock），将下行风险彻底归零。
 
 ---
 

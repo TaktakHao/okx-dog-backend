@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from config import settings
 from database import get_db
 from models import (
     ApiResponse,
@@ -248,11 +249,11 @@ async def get_llm_config(db: AsyncSession = Depends(get_db)):
     if not row:
         return ApiResponse(
             code=0,
-            msg="未配置大模型",
+            msg="未配置大模型 (默认启用本地 Antigravity CLI 驱动)",
             data=LLMConfigResponse(
-                llm_provider=LLMProvider.DEEPSEEK,
-                llm_base_url="https://api.deepseek.com",
-                llm_model="deepseek-reasoner",
+                llm_provider=LLMProvider.ANTIGRAVITY,
+                llm_base_url=settings.DEFAULT_LLM_BASE_URL,
+                llm_model=settings.DEFAULT_LLM_MODEL,
                 llm_api_key_masked=None,
                 llm_temperature=0.2,
                 llm_max_tokens=4096
@@ -260,7 +261,7 @@ async def get_llm_config(db: AsyncSession = Depends(get_db)):
             timestamp=now_ms
         )
 
-    provider_str = row.get("llm_provider") or "deepseek"
+    provider_str = row.get("llm_provider") or "antigravity"
     try:
         provider_enum = LLMProvider(provider_str)
     except ValueError:
@@ -271,8 +272,8 @@ async def get_llm_config(db: AsyncSession = Depends(get_db)):
         msg="success",
         data=LLMConfigResponse(
             llm_provider=provider_enum,
-            llm_base_url=row.get("llm_base_url") or "https://api.deepseek.com",
-            llm_model=row.get("llm_model") or "deepseek-reasoner",
+            llm_base_url=row.get("llm_base_url") or settings.DEFAULT_LLM_BASE_URL,
+            llm_model=row.get("llm_model") or settings.DEFAULT_LLM_MODEL,
             llm_api_key_masked=row.get("llm_api_key_masked"),
             llm_temperature=float(row.get("llm_temperature") if row.get("llm_temperature") is not None else 0.2),
             llm_max_tokens=int(row.get("llm_max_tokens") if row.get("llm_max_tokens") is not None else 4096)
@@ -383,8 +384,13 @@ async def test_llm_connection(
         if not (antigravity_bridge and antigravity_bridge.is_available()):
             return ApiResponse(
                 code=2004,
-                msg="Antigravity CLI (agy) 未就绪，请确保已安装并在 PATH 中",
-                data=TestLLMResponse(connected=False, latency_ms=0, model=target_model, message="CLI 未安装或路径不可用"),
+                msg="Antigravity CLI 本地服务未就绪。若在 Docker 容器中运行，请在宿主机终端启动 'python okx-dog-ai/antigravity_server.py'，或在上方切换为 DeepSeek / OpenAI 配置 API Key",
+                data=TestLLMResponse(
+                    connected=False,
+                    latency_ms=0,
+                    model=target_model,
+                    message="未探测到本地 agy 或 Antigravity 宿主机 HTTP 网关 (端口 8001)"
+                ),
                 timestamp=now_ms
             )
         return ApiResponse(

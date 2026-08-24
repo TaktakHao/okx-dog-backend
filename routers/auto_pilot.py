@@ -49,20 +49,34 @@ async def start_auto_pilot(req: Optional[AutoPilotStartRequest] = None):
     auto_lev = req.auto_leverage_enabled if req and req.auto_leverage_enabled is not None else True
     sym = req.symbol if req and req.symbol else "BTC-USDT-SWAP"
     symbols = req.symbols if req and req.symbols is not None else None
+    focus_symbols = req.focus_symbols if req and req.focus_symbols is not None else None
+    focus_mode = req.focus_mode if req and req.focus_mode is not None else None
+    max_scale = req.max_scale_layers if req and req.max_scale_layers is not None else None
+    scale_strat = req.scale_in_strategy if req and req.scale_in_strategy is not None else None
+    auto_rev = req.auto_reversal_enabled if req and req.auto_reversal_enabled is not None else None
     max_pos = req.max_concurrent_positions if req and req.max_concurrent_positions is not None else None
     trailing = req.trailing_stop_enabled if req and req.trailing_stop_enabled is not None else None
     be_ratio = req.breakeven_trigger_ratio if req and req.breakeven_trigger_ratio is not None else None
+    floor_eq = req.stop_loss_equity_floor if req and req.stop_loss_equity_floor is not None else None
+    max_loss = req.max_loss_limit_usdt if req and req.max_loss_limit_usdt is not None else None
 
     status = await auto_pilot_manager.start(
         initial_equity=cur_eq,
         is_live_mode=is_live,
         symbol=sym,
         symbols=symbols,
+        focus_symbols=focus_symbols,
+        focus_mode=focus_mode,
+        max_scale_layers=max_scale,
+        scale_in_strategy=scale_strat,
+        auto_reversal_enabled=auto_rev,
         max_concurrent_positions=max_pos,
         trailing_stop_enabled=trailing,
         breakeven_trigger_ratio=be_ratio,
         min_confidence=min_conf,
         auto_leverage_enabled=auto_lev,
+        stop_loss_equity_floor=floor_eq,
+        max_loss_limit_usdt=max_loss,
     )
 
     # 广播最新状态
@@ -86,12 +100,12 @@ async def stop_auto_pilot():
             bal = await rest_client.get_account_balance()
             cur_eq = bal.total_equity_usdt
         except Exception:
-            cur_eq = auto_pilot_manager.current_equity
+            cur_eq = auto_pilot_manager.get_state(True).current_equity
     else:
         bal = paper_engine.get_account_balance()
         cur_eq = bal.total_equity_usdt
 
-    status = await auto_pilot_manager.stop(current_equity=cur_eq)
+    status = await auto_pilot_manager.stop(current_equity=cur_eq, is_live_mode=is_live)
 
     await ws_manager.broadcast_to_subscribers(WSPushPayload[AutoPilotStatusModel](
         channel="auto_pilot",
@@ -114,14 +128,14 @@ async def get_auto_pilot_status():
             cur_eq = bal.total_equity_usdt
             upl = bal.unrealized_pnl_usdt
         except Exception:
-            cur_eq = auto_pilot_manager.current_equity
+            cur_eq = auto_pilot_manager.get_state(True).current_equity
             upl = 0.0
     else:
         bal = paper_engine.get_account_balance()
         cur_eq = bal.total_equity_usdt
         upl = bal.unrealized_pnl_usdt
 
-    status = auto_pilot_manager.get_status(current_equity=cur_eq, unrealized_pnl=upl)
+    status = auto_pilot_manager.get_status(current_equity=cur_eq, unrealized_pnl=upl, is_live_mode=is_live)
     return ApiResponse(code=0, msg="自动操盘实时收益全景", data=status, timestamp=now_ms)
 
 
@@ -129,26 +143,43 @@ async def get_auto_pilot_status():
 async def get_auto_pilot_history():
     """获取开启以来的时序收益曲线采样点与自动交易流水"""
     now_ms = int(time.time() * 1000)
-    history = auto_pilot_manager.get_history()
+    is_live = rest_client.is_live_mode and bool(rest_client.api_key)
+    history = auto_pilot_manager.get_history(is_live_mode=is_live)
     return ApiResponse(code=0, msg="自动操盘收益曲线与流水", data=history, timestamp=now_ms)
 
 
 @router.post("/config", response_model=ApiResponse[AutoPilotStatusModel], summary="更新自动操盘策略配置")
 async def update_auto_pilot_config(req: AutoPilotConfigUpdateRequest):
-    """更新跟单阈值、杠杆设置与多标的池"""
+    """更新跟单阈值、杠杆设置、专注模式与加仓策略"""
     now_ms = int(time.time() * 1000)
+    is_live = rest_client.is_live_mode and bool(rest_client.api_key)
     await auto_pilot_manager.update_config(
         min_confidence=req.min_confidence,
         auto_leverage_enabled=req.auto_leverage_enabled,
         symbol=req.symbol,
         symbols=req.symbols,
+        focus_symbols=req.focus_symbols,
+        focus_mode=req.focus_mode,
+        max_scale_layers=req.max_scale_layers,
+        scale_in_strategy=req.scale_in_strategy,
+        auto_reversal_enabled=req.auto_reversal_enabled,
         max_concurrent_positions=req.max_concurrent_positions,
         trailing_stop_enabled=req.trailing_stop_enabled,
         breakeven_trigger_ratio=req.breakeven_trigger_ratio,
+        stop_loss_equity_floor=req.stop_loss_equity_floor,
+        max_loss_limit_usdt=req.max_loss_limit_usdt,
+        is_live_mode=is_live,
     )
-    is_live = rest_client.is_live_mode and bool(rest_client.api_key)
-    cur_eq = paper_engine.cash if not is_live else 10000.0
-    status = auto_pilot_manager.get_status(current_equity=cur_eq)
+    if is_live:
+        try:
+            bal = await rest_client.get_account_balance()
+            cur_eq = bal.total_equity_usdt
+        except Exception:
+            cur_eq = auto_pilot_manager.get_state(True).current_equity
+    else:
+        cur_eq = paper_engine.get_account_balance().total_equity_usdt
+
+    status = auto_pilot_manager.get_status(current_equity=cur_eq, is_live_mode=is_live)
     return ApiResponse(code=0, msg="自动操盘策略配置已更新", data=status, timestamp=now_ms)
 
 
@@ -167,5 +198,6 @@ async def reset_auto_pilot_stats():
         bal = paper_engine.get_account_balance()
         cur_eq = bal.total_equity_usdt
 
-    status = await auto_pilot_manager.reset_stats(current_equity=cur_eq)
+    status = await auto_pilot_manager.reset_stats(current_equity=cur_eq, is_live_mode=is_live)
     return ApiResponse(code=0, msg="自动操盘收益统计基准已重置", data=status, timestamp=now_ms)
+

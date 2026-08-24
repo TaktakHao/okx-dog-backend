@@ -27,6 +27,7 @@ from models import (
     TimeframeTrend,
     TradePlan,
     TradePlanOrderType,
+    PosSide,
 )
 
 try:
@@ -43,11 +44,13 @@ def generate_quantitative_rule_decision(
     multi_indicators: MultiPeriodIndicators,
     derivatives: DerivativesMetrics,
     risk_limits: Optional[Any] = None,
+    position: Optional[Any] = None,
+    available_funds: Optional[float] = None,
     model_name: str = "quantitative-rule-v2"
 ) -> AIAnalysisResponse:
     """
     基于实时多周期指标矩阵 (15m/1h/4h/1d EMA/MACD/RSI/ATR/布林带) 与衍生品情绪，
-    通过高保真量化规则算法动态推导结构化交易决策与思维链。
+    结合当前实盘可用资金 (available_funds) 与持仓上下文，通过高保真量化规则算法动态推导结构化交易决策与思维链。
     杜绝任何写死的假数据与历史老数据。
     """
     now_ms = int(time.time() * 1000)
@@ -92,6 +95,20 @@ def generate_quantitative_rule_decision(
     else:
         is_bullish = (ema20_1h >= ema50_1h and rsi_1h >= 48.0) or (rsi_1h > 58.0)
         is_bearish = (ema20_1h < ema50_1h and rsi_1h <= 45.0) or (rsi_1h < 38.0)
+
+    # 持仓感知 (Position-Aware) 动态增强：已有持仓若处于顺势浮盈 (≥0.8%) 且未破位，增强顺势加仓动能
+    if position and hasattr(position, "avg_px") and position.avg_px > 0 and position.pos > 0:
+        is_pos_long = (position.pos_side == PosSide.LONG)
+        pos_profit_ratio = (current_price - position.avg_px) / position.avg_px if is_pos_long else (position.avg_px - current_price) / position.avg_px
+        if pos_profit_ratio >= 0.008:
+            if is_pos_long:
+                is_bullish = True
+                is_bearish = False
+                is_squeezed = False
+            else:
+                is_bearish = True
+                is_bullish = False
+                is_squeezed = False
 
     max_lev = (risk_limits.max_leverage if risk_limits and hasattr(risk_limits, "max_leverage") else 5)
     sug_lev = min(3, max_lev)
