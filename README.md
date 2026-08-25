@@ -27,6 +27,11 @@ OKX-Dog 后端是基于 Python 异步架构构建的高并发量化交易与 7x2
    - 支持全真模拟撮合、动态盯市计算浮动盈亏（UPL）、自动止盈止损触发。
 5. **REST API 网关 (`routers/`)**:
    - 多标的检索过滤 (`/api/v1/market/symbols`)、订单流转、持仓管理、AI 决策触发、SSE 流式接口。
+6. **智能体自演化与 AI 员工看板网关 (`routers/evolution.py`)**:
+   - 获取 6 位 AI 员工档案与动态话语权 (`/api/v1/evolution/team`)；
+   - 历史演进版本快照查询 (`/api/v1/evolution/history`)；
+   - 一键回滚出厂黄金基准 (`/api/v1/evolution/rollback`) 与恢复出厂初始设置 (`/api/v1/evolution/reset`)；
+   - 模拟结算对决与自适应学习 (`/api/v1/evolution/simulate-reinforcement`)。
 
 ## 快速启动与测试
 
