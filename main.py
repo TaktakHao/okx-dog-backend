@@ -206,6 +206,10 @@ app.include_router(telegram_router)
 # v3.5 AI Quant Studio & Codex Harness 策略实验室路由
 app.include_router(studio_router)
 
+# v3.6 多智能体自适应强化奖励与 AI 员工看板路由
+from routers.evolution import router as evolution_router
+app.include_router(evolution_router)
+
 
 
 # =============================================================================

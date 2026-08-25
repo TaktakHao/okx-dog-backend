@@ -77,7 +77,9 @@ class RiskController:
             max_leverage=settings.DEFAULT_MAX_LEVERAGE,
             max_slippage_pct=settings.DEFAULT_MAX_SLIPPAGE_PCT,
             max_open_positions=10,
-            max_position_usdt=100000.0
+            max_position_usdt=100000.0,
+            fixed_risk_per_trade_percent=0.01,
+            enforce_post_only=True
         )
 
         # 内存实时风控状态机
@@ -399,6 +401,28 @@ class RiskController:
             )
 
         # ---------------------------------------------------------------------
+        # 规则 2.5: 强制 Post-Only (Maker) 保护与市价单 Taker 阻断
+        # ---------------------------------------------------------------------
+        if self.rules.enforce_post_only and not is_reduce_only and order.order_type == OrderType.MARKET:
+            reason = "【硬风控拦截】为彻底消除 Taker 吃单滑点与高额手续费损耗，系统已强制锁定仅允许 Post-Only/限价委托开仓！"
+            await self.record_risk_event(
+                event_type=RiskEventType.ORDER_REJECTED,
+                rule_name="ENFORCE_POST_ONLY_MAKER",
+                limit_val="POST_ONLY_ONLY",
+                current_val="MARKET_ATTEMPT",
+                symbol=order.symbol,
+                is_blocked=True,
+                action_taken="REJECT_ORDER",
+                severity=AuditSeverity.WARNING
+            )
+            return RiskCheckResult(
+                passed=False,
+                rejected_rule="ENFORCE_POST_ONLY_MAKER",
+                message=reason,
+                risk_status=self.risk_status
+            )
+
+        # ---------------------------------------------------------------------
         # 规则 3: 杠杆倍数硬锁上限与单日亏损降杠杆惩罚
         # ---------------------------------------------------------------------
         effective_max_leverage = self.rules.max_leverage
@@ -697,6 +721,40 @@ class RiskController:
             circuit_broken_at=now_ms,
             message=msg
         )
+
+    def calculate_fixed_risk_position_size(
+        self,
+        equity: float,
+        entry_price: float,
+        stop_loss_price: float,
+        contract_val: float = 1.0,
+        risk_pct: Optional[float] = None
+    ) -> float:
+        """
+        基于恒定 1% 资金风险模型 (Fixed Fractional Risk) 计算开仓张数/币数
+        公式: Position Size = (Equity * RiskPct) / (|Entry - StopLoss| * ContractVal)
+        示例: 7000 USDT 本金, 1% 风险 = 70 USDT 亏损上限。
+        """
+        pct = risk_pct if risk_pct is not None else self.rules.fixed_risk_per_trade_percent
+        max_loss_usdt = equity * pct
+        price_diff = abs(entry_price - stop_loss_price)
+
+        if price_diff <= 0 or contract_val <= 0:
+            logger.warning(f"[RiskController] 止损距离或合约面值异常: diff={price_diff}, val={contract_val}")
+            return 0.0
+
+        raw_size = max_loss_usdt / (price_diff * contract_val)
+
+        # 检查是否受单笔最大名义金额限制
+        estimated_notional = raw_size * entry_price * contract_val
+        if estimated_notional > self.rules.max_order_usdt:
+            raw_size = self.rules.max_order_usdt / (entry_price * contract_val)
+
+        logger.info(
+            f"🎯【1% 风险头寸计算】净值={equity:.2f} USDT, 风险限额={max_loss_usdt:.2f} USDT (1%), "
+            f"入场={entry_price}, 止损={stop_loss_price}, 距离={price_diff:.2f} -> 建议开仓={raw_size:.4f} 张/币 (名义价值 ${raw_size * entry_price * contract_val:.2f})"
+        )
+        return round(raw_size, 4)
 
 
 # 单例硬风控中枢

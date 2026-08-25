@@ -1222,18 +1222,19 @@ class AutoPilotManager:
                         pos_side = PosSide.SHORT if is_short else PosSide.LONG
                         lev = min(plan.suggested_leverage or 3, risk_controller.rules.max_leverage if risk_controller.rules else 5)
 
-                        risk_budget = max(5.0, avail_funds * 0.02)
                         sl_px = plan.stop_loss_price or (ref_px * 0.985 if not is_short else ref_px * 1.015)
                         stop_dist = max(abs(ref_px - sl_px), ref_px * 0.008)
-                        calc_coins = risk_budget / stop_dist
-                        raw_notional = calc_coins * ref_px
 
-                        max_order_cap = min(
-                            risk_controller.rules.max_order_usdt if risk_controller.rules else 50000.0,
-                            avail_funds * lev * 0.90
+                        # 使用 L0 核心硬风控 1% 恒定资金风险模型计算头寸 (7000 USDT 本金对应 70 USDT 最大亏损)
+                        final_coins = risk_controller.calculate_fixed_risk_position_size(
+                            equity=cur_eq,
+                            entry_price=ref_px,
+                            stop_loss_price=sl_px,
+                            contract_val=1.0,
+                            risk_pct=0.01
                         )
-                        final_notional = min(raw_notional, max_order_cap)
-                        final_coins = max(0.001, math.floor((final_notional / ref_px) * 1000) / 1000.0)
+                        if final_coins <= 0:
+                            final_coins = 0.001
 
                         tp_target = None
                         if hasattr(plan, "take_profit_levels") and plan.take_profit_levels:
@@ -1245,12 +1246,24 @@ class AutoPilotManager:
                         else:
                             tp_target = round(ref_px + stop_dist * 2.0, 2)
 
+                        # 确定限价挂单价格 (Maker)
+                        limit_entry_px = ref_px
+                        if hasattr(plan, "entry_range") and plan.entry_range and len(plan.entry_range) == 2:
+                            limit_entry_px = (plan.entry_range[0] + plan.entry_range[1]) / 2.0
+                        elif is_short:
+                            limit_entry_px = round(ref_px * 1.0005, 2)
+                        else:
+                            limit_entry_px = round(ref_px * 0.9995, 2)
+
+                        exec_order_type = OrderType.POST_ONLY if (state.post_only_preferred or risk_controller.rules.enforce_post_only) else OrderType.LIMIT
+
                         order_req = PlaceOrderRequest(
                             symbol=target_symbol,
                             inst_type=InstType.SWAP,
                             side=side,
                             pos_side=pos_side,
-                            order_type=OrderType.MARKET,
+                            order_type=exec_order_type,
+                            price=limit_entry_px,
                             size=final_coins,
                             leverage=lev,
                             tp_trigger_price=tp_target,

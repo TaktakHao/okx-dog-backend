@@ -150,8 +150,9 @@ class SignalUrgency(str, Enum):
 
 class TradePlanOrderType(str, Enum):
     """建议交易计划委托类型"""
+    POST_ONLY = "POST_ONLY"                  # 只做 Maker 被动挂单 (无吃单滑点与费率返还)
     LIMIT = "LIMIT"                          # 限价单
-    MARKET = "MARKET"                        # 市价单
+    MARKET = "MARKET"                        # 市价单 (兼容历史)
     TRIGGER_LIMIT = "TRIGGER_LIMIT"          # 条件计划限价单
 
 
@@ -386,6 +387,8 @@ class RiskRulesConfig(BaseModel):
     max_position_usdt: float = Field(100000.0, gt=0, description="单标的最大持仓名义价值 (USDT)")
     default_stop_loss_pct: Optional[float] = Field(None, description="默认附带止损百分比")
     default_take_profit_pct: Optional[float] = Field(None, description="默认附带止盈百分比")
+    fixed_risk_per_trade_percent: float = Field(0.01, gt=0.0, le=0.1, description="单笔最大风险暴露比例 (默认 1% 净值，7000 USDT 本金对应 70 USDT)")
+    enforce_post_only: bool = Field(True, description="开仓委托是否强制 Post-Only 只做 Maker 消除 Taker 滑点与费率磨损")
 
 
 
@@ -744,15 +747,50 @@ class TradePlan(BaseModel):
     """建议交易计划与量化点位参数 (AI_SCHEMA properties.trade_plan)"""
     model_config = ConfigDict(populate_by_name=True)
 
+    intent: str = Field("WAIT_OBSERVE", description="战术交易逻辑分类：SHORT_SQUEEZE, LIQUIDITY_SWEEP, TREND_CONTINUATION, MEAN_REVERSION, BREAKOUT_FOLLOW, WAIT_OBSERVE")
     entry_range: List[float] = Field(..., min_length=2, max_length=2, description="建议入场价格区间 [最低入场价, 最高入场价]")
     take_profit_levels: List[TakeProfitLevel] = Field(..., min_length=1, max_length=4, description="分批止盈目标列表")
     stop_loss_price: float = Field(..., ge=0.0, description="硬止损价格")
     risk_reward_ratio: float = Field(..., ge=0.0, description="理论盈亏比 (R:R Ratio)")
     suggested_leverage: int = Field(..., ge=1, le=20, description="建议杠杆倍数 (1 ~ 20)")
-    order_type: TradePlanOrderType = Field(TradePlanOrderType.LIMIT, description="建议委托类型：LIMIT, MARKET, TRIGGER_LIMIT")
+    order_type: TradePlanOrderType = Field(TradePlanOrderType.POST_ONLY, description="建议委托类型：POST_ONLY, LIMIT, TRIGGER_LIMIT")
 
 
 AITradePlan = TradePlan  # 别名兼容
+
+
+class MarketAnomalyTriggerType(str, Enum):
+    """L1 毫秒级微观异动触发类型"""
+    OI_SURGE_BREAKOUT = "OI_SURGE_BREAKOUT"                    # 15m 持仓量 (OI) 暴增突破
+    EXTREME_FUNDING_DIVERGENCE = "EXTREME_FUNDING_DIVERGENCE"  # 资金费率极端倒挂与情绪偏离
+    LIQUIDITY_SWEEP_REVERSAL = "LIQUIDITY_SWEEP_REVERSAL"      # 流动性假突破与均值回归
+    MASSIVE_LIQUIDATION_CASCADE = "MASSIVE_LIQUIDATION_CASCADE"# 密集清算爆仓踩踏
+
+
+class MicrostructureMetrics(BaseModel):
+    """L1 毫秒级微观结构指标"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: str = Field(..., description="标的代码")
+    timestamp: int = Field(..., description="毫秒时间戳")
+    order_book_imbalance: float = Field(..., description="前10档买卖盘挂单失衡率 OBI [-1.0, 1.0]")
+    cumulative_volume_delta: float = Field(..., description="15m 累积主动买卖量差 CVD")
+    oi_surge_pct: float = Field(..., description="15m 未平仓合约量变化率 (%)")
+    funding_rate_annualized: float = Field(..., description="当前当期资金费率折合年化率 (%)")
+    recent_liquidations_usdt: float = Field(0.0, description="近5分钟清算爆仓名义金额")
+
+
+class MarketAnomalyEvent(BaseModel):
+    """L1 触发 L2 条件唤醒的异动事件数据包"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    event_id: str = Field(..., description="事件唯一 UUID")
+    symbol: str = Field(..., description="异动标的代码")
+    timestamp: int = Field(..., description="毫秒时间戳")
+    trigger_type: MarketAnomalyTriggerType = Field(..., description="触发异动类型")
+    severity: str = Field("WARNING", description="严重程度: INFO, WARNING, CRITICAL")
+    metrics_snapshot: MicrostructureMetrics = Field(..., description="异动发生时的微观指标快照")
+    reason: str = Field(..., description="异动触发具体依据与参数")
 
 
 class RiskAssessment(BaseModel):
