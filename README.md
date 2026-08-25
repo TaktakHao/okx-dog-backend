@@ -31,7 +31,8 @@ OKX-Dog 后端是基于 Python 异步架构构建的高并发量化交易与 7x2
    - 获取 6 位 AI 员工档案与动态话语权 (`/api/v1/evolution/team`)；
    - 历史演进版本快照查询 (`/api/v1/evolution/history`)；
    - 一键回滚出厂黄金基准 (`/api/v1/evolution/rollback`) 与恢复出厂初始设置 (`/api/v1/evolution/reset`)；
-   - 模拟结算对决与自适应学习 (`/api/v1/evolution/simulate-reinforcement`)。
+   - 话语权自适应进化仅由实盘真实交易结算（PnL/MFE/MAE/排雷）闭环驱动，物理隔离模拟干预。
+
 
 ## 快速启动与测试
 

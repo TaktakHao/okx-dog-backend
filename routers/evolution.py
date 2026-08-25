@@ -32,17 +32,6 @@ class ApiResponse(BaseModel):
     data: Optional[Any] = None
 
 
-class SimulateReinforcementReq(BaseModel):
-    symbol: str = Field(default="BTC-USDT-SWAP")
-    pos_side: str = Field(default="LONG")
-    entry_price: float = Field(default=96000.0)
-    exit_price: float = Field(default=97500.0)
-    sl_price: float = Field(default=95200.0)
-    realized_pnl: float = Field(default=150.0)
-    mfe_pct: float = Field(default=0.018)
-    mae_pct: float = Field(default=0.003)
-    is_crisis_defended: bool = Field(default=False)
-
 
 @router.get("/team", response_model=ApiResponse, summary="获取决策层 AI 员工团队档案与当前话语权")
 async def get_team_status():
@@ -92,32 +81,3 @@ async def reset_team():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/simulate-reinforcement", response_model=ApiResponse, summary="模拟单笔平仓触发强化奖励与进化 (用于演示联调)")
-async def simulate_reinforcement(req: SimulateReinforcementReq):
-    """模拟一笔交易结算并触发动态进化"""
-    try:
-        manager = AgentEvolutionManager.get_instance()
-        mock_opinions = {
-            "bull_specialist": {"role_name": "多头辩护专家", "stance": "BULLISH", "confidence": 0.82},
-            "bear_critic": {"role_name": "空头风控专家", "stance": "BEARISH", "confidence": 0.45},
-            "macro_news": {"role_name": "宏观舆情专家", "stance": "BULLISH", "confidence": 0.70},
-            "micro_sniper": {"role_name": "微观盘口分析师", "stance": "BULLISH", "confidence": 0.78},
-            "chief_arbiter": {"role_name": "首席量化仲裁官", "stance": "BULLISH", "confidence": 0.85},
-        }
-        outcome = manager.process_trade_reinforcement(
-            trade_id=f"sim_{int(req.entry_price)}",
-            symbol=req.symbol,
-            pos_side=req.pos_side,
-            entry_price=req.entry_price,
-            exit_price=req.exit_price,
-            sl_price=req.sl_price,
-            realized_pnl=req.realized_pnl,
-            mfe_pct=req.mfe_pct,
-            mae_pct=req.mae_pct,
-            agent_opinions=mock_opinions,
-            is_crisis_defended=req.is_crisis_defended
-        )
-        return ApiResponse(code=0, msg="演进结算完成", data=outcome.dict())
-    except Exception as e:
-        logger.exception("模拟进化异常: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
