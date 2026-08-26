@@ -1466,6 +1466,7 @@ class AutoPilotStatusModel(BaseModel):
     auto_leverage_enabled: bool = Field(True, description="是否启用自适应智能杠杆")
     stop_loss_equity_floor: Optional[float] = Field(None, description="最低保留本金底线 (USDT，亏损至该值自动熔断停止操盘)")
     max_loss_limit_usdt: Optional[float] = Field(None, description="最大允许亏损金额 (USDT)")
+    aggressiveness_mode: str = Field("BALANCED", description="操盘激进程度: CONSERVATIVE 保守稳健 / BALANCED 标准量化 / AGGRESSIVE 积极进攻")
     is_live_mode: bool = Field(False, description="是否为实盘环境")
     last_patrol_time: Optional[int] = Field(None, description="最近一次后端自动巡检时间戳 (ms)")
     last_patrol_log: Optional[str] = Field(None, description="最近一次后端自动巡检结果概要")
@@ -1507,6 +1508,7 @@ class AutoPilotHistoryResponse(BaseModel):
 
 class AutoPilotStartRequest(BaseModel):
     """开启自动操盘请求"""
+    aggressiveness_mode: Optional[str] = Field("BALANCED", description="操盘激进程度: CONSERVATIVE / BALANCED / AGGRESSIVE")
     min_confidence: Optional[float] = Field(0.70, ge=0.50, le=0.99, description="自动跟单最低置信度门槛")
     auto_leverage_enabled: Optional[bool] = Field(True, description="是否启用自适应智能杠杆")
     stop_loss_equity_floor: Optional[float] = Field(None, description="最低保留本金底线 (USDT，如当前8000U设7000U，亏损至该值自动停止操盘)")
@@ -1525,6 +1527,7 @@ class AutoPilotStartRequest(BaseModel):
 
 class AutoPilotConfigUpdateRequest(BaseModel):
     """更新自动操盘策略参数请求"""
+    aggressiveness_mode: Optional[str] = Field(None, description="操盘激进程度: CONSERVATIVE / BALANCED / AGGRESSIVE")
     min_confidence: Optional[float] = Field(None, ge=0.50, le=0.99, description="自动跟单最低置信度门槛")
     auto_leverage_enabled: Optional[bool] = Field(None, description="是否启用自适应智能杠杆")
     stop_loss_equity_floor: Optional[float] = Field(None, description="最低保留本金底线 (USDT，亏损至该值自动熔断停止操盘)")

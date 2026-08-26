@@ -46,6 +46,7 @@ def generate_quantitative_rule_decision(
     risk_limits: Optional[Any] = None,
     position: Optional[Any] = None,
     available_funds: Optional[float] = None,
+    aggressiveness_mode: str = "BALANCED",
     model_name: str = "quantitative-rule-v2"
 ) -> AIAnalysisResponse:
     """
@@ -84,14 +85,19 @@ def generate_quantitative_rule_decision(
     bb_up_15m = (tf_15m.bb_upper if (tf_15m and tf_15m.bb_upper > 0) else current_price * 1.012)
     bb_low_15m = (tf_15m.bb_lower if (tf_15m and tf_15m.bb_lower > 0) else current_price * 0.988)
 
-    # 波动率挤压检测
+    # 波动率挤压检测 (激进模式下放宽挤压过滤，鼓励捕捉短线突破)
     bb_bandwidth = (bb_up_15m - bb_low_15m) / max(current_price, 1e-6)
-    is_squeezed = (bb_bandwidth < 0.015) or (atr_15m / max(current_price, 1e-6) < 0.0035)
+    is_agg = (aggressiveness_mode.upper() == "AGGRESSIVE")
+    is_squeezed = False if is_agg else ((bb_bandwidth < 0.015) or (atr_15m / max(current_price, 1e-6) < 0.0035))
 
     # 判定多空趋势与共振状态
     if is_squeezed:
         is_bullish = False
         is_bearish = False
+    elif is_agg:
+        # 激进模式：以 15m/1h 动量优先触发
+        is_bullish = (rsi_15m >= 48.0 and current_price >= ema20_1h * 0.997) or (rsi_1h >= 50.0)
+        is_bearish = (rsi_15m <= 52.0 and current_price <= ema20_1h * 1.003) or (rsi_1h <= 48.0)
     else:
         is_bullish = (ema20_1h >= ema50_1h and rsi_1h >= 48.0) or (rsi_1h > 58.0)
         is_bearish = (ema20_1h < ema50_1h and rsi_1h <= 45.0) or (rsi_1h < 38.0)

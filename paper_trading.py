@@ -410,6 +410,27 @@ class PaperTradingEngine:
                 except Exception as cb_err:
                     logger.warning(f"平仓回调执行异常: {cb_err}")
 
+            # 触发 AI 员工自演进与战绩更新
+            try:
+                import sys, os
+                ai_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "okx-dog-ai"))
+                if ai_path not in sys.path:
+                    sys.path.insert(0, ai_path)
+                from agent.evolution.evolution_manager import AgentEvolutionManager
+                evo_mgr = AgentEvolutionManager.get_instance()
+                evo_mgr.process_trade_reinforcement(
+                    trade_id=f"sim_trade_{now_ms}",
+                    symbol=symbol,
+                    pos_side=pos.pos_side.value if hasattr(pos.pos_side, "value") else str(pos.pos_side),
+                    entry_price=pos.avg_px,
+                    exit_price=close_price,
+                    sl_price=pos.sl_trigger_price or (close_price if "止损" in reason else pos.avg_px * 0.985),
+                    realized_pnl=pnl,
+                    is_crisis_defended=("保本" in reason or "防守" in reason or "排雷" in reason or "风控" in reason)
+                )
+            except Exception as evo_err:
+                logger.debug(f"模拟操盘 AI 演进联动跳过: {evo_err}")
+
             if close_ratio >= 0.999:
                 del self.positions[k]
             else:

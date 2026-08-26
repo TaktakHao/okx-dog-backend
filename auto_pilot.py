@@ -72,6 +72,7 @@ class AutoPilotEnvState:
         ]
         self.symbols: List[str] = list(self.focus_symbols)
         self.focus_mode: str = "SINGLE_SYMBOL"  # SINGLE_SYMBOL | MULTI_SYMBOL_POOL
+        self.aggressiveness_mode: str = "BALANCED"  # CONSERVATIVE | BALANCED | AGGRESSIVE
         self.max_scale_layers: int = 3          # 最大加仓层数 (1~5)
         self.scale_in_strategy: str = "SMART_HYBRID"  # PYRAMIDING | PULLBACK_DCA | SMART_HYBRID
         self.auto_reversal_enabled: bool = True  # 遇到强反向信号是否自动反手
@@ -111,6 +112,20 @@ class AutoPilotEnvState:
                 pnl_ratio=0.0,
             )
         )
+
+    def apply_aggressiveness_preset(self, mode: str):
+        """应用激进程度预设参数"""
+        m = (mode or "BALANCED").upper()
+        self.aggressiveness_mode = m
+        if m == "CONSERVATIVE":
+            self.min_confidence = 0.80
+            self.max_scale_layers = 1
+        elif m == "AGGRESSIVE":
+            self.min_confidence = 0.60
+            self.max_scale_layers = 5
+        else:  # BALANCED
+            self.min_confidence = 0.70
+            self.max_scale_layers = 3
 
     def reset_for_start(self, initial_equity: float):
         """开启或重置新会话"""
@@ -392,6 +407,7 @@ class AutoPilotManager:
         self,
         initial_equity: float,
         is_live_mode: Optional[bool] = None,
+        aggressiveness_mode: Optional[str] = "BALANCED",
         symbol: str = "BTC-USDT-SWAP",
         symbols: Optional[List[str]] = None,
         focus_symbols: Optional[List[str]] = None,
@@ -417,6 +433,8 @@ class AutoPilotManager:
 
             # 开启新会话并重置统计基准
             state.reset_for_start(initial_equity=initial_equity)
+            if aggressiveness_mode:
+                state.apply_aggressiveness_preset(aggressiveness_mode)
             state.symbol = symbol
 
             # 资金保护底线设定
@@ -539,6 +557,7 @@ class AutoPilotManager:
 
     async def update_config(
         self,
+        aggressiveness_mode: Optional[str] = None,
         min_confidence: Optional[float] = None,
         auto_leverage_enabled: Optional[bool] = None,
         symbol: Optional[str] = None,
@@ -558,6 +577,9 @@ class AutoPilotManager:
         """更新并记忆指定环境的策略配置"""
         async with self._lock:
             state = self.get_state(is_live_mode)
+
+            if aggressiveness_mode is not None:
+                state.apply_aggressiveness_preset(aggressiveness_mode)
 
             if min_confidence is not None:
                 state.min_confidence = min_confidence
@@ -602,8 +624,9 @@ class AutoPilotManager:
                 state.breakeven_trigger_ratio = breakeven_trigger_ratio
 
             logger.info(
-                f"【自动操盘中枢】{'实盘' if state.is_live_mode else '模拟'}配置已更新并记忆: 模式={state.focus_mode}, 主标的={state.symbol}, "
-                f"关注池={state.focus_symbols}, 本金底线={state.stop_loss_equity_floor}, 加仓层数={state.max_scale_layers}, 自动反手={state.auto_reversal_enabled}"
+                f"【自动操盘中枢】{'实盘' if state.is_live_mode else '模拟'}配置已更新并记忆: 激进程度={state.aggressiveness_mode}, "
+                f"模式={state.focus_mode}, 主标的={state.symbol}, 关注池={state.focus_symbols}, "
+                f"置信度={state.min_confidence}, 加仓层数={state.max_scale_layers}"
             )
 
     # ---------------- 收益采样与交易战绩记录 ----------------
@@ -714,6 +737,27 @@ class AutoPilotManager:
                         risk_controller.record_symbol_stop_loss(symbol, state.stop_loss_cooldown_minutes, reason)
                 except Exception as rc_err:
                     logger.debug(f"风控止损记录同步跳过: {rc_err}")
+
+            # 触发多智能体强化学习自演进与 AI 员工战绩闭环更新
+            try:
+                import sys, os
+                ai_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "okx-dog-ai"))
+                if ai_path not in sys.path:
+                    sys.path.insert(0, ai_path)
+                from agent.evolution.evolution_manager import AgentEvolutionManager
+                evo_mgr = AgentEvolutionManager.get_instance()
+                evo_mgr.process_trade_reinforcement(
+                    trade_id=order_id or record_id,
+                    symbol=symbol,
+                    pos_side=pos_side,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    sl_price=exit_price if ("止损" in reason or "SL" in reason) else entry_price * 0.985,
+                    realized_pnl=realized_pnl,
+                    is_crisis_defended=("保本" in reason or "防守" in reason or "排雷" in reason or "风控" in reason)
+                )
+            except Exception as evo_err:
+                logger.warning(f"【自动操盘中枢】AI员工自演进联动跳过: {evo_err}")
 
             # 持久化到 SQLite
             try:
@@ -828,6 +872,7 @@ class AutoPilotManager:
             auto_leverage_enabled=state.auto_leverage_enabled,
             stop_loss_equity_floor=state.stop_loss_equity_floor,
             max_loss_limit_usdt=state.max_loss_limit_usdt,
+            aggressiveness_mode=state.aggressiveness_mode,
             is_live_mode=state.is_live_mode,
             last_patrol_time=state.last_patrol_time,
             last_patrol_log=state.last_patrol_log,
@@ -1179,6 +1224,23 @@ class AutoPilotManager:
                     if len(held_pos_map) >= state.max_concurrent_positions:
                         break
 
+                    # 动态刷新当前最新可用保证金
+                    if is_live:
+                        try:
+                            bal = await rest_client.get_account_balance()
+                            avail_funds = bal.available_margin_usdt if bal.available_margin_usdt > 0 else bal.total_equity_usdt
+                            cur_eq = bal.total_equity_usdt
+                        except Exception:
+                            pass
+                    else:
+                        bal = paper_engine.get_account_balance()
+                        avail_funds = bal.available_margin_usdt if bal.available_margin_usdt > 0 else bal.total_equity_usdt
+                        cur_eq = bal.total_equity_usdt
+
+                    if avail_funds < 20.0:
+                        patrol_summaries.append(f"{target_symbol}(可用保证金不足)")
+                        continue
+
                     # 交易时段检查：美股代币周末休市过滤
                     is_tradfi_equity = any(t in target_symbol.upper() for t in ["NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "SPY", "QQQ"])
                     now_dt = datetime.utcnow()
@@ -1193,12 +1255,14 @@ class AutoPilotManager:
                         cur_tk = ws_manager.latest_tickers.get(target_symbol)
                         ref_px = cur_tk.last_price if (cur_tk and cur_tk.last_price > 0) else paper_engine.last_price_map.get(target_symbol, 100.0)
 
+                        agg_mode = getattr(state, "aggressiveness_mode", "BALANCED").upper()
                         decision = generate_quantitative_rule_decision(
                             symbol=target_symbol,
                             current_price=ref_px,
                             multi_indicators=multi_ind,
                             derivatives=deriv,
                             risk_limits=risk_controller.rules,
+                            aggressiveness_mode=agg_mode,
                         )
                     except Exception as eval_err:
                         logger.debug(f"标的 {target_symbol} 决策推导跳过: {eval_err}")
@@ -1216,25 +1280,41 @@ class AutoPilotManager:
                             patrol_summaries.append(f"{target_symbol}(已建仓)")
                             continue
 
-                        # 科学仓位核算 (2% 风险预算与可用保证金双重约束)
-                        is_short = action == SignalAction.SELL_SHORT
+                        # 科学方向与仓位核算
+                        is_short = (action == SignalAction.SELL_SHORT)
                         side = OrderSide.SELL if is_short else OrderSide.BUY
                         pos_side = PosSide.SHORT if is_short else PosSide.LONG
-                        lev = min(plan.suggested_leverage or 3, risk_controller.rules.max_leverage if risk_controller.rules else 5)
+
+                        # 根据激进程度动态决定资金风险比例与杠杆上限
+                        agg_mode = getattr(state, "aggressiveness_mode", "BALANCED").upper()
+                        if agg_mode == "CONSERVATIVE":
+                            risk_pct = 0.005
+                            lev_cap = 3
+                        elif agg_mode == "AGGRESSIVE":
+                            risk_pct = 0.020
+                            lev_cap = 8
+                        else:  # BALANCED
+                            risk_pct = 0.010
+                            lev_cap = 5
+
+                        max_sys_lev = risk_controller.rules.max_leverage if risk_controller.rules else 5
+                        lev = min(plan.suggested_leverage or 3, lev_cap, max_sys_lev)
 
                         sl_px = plan.stop_loss_price or (ref_px * 0.985 if not is_short else ref_px * 1.015)
                         stop_dist = max(abs(ref_px - sl_px), ref_px * 0.008)
 
-                        # 使用 L0 核心硬风控 1% 恒定资金风险模型计算头寸 (7000 USDT 本金对应 70 USDT 最大亏损)
-                        final_coins = risk_controller.calculate_fixed_risk_position_size(
+                        # 使用 L0 核心硬风控根据激进程度动态计算头寸
+                        raw_coins = risk_controller.calculate_fixed_risk_position_size(
                             equity=cur_eq,
                             entry_price=ref_px,
                             stop_loss_price=sl_px,
                             contract_val=1.0,
-                            risk_pct=0.01
+                            risk_pct=risk_pct
                         )
-                        if final_coins <= 0:
-                            final_coins = 0.001
+                        # 双重约束：严格限制不超过当前可用保证金的安全头寸上限 (80% 可用资金缓冲)
+                        max_coins_by_margin = max(0.0001, ((avail_funds * 0.80) * lev) / max(ref_px, 1e-6))
+                        final_coins = min(raw_coins if raw_coins > 0 else 0.001, max_coins_by_margin)
+                        final_coins = max(0.0001, round(final_coins, 4))
 
                         tp_target = None
                         if hasattr(plan, "take_profit_levels") and plan.take_profit_levels:

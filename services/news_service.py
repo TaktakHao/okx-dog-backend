@@ -100,14 +100,39 @@ class NewsService:
 
         return MacroCalendarResponse(events=events_out)
 
+    async def poll_and_sync_intelligence(self, limit: int = 15):
+        """自动从 NLP 引擎拉取最新快讯与异动情报并落库"""
+        try:
+            import os, sys
+            ai_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "okx-dog-ai"))
+            if ai_path not in sys.path:
+                sys.path.insert(0, ai_path)
+            from news_nlp_engine import NewsNLPEngine
+
+            latest_items = await NewsNLPEngine.fetch_latest_crypto_news(limit=limit)
+            for item in latest_items:
+                await self.ingest_news_item(
+                    source=item.get("source", "MarketFeed"),
+                    title=item.get("title", ""),
+                    content=item.get("content", item.get("title", "")),
+                    sentiment_score=float(item.get("sentiment_score", 0.0)),
+                    urgency=item.get("urgency", "P2"),
+                    related_symbols=item.get("related_symbols", ["BTC"]),
+                    summary_zh=item.get("summary_zh", item.get("title", "")[:40])
+                )
+        except Exception as err:
+            logger.debug(f"动态情报流聚合同步跳过: {err}")
+
     async def get_latest_news_feed(self, limit: int = 20) -> NewsFeedResponse:
-        """从 SQLite news_events 表查询最新资讯流，若库为空则初始化默认样本"""
+        """从 SQLite news_events 表查询最新资讯流，自动同步最新动态情报"""
+        await self.poll_and_sync_intelligence(limit=limit)
+
         async with get_db_session() as db:
             res = await db.execute(text("""
                 SELECT id, source, title, content, url, published_at, 
                        sentiment_score, urgency, related_symbols, is_fud_or_rumor, summary_zh
                 FROM news_events
-                ORDER BY published_at DESC LIMIT :limit
+                ORDER BY published_at DESC, created_at DESC LIMIT :limit
             """), {"limit": limit})
             rows = res.mappings().all()
 

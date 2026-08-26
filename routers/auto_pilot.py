@@ -47,6 +47,7 @@ async def start_auto_pilot(req: Optional[AutoPilotStartRequest] = None):
 
     min_conf = req.min_confidence if req and req.min_confidence is not None else 0.70
     auto_lev = req.auto_leverage_enabled if req and req.auto_leverage_enabled is not None else True
+    agg_mode = req.aggressiveness_mode if req and req.aggressiveness_mode is not None else "BALANCED"
     sym = req.symbol if req and req.symbol else "BTC-USDT-SWAP"
     symbols = req.symbols if req and req.symbols is not None else None
     focus_symbols = req.focus_symbols if req and req.focus_symbols is not None else None
@@ -63,6 +64,7 @@ async def start_auto_pilot(req: Optional[AutoPilotStartRequest] = None):
     status = await auto_pilot_manager.start(
         initial_equity=cur_eq,
         is_live_mode=is_live,
+        aggressiveness_mode=agg_mode,
         symbol=sym,
         symbols=symbols,
         focus_symbols=focus_symbols,
@@ -154,6 +156,7 @@ async def update_auto_pilot_config(req: AutoPilotConfigUpdateRequest):
     now_ms = int(time.time() * 1000)
     is_live = rest_client.is_live_mode and bool(rest_client.api_key)
     await auto_pilot_manager.update_config(
+        aggressiveness_mode=req.aggressiveness_mode,
         min_confidence=req.min_confidence,
         auto_leverage_enabled=req.auto_leverage_enabled,
         symbol=req.symbol,
