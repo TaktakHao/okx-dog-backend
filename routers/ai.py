@@ -171,6 +171,47 @@ async def trigger_ai_analysis(
     except Exception as e:
         logger.warning(f"写入 AI 研判日志失败: {e}")
 
+    # 6. 自动沉淀到模型微调训练数据集 (SFT/DPO) + 异步触发实习生影子推演
+    try:
+        from dataset.collector import dataset_collector
+        from agent.evolution.intern_slot import intern_slot_manager
+
+        snap_dict = snapshot.dict() if hasattr(snapshot, "dict") else dict(snapshot)
+        resp_clean = {
+            "analysis_id": analysis_res.analysis_id,
+            "action": analysis_res.signal.action.value if hasattr(analysis_res.signal.action, "value") else str(analysis_res.signal.action),
+            "confidence": analysis_res.signal.confidence,
+            "reasoning": analysis_res.reasoning_summary,
+            "suggested_entry_price": analysis_res.trade_plan.entry_range[0] if analysis_res.trade_plan.entry_range else current_price,
+            "stop_loss_price": analysis_res.trade_plan.stop_loss_price,
+            "take_profit_price": analysis_res.trade_plan.take_profit_levels[0].price if analysis_res.trade_plan.take_profit_levels else 0.0,
+            "target_leverage": analysis_res.trade_plan.suggested_leverage,
+            "order_type": analysis_res.trade_plan.recommended_order_type.value if hasattr(analysis_res.trade_plan.recommended_order_type, "value") else str(analysis_res.trade_plan.recommended_order_type),
+            "raw_thinking": getattr(analysis_res, "thinking_process", "")
+        }
+        sample_id = dataset_collector.record_decision_sample(
+            symbol=symbol,
+            current_price=current_price,
+            market_snapshot=snap_dict,
+            final_response=resp_clean,
+            analysis_id=analysis_res.analysis_id
+        )
+        if sample_id:
+            logger.info(f"📦 [训练集沉淀] 成功捕获一条微调决策样本: sample_id={sample_id}, symbol={symbol}, action={resp_clean['action']}")
+
+        if intern_slot_manager and intern_slot_manager.is_enabled():
+            asyncio.create_task(
+                intern_slot_manager.trigger_shadow_inference(
+                    symbol=symbol,
+                    current_price=current_price,
+                    market_snapshot=snap_dict,
+                    senior_response=resp_clean,
+                    analysis_id=analysis_res.analysis_id
+                )
+            )
+    except Exception as d_err:
+        logger.warning(f"沉淀训练集数据或触发实习生推演异常 (不影响主交易链路): {d_err}")
+
     return ApiResponse(code=0, msg="AI 智能研判生成成功", data=analysis_res, timestamp=now_ms)
 
 

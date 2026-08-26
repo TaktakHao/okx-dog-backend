@@ -428,6 +428,30 @@ class PaperTradingEngine:
                     realized_pnl=pnl,
                     is_crisis_defended=("保本" in reason or "防守" in reason or "排雷" in reason or "风控" in reason)
                 )
+
+                # 同步更新数据集真实盈亏正负标签 (Chosen/Rejected) 与实习生虚拟实盘收益
+                try:
+                    from dataset.collector import dataset_collector
+                    from agent.evolution.intern_slot import intern_slot_manager
+                    pnl_ratio = (pnl / released_margin) if released_margin > 0 else 0.0
+                    hit_tp = ("止盈" in reason) or (pnl_ratio >= 0.015)
+                    hit_sl = ("止损" in reason) or (pnl_ratio <= -0.010)
+
+                    dataset_collector.update_sample_outcome(
+                        sample_id_or_analysis_id=symbol,
+                        pnl_pct=pnl_ratio,
+                        hit_tp=hit_tp,
+                        hit_sl=hit_sl
+                    )
+                    if intern_slot_manager and intern_slot_manager.is_enabled():
+                        intern_slot_manager.settle_virtual_outcome(
+                            analysis_id=symbol,
+                            actual_pnl_pct=pnl_ratio,
+                            hit_tp=hit_tp,
+                            hit_sl=hit_sl
+                        )
+                except Exception as d_err:
+                    logger.debug(f"数据集收益沉淀或实习生结算跳过: {d_err}")
             except Exception as evo_err:
                 logger.debug(f"模拟操盘 AI 演进联动跳过: {evo_err}")
 
