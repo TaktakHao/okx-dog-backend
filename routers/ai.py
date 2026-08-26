@@ -177,16 +177,32 @@ async def trigger_ai_analysis(
         from agent.evolution.intern_slot import intern_slot_manager
 
         snap_dict = snapshot.dict() if hasattr(snapshot, "dict") else dict(snapshot)
+
+        # 防御性提取所有字段，杜绝 AttributeError
+        trade_plan = getattr(analysis_res, "trade_plan", None)
+        entry_range = getattr(trade_plan, "entry_range", [current_price, current_price]) if trade_plan else [current_price, current_price]
+        stop_loss_px = getattr(trade_plan, "stop_loss_price", 0.0) if trade_plan else 0.0
+        tp_levels = getattr(trade_plan, "take_profit_levels", []) if trade_plan else []
+        tp_px = tp_levels[0].price if (tp_levels and len(tp_levels) > 0 and hasattr(tp_levels[0], "price")) else 0.0
+        leverage = getattr(trade_plan, "suggested_leverage", 3) if trade_plan else 3
+        order_type_val = getattr(trade_plan, "order_type", getattr(trade_plan, "recommended_order_type", "POST_ONLY"))
+        order_type_str = order_type_val.value if hasattr(order_type_val, "value") else str(order_type_val)
+
+        signal_obj = getattr(analysis_res, "signal", None)
+        signal_action = getattr(signal_obj, "action", "HOLD_WAIT")
+        action_str = signal_action.value if hasattr(signal_action, "value") else str(signal_action)
+        confidence_val = float(getattr(signal_obj, "confidence", 0.0))
+
         resp_clean = {
-            "analysis_id": analysis_res.analysis_id,
-            "action": analysis_res.signal.action.value if hasattr(analysis_res.signal.action, "value") else str(analysis_res.signal.action),
-            "confidence": analysis_res.signal.confidence,
-            "reasoning": analysis_res.reasoning_summary,
-            "suggested_entry_price": analysis_res.trade_plan.entry_range[0] if analysis_res.trade_plan.entry_range else current_price,
-            "stop_loss_price": analysis_res.trade_plan.stop_loss_price,
-            "take_profit_price": analysis_res.trade_plan.take_profit_levels[0].price if analysis_res.trade_plan.take_profit_levels else 0.0,
-            "target_leverage": analysis_res.trade_plan.suggested_leverage,
-            "order_type": analysis_res.trade_plan.recommended_order_type.value if hasattr(analysis_res.trade_plan.recommended_order_type, "value") else str(analysis_res.trade_plan.recommended_order_type),
+            "analysis_id": getattr(analysis_res, "analysis_id", ""),
+            "action": action_str,
+            "confidence": confidence_val,
+            "reasoning": getattr(analysis_res, "reasoning_summary", ""),
+            "suggested_entry_price": entry_range[0] if (entry_range and len(entry_range) > 0) else current_price,
+            "stop_loss_price": stop_loss_px,
+            "take_profit_price": tp_px,
+            "target_leverage": leverage,
+            "order_type": order_type_str,
             "raw_thinking": getattr(analysis_res, "thinking_process", "")
         }
         sample_id = dataset_collector.record_decision_sample(
