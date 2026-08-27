@@ -155,24 +155,58 @@ async def export_training_dataset(req: ExportDatasetRequest):
         raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}")
 
 
-@router.get("/dataset/download/{filename}", summary="下载导出好的 JSONL 数据集文件")
-async def download_dataset_file(filename: str):
-    """下载指定导出的数据集文件"""
-    from fastapi.responses import FileResponse
-    # 安全文件名校验防目录遍历
-    if "/" in filename or "\\" in filename or not filename.endswith(".jsonl"):
-        raise HTTPException(status_code=400, detail="非法文件名")
+@router.post("/diagnose", response_model=ApiResponse, summary="触发大模型量化总监自驱反思问诊与团队战法进化")
+async def trigger_ai_meta_diagnosis():
+    """
+    调度大模型（DeepSeek-R1 / GPT-4o）对当前 6 位 AI 员工进行失败案例诊断，
+    自动提炼各角色专属避坑硬约束口诀并热注入生效。
+    """
+    try:
+        from database import get_db_session
+        from sqlalchemy import text
+        
+        # 1. 抓取最近 20 笔实盘/模拟盘订单
+        recent_trades = []
+        try:
+            async with get_db_session() as db:
+                res = await db.execute(text("""
+                    SELECT symbol, pos_side, entry_price, exit_price, size, 
+                           leverage, realized_pnl, roi_pct, reason, timestamp
+                    FROM auto_pilot_trades
+                    ORDER BY timestamp DESC LIMIT 20
+                """))
+                recent_trades = [dict(r) for r in res.mappings().all()]
+        except Exception as db_err:
+            logger.warning("查询历史订单异常 (将使用空样本进行诊断): %s", db_err)
 
-    export_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "exports"))
-    file_path = os.path.join(export_dir, filename)
+        # 2. 执行大模型深度反思诊断与规则演化
+        manager = AgentEvolutionManager.get_instance()
+        report = await manager.diagnose_and_evolve_team(recent_trades=recent_trades)
+        updated_status = manager.get_team_status()
 
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="文件尚未生成，请先点击导出")
+        return ApiResponse(
+            code=0,
+            msg="大模型自驱诊断与进化完成",
+            data={
+                "report": report.dict(),
+                "team_status": updated_status.dict()
+            }
+        )
+    except Exception as e:
+        logger.exception("大模型自驱诊断异常: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return FileResponse(
-        path=file_path,
-        filename=filename,
-        media_type="application/jsonl"
-    )
+
+@router.get("/diagnosis-report", response_model=ApiResponse, summary="获取最新一次大模型自驱诊断反思报告")
+async def get_latest_diagnosis_report():
+    """获取最新大模型量化总监生成的团队诊断报告"""
+    try:
+        manager = AgentEvolutionManager.get_instance()
+        report = manager.latest_diagnosis_report
+        return ApiResponse(code=0, msg="获取诊断报告成功", data=report)
+    except Exception as e:
+        logger.exception("获取诊断报告异常: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 

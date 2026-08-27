@@ -28,12 +28,15 @@ OKX-Dog 后端是基于 Python 异步架构构建的高并发量化交易与 7x2
 5. **REST API 网关 (`routers/`)**:
    - 多标的检索过滤 (`/api/v1/market/symbols`)、订单流转、持仓管理、AI 决策触发、SSE 流式接口。
 6. **智能体自演化、AI 员工看板与微调数据中心网关 (`routers/evolution.py`)**:
-   - 获取 6 位 AI 员工档案与动态话语权 (`/api/v1/evolution/team`)；
+   - 获取 6 位 AI 员工档案、专属规则与动态话语权 (`/api/v1/evolution/team`)；
+   - 触发大模型量化总监自驱反思问诊与战法进化 (`POST /api/v1/evolution/diagnose`)；
+   - 获取最新大模型反思诊断长文报告 (`GET /api/v1/evolution/diagnosis-report`)；
    - 历史演进版本快照查询 (`/api/v1/evolution/history`)；
    - 一键回滚出厂黄金基准 (`/api/v1/evolution/rollback`) 与恢复出厂初始设置 (`/api/v1/evolution/reset`)；
    - 微调数据集沉淀统计 (`/api/v1/evolution/dataset/stats`)；
    - 前端一键生成与导出 Colab 训练集 (`/api/v1/evolution/dataset/export`)；
    - 数据集安全下载通道 (`/api/v1/evolution/dataset/download/{filename}`)。
+
 
 
 ## 快速启动与测试

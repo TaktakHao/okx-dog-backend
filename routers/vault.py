@@ -393,17 +393,37 @@ async def test_llm_connection(
                 ),
                 timestamp=now_ms
             )
-        return ApiResponse(
-            code=0,
-            msg="Antigravity 本地免 Key AI 驱动就绪",
-            data=TestLLMResponse(
-                connected=True,
-                latency_ms=12,
+
+        # 发起轻量真实探测，校验指定 model 与 effort 是否有效
+        try:
+            _, _, latency_ms, actual_model = await antigravity_bridge.generate(
+                prompt="Ping test. Please reply 'OK'.",
                 model=target_model,
-                message=f"Antigravity CLI 驱动已就绪: {antigravity_bridge.cli_path}"
-            ),
-            timestamp=now_ms
-        )
+                timeout_seconds=20.0
+            )
+            return ApiResponse(
+                code=0,
+                msg=f"Antigravity CLI 本地直驱测试通过 ({actual_model or target_model})",
+                data=TestLLMResponse(
+                    connected=True,
+                    latency_ms=latency_ms,
+                    model=actual_model or target_model,
+                    message=f"Antigravity CLI 驱动已就绪并成功响应: {getattr(antigravity_bridge, 'cli_path', 'agy')}"
+                ),
+                timestamp=now_ms
+            )
+        except Exception as e:
+            return ApiResponse(
+                code=4001,
+                msg=f"Antigravity 模型连通性测试失败: {e}",
+                data=TestLLMResponse(
+                    connected=False,
+                    latency_ms=0,
+                    model=target_model,
+                    message=f"CLI 调用异常: {e}"
+                ),
+                timestamp=now_ms
+            )
 
     # 分支 2: 外部兼容 OpenAI 格式大模型 (DeepSeek / OpenAI)
     if not target_key or not target_key.strip():

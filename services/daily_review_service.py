@@ -135,6 +135,16 @@ class DailyReviewService:
             })
 
         logger.info(f"[{target_date}] 每日盘后复盘报告已成功落库与沉淀经验")
+
+        # 5. 自动触发 AI 员工团队自驱反思与战法进化
+        try:
+            from agent.evolution.evolution_manager import AgentEvolutionManager
+            manager = AgentEvolutionManager.get_instance()
+            asyncio.create_task(manager.diagnose_and_evolve_team(recent_trades=trades))
+            logger.info("🤖 已自动在后台启动 AI 员工团队大模型自驱诊断与进化任务！")
+        except Exception as evo_err:
+            logger.warning(f"触发 AI 员工团队自驱进化异常: {evo_err}")
+
         return DailyReviewDetail(
             review_date=target_date,
             total_trades=total_trades,
