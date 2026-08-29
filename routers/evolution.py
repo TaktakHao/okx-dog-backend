@@ -4,11 +4,13 @@ OKX-Dog 多智能体强化奖励与 AI 员工看板 REST API 路由
 角色: 后端架构师 (agency-backend-architect)
 """
 
+import asyncio
 import logging
 import os
 import sys
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 # 导入 okx-dog-ai 模块
@@ -93,6 +95,12 @@ async def get_dataset_stats():
         from dataset.collector import dataset_collector
         from agent.evolution.intern_slot import intern_slot_manager
         
+        # 触发轻量数据自愈与标签补全
+        try:
+            dataset_collector.heal_and_backfill_historical_samples()
+        except Exception as h_err:
+            logger.debug("统计前数据自愈跳过: %s", h_err)
+
         conn = dataset_collector._get_connection()
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) as tot, SUM(is_qualified_sft) as qual, SUM(CASE WHEN refined_cot IS NOT NULL THEN 1 ELSE 0 END) as refined, SUM(CASE WHEN label='CHOSEN' THEN 1 ELSE 0 END) as chosen, SUM(CASE WHEN label='REJECTED' THEN 1 ELSE 0 END) as rejected FROM decision_samples")
@@ -130,7 +138,13 @@ async def export_training_dataset(req: ExportDatasetRequest):
 
         refined_count = 0
         if req.refine_first:
-            refined_count = await llm_data_refiner.batch_refine(batch_size=req.batch_size)
+            try:
+                refined_count = await asyncio.wait_for(
+                    llm_data_refiner.batch_refine(batch_size=req.batch_size),
+                    timeout=15.0
+                )
+            except Exception as ref_err:
+                logger.warning("大模型精炼提炼异常或超时 (跳过精炼继续完成导出): %s", ref_err)
 
         sft_filename = "sft_train_alpaca.jsonl"
         dpo_filename = "dpo_pairs.jsonl"
@@ -153,6 +167,29 @@ async def export_training_dataset(req: ExportDatasetRequest):
     except Exception as e:
         logger.exception("导出数据集异常: %s", e)
         raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}")
+
+
+@router.get("/dataset/download/{filename}", summary="安全下载已导出的微调训练集文件")
+async def download_dataset_file(filename: str):
+    """
+    安全下载导出的 SFT 或 DPO 数据集 jsonl 文件，防止目录穿越
+    """
+    allowed_files = {"sft_train_alpaca.jsonl", "dpo_pairs.jsonl", "sft_train_sharegpt.jsonl"}
+    clean_name = os.path.basename(filename)
+    if clean_name not in allowed_files:
+        raise HTTPException(status_code=400, detail="非法或不支持下载的文件名")
+
+    export_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "exports"))
+    file_path = os.path.join(export_dir, clean_name)
+
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="训练集文件尚未生成，请先在看板中点击生成导出")
+
+    return FileResponse(
+        path=file_path,
+        filename=clean_name,
+        media_type="application/x-jsonlines"
+    )
 
 
 @router.post("/diagnose", response_model=ApiResponse, summary="触发大模型量化总监自驱反思问诊与团队战法进化")
