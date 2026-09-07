@@ -1116,6 +1116,8 @@ class PositionModel(BaseModel):
     last_scale_price: Optional[float] = Field(None, description="上一次加仓价格")
     last_scale_time: Optional[int] = Field(None, description="上一次加仓时间戳 (ms)")
     is_danger_alert: bool = Field(False, description="是否触发强平危险告警")
+    peak_price: Optional[float] = Field(None, description="持仓期间历史最高标记价")
+    peak_profit_ratio: Optional[float] = Field(None, description="持仓期间历史最高浮盈率")
     last_synced_at: Union[int, datetime] = Field(default_factory=lambda: int(datetime.utcnow().timestamp() * 1000), description="与 OKX 同步时间")
 
     created_at: Optional[Union[int, datetime]] = Field(None, description="开仓时间戳")
@@ -1462,6 +1464,10 @@ class AutoPilotStatusModel(BaseModel):
     max_concurrent_positions: int = Field(3, description="最大同时持仓标的数 (防过度分散)")
     trailing_stop_enabled: bool = Field(True, description="是否启用动态移动保本与跟踪止损")
     breakeven_trigger_ratio: float = Field(0.5, description="浮盈达到目标位比例时移至保本")
+    trailing_profit_threshold: float = Field(0.012, description="跟踪止盈激活浮盈门槛 (例如 0.012 表示浮盈达 1.2% 时激活跟踪盯市)")
+    trailing_profit_callback: float = Field(0.25, description="跟踪止盈最高点回撤比例 (例如 0.25 表示从最高浮盈回撤 25% 时主动止盈平仓)")
+    reentry_cooldown_seconds: int = Field(90, description="平仓后重新入场冷却时间 (秒，避免刚止盈就在同一高位假突破追高)")
+    funding_fee_guard_enabled: bool = Field(True, description="是否启用资金费结算时点防收割保护 (结算前15分钟规避高费率建仓)")
     min_confidence: float = Field(0.70, description="自动跟单最低置信度门槛")
     auto_leverage_enabled: bool = Field(True, description="是否启用自适应智能杠杆")
     stop_loss_equity_floor: Optional[float] = Field(None, description="最低保留本金底线 (USDT，亏损至该值自动熔断停止操盘)")
@@ -1523,6 +1529,10 @@ class AutoPilotStartRequest(BaseModel):
     max_concurrent_positions: Optional[int] = Field(3, ge=1, le=10, description="最大同时持仓标的数")
     trailing_stop_enabled: Optional[bool] = Field(True, description="是否启用动态移动保本与跟踪止损")
     breakeven_trigger_ratio: Optional[float] = Field(0.5, ge=0.1, le=0.9, description="浮盈达到目标位比例时移至保本")
+    trailing_profit_threshold: Optional[float] = Field(0.012, description="跟踪止盈激活浮盈门槛")
+    trailing_profit_callback: Optional[float] = Field(0.25, description="跟踪止盈最高点回撤比例")
+    reentry_cooldown_seconds: Optional[int] = Field(90, description="平仓后重新入场冷却时间 (秒)")
+    funding_fee_guard_enabled: Optional[bool] = Field(True, description="是否启用资金费结算时点防收割保护")
 
 
 class AutoPilotConfigUpdateRequest(BaseModel):
@@ -1542,6 +1552,10 @@ class AutoPilotConfigUpdateRequest(BaseModel):
     max_concurrent_positions: Optional[int] = Field(None, ge=1, le=10, description="最大同时持仓标的数")
     trailing_stop_enabled: Optional[bool] = Field(None, description="是否启用动态移动保本与跟踪止损")
     breakeven_trigger_ratio: Optional[float] = Field(None, ge=0.1, le=0.9, description="浮盈达到目标位比例时移至保本")
+    trailing_profit_threshold: Optional[float] = Field(None, description="跟踪止盈激活浮盈门槛")
+    trailing_profit_callback: Optional[float] = Field(None, description="跟踪止盈最高点回撤比例")
+    reentry_cooldown_seconds: Optional[int] = Field(None, description="平仓后重新入场冷却时间 (秒)")
+    funding_fee_guard_enabled: Optional[bool] = Field(None, description="是否启用资金费结算时点防收割保护")
 
 
 # =============================================================================

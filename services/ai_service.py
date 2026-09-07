@@ -102,11 +102,46 @@ def generate_quantitative_rule_decision(
         is_bullish = (ema20_1h >= ema50_1h and rsi_1h >= 48.0) or (rsi_1h > 58.0)
         is_bearish = (ema20_1h < ema50_1h and rsi_1h <= 45.0) or (rsi_1h < 38.0)
 
-    # 持仓感知 (Position-Aware) 动态增强：已有持仓若处于顺势浮盈 (≥0.8%) 且未破位，增强顺势加仓动能
+    # 持仓感知 (Position-Aware) 动态离场研判：
+    # 若已有持仓处于浮盈状态，且指标出现严重超买/超卖或冲高动能衰竭，触发主动平仓离场 (CLOSE_POSITION)，落袋为安！
+    should_close_tp = False
+    close_reason_summary = ""
+    close_reasoning_details = ""
+    close_thinking_process = ""
+
     if position and hasattr(position, "avg_px") and position.avg_px > 0 and position.pos > 0:
         is_pos_long = (position.pos_side == PosSide.LONG)
         pos_profit_ratio = (current_price - position.avg_px) / position.avg_px if is_pos_long else (position.avg_px - current_price) / position.avg_px
-        if pos_profit_ratio >= 0.008:
+        
+        # 多单主动止盈判定：浮盈 ≥ 0.6% 且 (15m RSI ≥ 70 超买 或 触及布林上轨受阻 或 1h RSI ≥ 75)
+        if is_pos_long and pos_profit_ratio >= 0.006:
+            if rsi_15m >= 70.0 or (current_price >= bb_up_15m * 0.998 and rsi_15m >= 65.0) or rsi_1h >= 75.0:
+                should_close_tp = True
+                close_reason_summary = f"多单持仓顺势浮盈达 +{pos_profit_ratio*100:.2f}%，15m RSI({round(rsi_15m, 1)}) 触及超买高危区且受阻于布林上轨，短期动能衰减，触发主动获利了结平仓！"
+                close_reasoning_details = f"当前持有多头仓位 (开仓均价 ${position.avg_px})，现价 ${current_price}。15m RSI 达到 {round(rsi_15m, 1)}，盘面短线存在冲高回落洗盘风险，执行主动止盈离场，锁定正收益胜果。"
+                close_thinking_process = (
+                    f"<think>\n"
+                    f"1. 持仓盯市：多单持仓现价 {current_price} USDT，持仓浮盈率达 +{pos_profit_ratio*100:.2f}%。\n"
+                    f"2. 动能研判：15m RSI 达到 {round(rsi_15m, 1)} 超买区，价格逼近布林线上轨 {round(bb_up_15m, prec)}，短线动能出现衰竭背离迹象。\n"
+                    f"3. 策略决策：贯彻【利润落袋为安】原则，主动平仓离场 (CLOSE_POSITION)，锁定胜率与本金收益，等待行情回踩走稳后再行重新开单。\n"
+                    f"</think>"
+                )
+        # 空单主动止盈判定：浮盈 ≥ 0.6% 且 (15m RSI ≤ 30 超卖 或 触及布林下轨支撑 或 1h RSI ≤ 25)
+        elif (not is_pos_long) and pos_profit_ratio >= 0.006:
+            if rsi_15m <= 30.0 or (current_price <= bb_low_15m * 1.002 and rsi_15m <= 35.0) or rsi_1h <= 25.0:
+                should_close_tp = True
+                close_reason_summary = f"空单持仓顺势浮盈达 +{pos_profit_ratio*100:.2f}%，15m RSI({round(rsi_15m, 1)}) 探底超卖区且触及布林下轨支撑，触发主动获利平仓！"
+                close_reasoning_details = f"当前持有空头仓位 (开仓均价 ${position.avg_px})，现价 ${current_price}。15m RSI 降至 {round(rsi_15m, 1)} 超卖区，有短期超跌反弹风险，执行主动止盈离场。"
+                close_thinking_process = (
+                    f"<think>\n"
+                    f"1. 持仓盯市：空单持仓现价 {current_price} USDT，持仓浮盈率达 +{pos_profit_ratio*100:.2f}%。\n"
+                    f"2. 动能研判：15m RSI 降至 {round(rsi_15m, 1)} 超卖区，触及布林下轨 {round(bb_low_15m, prec)}。\n"
+                    f"3. 策略决策：规避空头轧空反弹，主动平仓离场 (CLOSE_POSITION)，锁定利润。\n"
+                    f"</think>"
+                )
+
+        # 顺势动能延续：若未触发超买/超卖主动止盈，且持仓顺势浮盈 (≥0.8%) 未破位，顺应趋势方向延续动能判断 (支持金字塔加仓)
+        if not should_close_tp and pos_profit_ratio >= 0.008:
             if is_pos_long:
                 is_bullish = True
                 is_bearish = False
@@ -123,6 +158,82 @@ def generate_quantitative_rule_decision(
 
     # 双边手续费与滑点摩擦预留 (0.15%)
     friction_cost = current_price * 0.0015
+
+    # 优先响应主动平仓离场
+    if should_close_tp:
+        regime = MarketRegime.TRENDING_UP if (position and position.pos_side == PosSide.LONG) else MarketRegime.TRENDING_DOWN
+        action = SignalAction.CLOSE_POSITION
+        confidence = 0.88
+        urgency = SignalUrgency.HIGH
+
+        support_1 = round(min(ema20_1h, current_price - 1.2 * atr_1h), prec)
+        resistance_1 = round(max(bb_up_15m, current_price + 1.2 * atr_1h), prec)
+
+        tf_analysis = TimeframeAnalysis(
+            tf_15m=TimeframeDetail(
+                trend=TimeframeTrend.BULLISH if rsi_15m >= 50 else TimeframeTrend.BEARISH,
+                key_indicators_summary=f"15m 触发主动获利平仓信号，RSI={round(rsi_15m, 1)}",
+                support_level=support_1,
+                resistance_level=resistance_1
+            ),
+            tf_1h=TimeframeDetail(
+                trend=TimeframeTrend.BULLISH if ema20_1h >= ema50_1h else TimeframeTrend.BEARISH,
+                key_indicators_summary=f"1h EMA20/50 运行中，ATR={round(atr_1h, prec)}",
+                support_level=support_1,
+                resistance_level=resistance_1
+            ),
+            tf_4h=TimeframeDetail(
+                trend=TimeframeTrend.NEUTRAL_CHOPPY,
+                key_indicators_summary="4h 周期保持观察",
+                support_level=support_1,
+                resistance_level=resistance_1
+            ),
+            tf_1d=TimeframeDetail(
+                trend=TimeframeTrend.NEUTRAL_CHOPPY,
+                key_indicators_summary="日线级别宏观趋势稳定",
+                support_level=support_1,
+                resistance_level=resistance_1
+            )
+        )
+
+        return AIAnalysisResponse(
+            analysis_id=plan_id,
+            symbol=symbol,
+            timestamp=now_ms,
+            market_regime=regime,
+            timeframe_analysis=tf_analysis,
+            derivatives_sentiment=DerivativesSentiment(
+                funding_rate_bias=FundingRateBias.MODERATE_POSITIVE if derivatives.funding_rate >= 0 else FundingRateBias.MODERATE_NEGATIVE,
+                open_interest_interpretation=f"全网持仓量 (OI) 为 {derivatives.open_interest}，资金费率 {derivatives.funding_rate * 100:.4f}%",
+                long_short_ratio_state=f"散户多空比 {derivatives.long_short_ratio or 1.15}:1",
+                sentiment_score=0.5
+            ),
+            signal=AISignal(
+                action=action,
+                confidence=confidence,
+                urgency=urgency
+            ),
+            trade_plan=TradePlan(
+                entry_range=[current_price, current_price],
+                take_profit_levels=[
+                    TakeProfitLevel(price=current_price, percentage=1.0, description="主动市价获利平仓锁定收益")
+                ],
+                stop_loss_price=current_price,
+                risk_reward_ratio=2.0,
+                suggested_leverage=sug_lev,
+                order_type=TradePlanOrderType.MARKET
+            ),
+            risk_assessment=RiskAssessment(
+                key_risks=["短线超买超卖冲高回落"],
+                invalidation_condition="市价平仓锁定收益",
+                max_holding_time_hours=0.5
+            ),
+            reasoning_summary=close_reason_summary,
+            reasoning_details=close_reasoning_details,
+            model_used=model_name,
+            latency_ms=120,
+            thinking_process=close_thinking_process
+        )
 
     if is_bullish:
         regime = MarketRegime.TRENDING_UP
@@ -141,10 +252,10 @@ def generate_quantitative_rule_decision(
         entry_high = round(current_price * 1.002, prec)
         stop_loss = round(current_price - 1.6 * atr_1h, prec)
         
-        # 基于净盈亏比目标 (1.65) 动态推导第一/第二止盈位，并与关键阻力位取最优
-        min_tp_reward = (abs(entry_high - stop_loss) + friction_cost) * 1.65 + friction_cost
-        tp_1 = round(max(resistance_1, entry_high + min_tp_reward), prec)
-        tp_2 = round(max(resistance_2, entry_high + min_tp_reward * 1.8), prec)
+        # 阶梯止盈：TP1 基于 1.25倍 ATR 或近期合理阻力位（高触达性与兑现率），TP2 作为波段扩展位
+        tp_1 = round(min(resistance_1, entry_high + 1.25 * atr_1h), prec)
+        tp_1 = max(tp_1, round(entry_high * 1.008, prec))
+        tp_2 = round(max(resistance_2, entry_high + 2.2 * atr_1h), prec)
         
         # 扣除摩擦后的真实净盈亏比
         net_reward = max(0.0, tp_1 - entry_high - friction_cost)
@@ -205,10 +316,10 @@ def generate_quantitative_rule_decision(
         entry_low = round(current_price * 0.998, prec)
         stop_loss = round(current_price + 1.6 * atr_1h, prec)
         
-        # 基于净盈亏比目标 (1.65) 动态推导第一/第二止盈位，并与关键支撑位取最优
-        min_tp_reward = (abs(stop_loss - entry_low) + friction_cost) * 1.65 + friction_cost
-        tp_1 = round(min(support_1, entry_low - min_tp_reward), prec)
-        tp_2 = round(min(support_2, entry_low - min_tp_reward * 1.8), prec)
+        # 阶梯止盈：TP1 基于 1.25倍 ATR 或近期合理支撑位（高触达性与兑现率），TP2 作为波段扩展位
+        tp_1 = round(max(support_1, entry_low - 1.25 * atr_1h), prec)
+        tp_1 = min(tp_1, round(entry_low * 0.992, prec))
+        tp_2 = round(min(support_2, entry_low - 2.2 * atr_1h), prec)
         
         # 扣除摩擦后的真实净盈亏比
         net_reward = max(0.0, entry_low - tp_1 - friction_cost)

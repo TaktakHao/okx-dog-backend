@@ -124,6 +124,20 @@ class PaperTradingEngine:
             pos.upl = upl
             pos.upl_ratio = (upl / pos.margin) if pos.margin > 0 else 0.0
 
+            # 动态跟踪并维护持仓生命周期最高价与最高浮盈率
+            cur_profit_ratio = (price - pos.avg_px) / pos.avg_px if is_long else (pos.avg_px - price) / pos.avg_px
+            if getattr(pos, "peak_price", None) is None:
+                pos.peak_price = price
+                pos.peak_profit_ratio = cur_profit_ratio
+            else:
+                if is_long:
+                    if price > pos.peak_price:
+                        pos.peak_price = price
+                else:
+                    if price < pos.peak_price:
+                        pos.peak_price = price
+                pos.peak_profit_ratio = max(getattr(pos, "peak_profit_ratio", 0.0) or 0.0, cur_profit_ratio)
+
             # 1. 检查阶梯止盈 (Take Profit) 触发 (首次达到 TP1 执行 50% 平仓 + 自动移动保本止损)
             if pos.tp_trigger_price and pos.tp_trigger_price > 0:
                 is_tp_hit = False
@@ -138,14 +152,14 @@ class PaperTradingEngine:
                         partial_close_sz = round(pos.pos * 0.5, 4)
                         logger.info(
                             f"【模拟操盘-分批止盈】标的 {symbol} 触及第一止盈位 ${pos.tp_trigger_price:.1f}！"
-                            f"执行自动平仓 50% ({partial_close_sz} BTC) 锁定利润，并将剩余仓位止损上移至保本价 ${pos.avg_px:.1f}"
+                            f"执行自动平仓 50% ({partial_close_sz} 币) 锁定利润，并将剩余仓位止损上移至保本安全线"
                         )
                         close_res = self.close_position(
                             symbol=symbol,
                             pos_side=pos.pos_side,
                             price=price,
                             size=partial_close_sz,
-                            reason=f"触及第一止盈位 ${pos.tp_trigger_price:.1f} (平仓50%并锁定移动保本)"
+                            reason=f"触及第一止盈位 ${pos.tp_trigger_price:.1f} (平仓50%落袋为安)"
                         )
                         triggered_events.append(close_res)
 
@@ -459,9 +473,16 @@ class PaperTradingEngine:
                 del self.positions[k]
             else:
                 pos.pos -= close_sz
-                pos.avail_pos -= close_sz
-                pos.margin -= released_margin
+                pos.pos_size = pos.pos
+                pos.avail_pos = max(0.0, pos.avail_pos - close_sz)
+                pos.margin = max(0.0, pos.margin - released_margin)
                 pos.notional_usd = pos.pos * close_price
+                if ("50%" in reason or "阶梯" in reason or "第一止盈" in reason or "减半" in reason) and not pos.tp_triggered_50:
+                    pos.tp_triggered_50 = True
+                    pos.is_breakeven_locked = True
+                    pos.sl_trigger_price = pos.avg_px
+                    pos.tp_trigger_price = None
+                    logger.info(f"【模拟操盘-阶梯止盈】{symbol} 已完成 50% 阶梯止盈，剩余仓位 {pos.pos} 张已锁定移动保本 (SL=${pos.avg_px})，固定止盈清除由移动追踪接管")
 
             logger.info(
                 f"【模拟操盘】平仓结算完成: {symbol} {pos.pos_side.value} {close_sz} 张 @ ${close_price:.1f}, "
@@ -470,11 +491,25 @@ class PaperTradingEngine:
 
         return {
             "success": True,
+            "closed_count": len(targets),
             "msg": f"平仓成功，已实现盈亏: {total_realized_pnl:+.2f} USDT",
             "realized_pnl": total_realized_pnl,
             "close_price": close_price,
+            "new_cash": self.cash,
             "reason": reason
         }
+
+    def cancel_all_orders(self, symbol: Optional[str] = None) -> int:
+        """撤销指定标的或全部未结模拟订单 (防幽灵仓)"""
+        canceled_count = 0
+        for ord_id, o in list(self.orders.items()):
+            if symbol is None or o.symbol == symbol:
+                if o.state in (OrderState.LIVE, OrderState.PARTIALLY_FILLED):
+                    o.state = OrderState.CANCELED
+                    canceled_count += 1
+        if canceled_count > 0:
+            logger.info(f"【模拟操盘】已清理标的 {symbol or 'ALL'} 的 {canceled_count} 笔挂单 (Cancel-Before-Close)")
+        return canceled_count
 
 
     def update_position_stops(
@@ -484,6 +519,7 @@ class PaperTradingEngine:
         stop_loss_price: Optional[float] = None,
         take_profit_price: Optional[float] = None,
         is_breakeven_locked: Optional[bool] = None,
+        clear_take_profit: bool = False,
     ) -> bool:
         """更新模拟持仓的止盈止损价与移动保本锁定标记"""
         updated = False
@@ -493,7 +529,9 @@ class PaperTradingEngine:
                     continue
                 if stop_loss_price is not None:
                     pos.sl_trigger_price = stop_loss_price
-                if take_profit_price is not None:
+                if clear_take_profit:
+                    pos.tp_trigger_price = None
+                elif take_profit_price is not None:
                     pos.tp_trigger_price = take_profit_price
                 if is_breakeven_locked is not None:
                     pos.is_breakeven_locked = is_breakeven_locked

@@ -80,6 +80,10 @@ class AutoPilotEnvState:
         self.max_concurrent_positions: int = 3
         self.trailing_stop_enabled: bool = True
         self.breakeven_trigger_ratio: float = 0.5  # 浮盈达 0.5R 触发移动保本
+        self.trailing_profit_threshold: float = 0.012  # 跟踪止盈激活门槛 (例如 0.012 表示浮盈达 1.2% 时激活跟踪盯市)
+        self.trailing_profit_callback: float = 0.25   # 跟踪止盈回撤平仓比例 (例如 0.25 表示从最高浮盈回撤 25% 时主动市价止盈)
+        self.reentry_cooldown_seconds: int = 90       # 平仓后重新入场冷却时间 (秒)
+        self.funding_fee_guard_enabled: bool = True   # 是否启用资金费结算时点防收割保护 (结算前15分钟避开高费率建仓)
         self.min_confidence: float = 0.70
         self.auto_leverage_enabled: bool = True
         self.post_only_preferred: bool = True       # 优先被动挂单 (POST_ONLY/Maker) 节省 60% 手续费
@@ -93,6 +97,8 @@ class AutoPilotEnvState:
         self.last_patrol_log: Optional[str] = f"【{'实盘' if is_live_mode else '模拟'}环境】就绪，等待开启操盘"
         self._executed_plan_ids: Set[str] = set()
         self._breakeven_applied_positions: Set[str] = set()
+        self.position_peaks: Dict[str, Dict[str, float]] = {}  # symbol -> {"peak_price": x, "peak_profit_ratio": y}
+        self.last_closed_timestamps: Dict[str, int] = {}       # symbol -> 上次平仓完成时间戳 (ms)
         self.position_scale_records: Dict[str, int] = {}       # symbol -> 当前加仓层数
         self.last_scale_timestamps: Dict[str, int] = {}        # symbol -> 上次加仓时间戳
 
@@ -418,6 +424,10 @@ class AutoPilotManager:
         max_concurrent_positions: Optional[int] = None,
         trailing_stop_enabled: Optional[bool] = None,
         breakeven_trigger_ratio: Optional[float] = None,
+        trailing_profit_threshold: Optional[float] = None,
+        trailing_profit_callback: Optional[float] = None,
+        reentry_cooldown_seconds: Optional[int] = None,
+        funding_fee_guard_enabled: Optional[bool] = None,
         min_confidence: float = 0.70,
         auto_leverage_enabled: bool = True,
         stop_loss_equity_floor: Optional[float] = None,
@@ -469,6 +479,14 @@ class AutoPilotManager:
                 state.trailing_stop_enabled = trailing_stop_enabled
             if breakeven_trigger_ratio is not None:
                 state.breakeven_trigger_ratio = breakeven_trigger_ratio
+            if trailing_profit_threshold is not None:
+                state.trailing_profit_threshold = trailing_profit_threshold
+            if trailing_profit_callback is not None:
+                state.trailing_profit_callback = trailing_profit_callback
+            if reentry_cooldown_seconds is not None:
+                state.reentry_cooldown_seconds = reentry_cooldown_seconds
+            if funding_fee_guard_enabled is not None:
+                state.funding_fee_guard_enabled = funding_fee_guard_enabled
 
             state.min_confidence = min_confidence
             state.auto_leverage_enabled = auto_leverage_enabled
@@ -570,6 +588,10 @@ class AutoPilotManager:
         max_concurrent_positions: Optional[int] = None,
         trailing_stop_enabled: Optional[bool] = None,
         breakeven_trigger_ratio: Optional[float] = None,
+        trailing_profit_threshold: Optional[float] = None,
+        trailing_profit_callback: Optional[float] = None,
+        reentry_cooldown_seconds: Optional[int] = None,
+        funding_fee_guard_enabled: Optional[bool] = None,
         stop_loss_equity_floor: Optional[float] = None,
         max_loss_limit_usdt: Optional[float] = None,
         is_live_mode: Optional[bool] = None,
@@ -622,11 +644,20 @@ class AutoPilotManager:
                 state.trailing_stop_enabled = trailing_stop_enabled
             if breakeven_trigger_ratio is not None:
                 state.breakeven_trigger_ratio = breakeven_trigger_ratio
+            if trailing_profit_threshold is not None:
+                state.trailing_profit_threshold = trailing_profit_threshold
+            if trailing_profit_callback is not None:
+                state.trailing_profit_callback = trailing_profit_callback
+            if reentry_cooldown_seconds is not None:
+                state.reentry_cooldown_seconds = reentry_cooldown_seconds
+            if funding_fee_guard_enabled is not None:
+                state.funding_fee_guard_enabled = funding_fee_guard_enabled
 
             logger.info(
                 f"【自动操盘中枢】{'实盘' if state.is_live_mode else '模拟'}配置已更新并记忆: 激进程度={state.aggressiveness_mode}, "
                 f"模式={state.focus_mode}, 主标的={state.symbol}, 关注池={state.focus_symbols}, "
-                f"置信度={state.min_confidence}, 加仓层数={state.max_scale_layers}"
+                f"置信度={state.min_confidence}, 跟踪止盈门槛={state.trailing_profit_threshold}, "
+                f"回撤止盈={state.trailing_profit_callback}, 冷却={state.reentry_cooldown_seconds}s"
             )
 
     # ---------------- 收益采样与交易战绩记录 ----------------
@@ -868,6 +899,10 @@ class AutoPilotManager:
             max_concurrent_positions=state.max_concurrent_positions,
             trailing_stop_enabled=state.trailing_stop_enabled,
             breakeven_trigger_ratio=state.breakeven_trigger_ratio,
+            trailing_profit_threshold=state.trailing_profit_threshold,
+            trailing_profit_callback=state.trailing_profit_callback,
+            reentry_cooldown_seconds=state.reentry_cooldown_seconds,
+            funding_fee_guard_enabled=getattr(state, "funding_fee_guard_enabled", True),
             min_confidence=state.min_confidence,
             auto_leverage_enabled=state.auto_leverage_enabled,
             stop_loss_equity_floor=state.stop_loss_equity_floor,
@@ -1016,17 +1051,20 @@ class AutoPilotManager:
                 is_long = pos.pos_side == PosSide.LONG
                 profit_ratio = (cur_px - entry_px) / entry_px if is_long else (entry_px - cur_px) / entry_px
 
-                # 1.1 动态移动保本 (Breakeven Locked)
-                if state.trailing_stop_enabled and pos_id not in state._breakeven_applied_positions:
-                    if profit_ratio >= 0.008:  # 浮盈超 0.8%
-                        state._breakeven_applied_positions.add(pos_id)
-                        if not is_live:
-                            paper_engine.update_position_stops(symbol=sym, stop_loss_price=entry_px)
-                        log_msg = f"🛡️ 【移动保本触发】{sym} 浮盈达 {profit_ratio*100:+.2f}%，止损线已移至均价 ${entry_px} (Breakeven Locked)"
-                        logger.info(log_msg)
-                        patrol_summaries.append(f"{sym}保本锁定")
+                # 动态跟踪并记录持仓生命周期最高价与最高浮盈峰值
+                if sym not in state.position_peaks:
+                    state.position_peaks[sym] = {"peak_price": cur_px, "peak_profit_ratio": profit_ratio}
+                else:
+                    pk = state.position_peaks[sym]
+                    if is_long:
+                        pk["peak_price"] = max(pk.get("peak_price", cur_px), cur_px)
+                    else:
+                        pk["peak_price"] = min(pk.get("peak_price", cur_px), cur_px)
+                    pk["peak_profit_ratio"] = max(pk.get("peak_profit_ratio", profit_ratio), profit_ratio)
 
-                # 1.2 提取多周期指标与 AI 量化规则研判
+                peak_profit = state.position_peaks[sym].get("peak_profit_ratio", profit_ratio)
+
+                # 1.1 先行提取多周期指标、衍生品情绪与 AI 量化策略研判
                 try:
                     multi_ind = await get_multi_period_indicators_data(sym)
                     deriv = await get_derivatives_metrics_data(sym)
@@ -1040,25 +1078,153 @@ class AutoPilotManager:
                     )
                 except Exception as eval_err:
                     logger.debug(f"标的 {sym} 持仓策略计算跳过: {eval_err}")
-                    continue
+                    decision = None
+                    multi_ind = None
+                    deriv = None
 
-                sig = decision.signal
-                plan = decision.trade_plan
+                sig = decision.signal if decision else None
+                plan = decision.trade_plan if decision else None
                 conf = sig.confidence if sig else 0.0
                 action = sig.action if sig else SignalAction.HOLD_WAIT
 
+                # 动态计算 ATR 波动率自适应跟踪止盈门槛 (Volatility-Adaptive)
+                atr_15m = 0.0
+                if multi_ind and "15m" in multi_ind.indicators and multi_ind.indicators["15m"].atr_14:
+                    atr_15m = multi_ind.indicators["15m"].atr_14
+                atr_ratio = (atr_15m / max(cur_px, 1.0)) if atr_15m > 0 else 0.008
+                dynamic_tp_threshold = max(0.010, min(0.035, 1.6 * atr_ratio))
+                effective_tp_threshold = max(state.trailing_profit_threshold, dynamic_tp_threshold)
+
+                has_tp_50 = getattr(pos, "tp_triggered_50", False)
+
+                # 1.2 两阶段阶梯止盈：阶段 1 (未减半状态，平仓 50% 锁定确定性胜率 + 移损保本)
+                if state.trailing_stop_enabled and not has_tp_50:
+                    drawdown_from_peak = peak_profit - profit_ratio
+                    callback_limit = peak_profit * state.trailing_profit_callback
+                    is_trailing_hit = (peak_profit >= effective_tp_threshold) and (drawdown_from_peak >= callback_limit or (profit_ratio <= 0.005 and peak_profit >= 0.012))
+                    is_ai_close_hit = (action == SignalAction.CLOSE_POSITION and conf >= 0.70)
+
+                    if is_trailing_hit or is_ai_close_hit:
+                        half_sz = max(0.001, round(pos.pos * 0.5, 4))
+                        reason_tp50 = (
+                            f"🎯 阶段1阶梯止盈50% (最高浮盈+{peak_profit*100:.2f}%, 现浮盈+{profit_ratio*100:.2f}%, "
+                            f"{'AI超买触发' if is_ai_close_hit else '动态追踪触发'})"
+                        )
+                        logger.info(f"【自动操盘-阶梯止盈50%】{sym} {reason_tp50}, 平仓张数: {half_sz}")
+                        try:
+                            # Cancel-Before-Close: 先行撤单清理，杜绝幽灵挂单
+                            if is_live:
+                                try:
+                                    await rest_client.cancel_all_orders(symbol=sym)
+                                except Exception:
+                                    pass
+                                await rest_client.place_order(
+                                    symbol=sym,
+                                    side=OrderSide.SELL if is_long else OrderSide.BUY,
+                                    pos_side=pos.pos_side,
+                                    order_type=OrderType.MARKET,
+                                    size=half_sz,
+                                    reduce_only=True
+                                )
+                            else:
+                                paper_engine.cancel_all_orders(symbol=sym)
+                                paper_engine.close_position(symbol=sym, pos_side=pos.pos_side, price=cur_px, size=half_sz, reason=reason_tp50)
+
+                            # 状态迁移：标记 50% 阶梯已触发，强制移损至保本均价 (Breakeven Locked)
+                            pos.tp_triggered_50 = True
+                            pos.is_breakeven_locked = True
+                            pos.sl_trigger_price = entry_px
+                            pos.tp_trigger_price = None  # 固定止盈清除，剩余50%仓位全面交由阶段2宽幅吊灯移动追踪或TP2出清接管
+                            state._breakeven_applied_positions.add(pos_id)
+
+                            if not is_live:
+                                paper_engine.update_position_stops(
+                                    symbol=sym,
+                                    pos_side=pos.pos_side,
+                                    stop_loss_price=entry_px,
+                                    take_profit_price=None,
+                                    clear_take_profit=True,
+                                    is_breakeven_locked=True
+                                )
+
+                            # 重置波段追踪峰值基准，以当前浮盈继续跟踪剩余 50% 仓位
+                            state.position_peaks[sym] = {"peak_price": cur_px, "peak_profit_ratio": profit_ratio}
+                            patrol_summaries.append(f"🎯{sym}阶梯止盈50%(+{profit_ratio*100:.1f}%)")
+                            continue
+                        except Exception as tp_err:
+                            logger.warning(f"阶段1阶梯止盈异常 {sym}: {tp_err}")
+
+                # 1.3 两阶段阶梯止盈：阶段 2 (已完成50%减半，剩余50%长尾波段博取 - 宽幅40%容忍度或触及TP2出清)
+                elif state.trailing_stop_enabled and has_tp_50:
+                    drawdown_from_peak = peak_profit - profit_ratio
+                    # 宽幅波段容忍度：允许从新高回调 40%
+                    wave_dd_limit = peak_profit * 0.40
+                    tp2_hit = False
+                    if plan and plan.take_profit_levels and len(plan.take_profit_levels) > 1:
+                        tp2_px = plan.take_profit_levels[-1].price
+                        tp2_hit = (cur_px >= tp2_px) if is_long else (cur_px <= tp2_px)
+
+                    # 出清条件：宽幅回撤40% / 浮盈回踩至保本线(0.2%) / 触及波段终极目标TP2 / AI超买强平
+                    is_tail_exit = (drawdown_from_peak >= wave_dd_limit) or (profit_ratio <= 0.002) or tp2_hit or (action == SignalAction.CLOSE_POSITION and conf >= 0.70)
+                    if is_tail_exit:
+                        reason_tail = (
+                            f"🏁 阶段2长尾波段出清 (最高浮盈+{peak_profit*100:.2f}%, 现浮盈+{profit_ratio*100:.2f}%, "
+                            f"{'触及TP2' if tp2_hit else ('宽幅回撤达标' if drawdown_from_peak >= wave_dd_limit else '回踩保本线')})"
+                        )
+                        logger.info(f"【自动操盘-波段出清】{sym} {reason_tail}")
+                        try:
+                            if is_live:
+                                try:
+                                    await rest_client.cancel_all_orders(symbol=sym)
+                                except Exception:
+                                    pass
+                                await rest_client.close_position(symbol=sym, pos_side=pos.pos_side, order_type=OrderType.MARKET)
+                            else:
+                                paper_engine.cancel_all_orders(symbol=sym)
+                                paper_engine.close_position(symbol=sym, pos_side=pos.pos_side, price=cur_px, reason=reason_tail)
+
+                            state.position_peaks.pop(sym, None)
+                            state.position_scale_records.pop(sym, None)
+                            state._breakeven_applied_positions.discard(pos_id)
+                            state.last_closed_timestamps[sym] = now_ms
+                            patrol_summaries.append(f"🏁{sym}波段出清(+{profit_ratio*100:.1f}%)")
+                            continue
+                        except Exception as tail_err:
+                            logger.warning(f"阶段2波段出清异常 {sym}: {tail_err}")
+
+                # 1.4 常规移动保本锁定 (浮盈超 0.8% 且尚未触发过保本)
+                if state.trailing_stop_enabled and pos_id not in state._breakeven_applied_positions:
+                    if profit_ratio >= 0.008:
+                        state._breakeven_applied_positions.add(pos_id)
+                        pos.is_breakeven_locked = True
+                        pos.sl_trigger_price = entry_px
+                        if not is_live:
+                            paper_engine.update_position_stops(symbol=sym, stop_loss_price=entry_px)
+                        log_msg = f"🛡️ 【移动保本触发】{sym} 浮盈达 {profit_ratio*100:+.2f}%，止损线已移至均价 ${entry_px} (Breakeven Locked)"
+                        logger.info(log_msg)
+                        patrol_summaries.append(f"{sym}保本锁定")
+
                 cur_layers = getattr(pos, "scale_layers", None) or state.position_scale_records.get(sym, 1)
 
-                # 1.3 核心情景 A: 强反向信号 -> 趋势反转平反开 (Directional Reversal)
+                # 1.5 强反向信号 -> 趋势反转平反开 (Directional Reversal)
                 is_opposite_signal = (is_long and action == SignalAction.SELL_SHORT) or ((not is_long) and action == SignalAction.BUY_LONG)
                 if state.auto_reversal_enabled and is_opposite_signal and conf >= 0.75 and plan:
                     try:
                         logger.info(f"🔄 【趋势反转触发】{sym} 当前持仓 {pos.pos_side.value} 遭遇强反向信号 ({action.value}, 置信度:{conf*100:.0f}%)，执行平仓并反手！")
-                        # (1) 平掉当前反向持仓
+                        # (1) Cancel-Before-Close 清理挂单并平掉当前反向持仓
                         if is_live:
+                            try:
+                                await rest_client.cancel_all_orders(symbol=sym)
+                            except Exception:
+                                pass
                             await rest_client.close_position(symbol=sym, pos_side=pos.pos_side, order_type=OrderType.MARKET)
                         else:
+                            paper_engine.cancel_all_orders(symbol=sym)
                             paper_engine.close_position(symbol=sym, pos_side=pos.pos_side, price=cur_px, reason=f"趋势反转强信号 ({action.value}) 自动平仓反手")
+
+                        # 清理旧持仓峰值与标记
+                        state.position_peaks.pop(sym, None)
+                        state._breakeven_applied_positions.discard(pos_id)
 
                         # (2) 立即反向开仓 (Layer 1)
                         new_side = OrderSide.SELL if action == SignalAction.SELL_SHORT else OrderSide.BUY
@@ -1107,9 +1273,11 @@ class AutoPilotManager:
                     except Exception as rev_err:
                         logger.warning(f"反手开仓执行异常 {sym}: {rev_err}")
 
-                # 1.4 核心情景 B: 同向高置信度信号 -> 智能阶梯加仓 (Pyramiding / Pullback Scale-In)
+                # 1.6 核心情景 C: 同向高置信度信号 -> 智能阶梯加仓 (Pyramiding / Pullback Scale-In)
+                # 严格约束：若当前已从最高点回撤超过 0.5%，说明行情见顶滞涨，禁止盲目加仓拉高均价！
+                drawdown_from_peak = peak_profit - profit_ratio
                 is_same_direction = (is_long and action == SignalAction.BUY_LONG) or ((not is_long) and action == SignalAction.SELL_SHORT)
-                if is_same_direction and conf >= state.min_confidence and cur_layers < state.max_scale_layers and plan:
+                if is_same_direction and conf >= state.min_confidence and cur_layers < state.max_scale_layers and plan and drawdown_from_peak < 0.005:
                     last_scale_ts = state.last_scale_timestamps.get(sym, 0)
                     min_interval = getattr(self, "min_scale_interval_ms", getattr(state, "min_scale_interval_ms", 30000))
                     # 防频繁加仓间隔
@@ -1143,14 +1311,25 @@ class AutoPilotManager:
                                 calc_coins = max(0.001, math.floor((final_notional / cur_px) * 1000) / 1000.0)
 
                                 new_sl_px = max(entry_px, cur_px * 0.99) if is_long else min(entry_px, cur_px * 1.01)
-                                tp_target = plan.take_profit_levels[0].price if plan.take_profit_levels else None
+                                tp_target = plan.take_profit_levels[-1].price if (plan and plan.take_profit_levels) else None
+                                if pos.tp_trigger_price and pos.tp_trigger_price > 0:
+                                    if is_long:
+                                        tp_target = max(tp_target or 0.0, pos.tp_trigger_price)
+                                    else:
+                                        tp_target = min(tp_target or 99999999.0, pos.tp_trigger_price)
+
+                                scale_ot = OrderType.POST_ONLY if (state.post_only_preferred or (risk_controller.rules and risk_controller.rules.enforce_post_only)) else OrderType.MARKET
+                                scale_px = round(cur_px * 0.9995, 2) if is_long else round(cur_px * 1.0005, 2)
+                                if scale_ot == OrderType.MARKET:
+                                    scale_px = cur_px
 
                                 scale_req = PlaceOrderRequest(
                                     symbol=sym,
                                     inst_type=InstType.SWAP,
                                     side=OrderSide.BUY if is_long else OrderSide.SELL,
                                     pos_side=pos.pos_side,
-                                    order_type=OrderType.MARKET,
+                                    order_type=scale_ot,
+                                    price=scale_px,
                                     size=calc_coins,
                                     leverage=lev,
                                     tp_trigger_price=tp_target,
@@ -1192,7 +1371,8 @@ class AutoPilotManager:
                                             symbol=sym,
                                             side=OrderSide.BUY if is_long else OrderSide.SELL,
                                             pos_side=pos.pos_side,
-                                            order_type=OrderType.MARKET,
+                                            order_type=scale_ot,
+                                            px=scale_px if scale_ot == OrderType.POST_ONLY else None,
                                             sz=calc_coins,
                                             leverage=lev,
                                             tp_trigger_price=tp_target,
@@ -1223,6 +1403,14 @@ class AutoPilotManager:
                 for target_symbol in unheld_targets:
                     if len(held_pos_map) >= state.max_concurrent_positions:
                         break
+
+                    # 平仓后重新入场冷却检查 (默认 90 秒，避免刚止盈就在同一高位假突破追高)
+                    last_closed_ts = state.last_closed_timestamps.get(target_symbol, 0)
+                    cooldown_ms = (getattr(state, "reentry_cooldown_seconds", 90) or 90) * 1000
+                    if (now_ms - last_closed_ts) < cooldown_ms:
+                        remain_sec = max(1, int((cooldown_ms - (now_ms - last_closed_ts)) / 1000))
+                        patrol_summaries.append(f"{target_symbol}(止盈冷静期{remain_sec}s)")
+                        continue
 
                     # 动态刷新当前最新可用保证金
                     if is_live:
@@ -1279,6 +1467,17 @@ class AutoPilotManager:
                         if plan_uuid in state._executed_plan_ids:
                             patrol_summaries.append(f"{target_symbol}(已建仓)")
                             continue
+
+                        # 资金费结算时点防收割保护 (Funding Fee Rollover Guard)
+                        if getattr(state, "funding_fee_guard_enabled", True):
+                            utc_now = datetime.utcnow()
+                            # OKX 资金费每 8 小时结算 (UTC 00:00, 08:00, 16:00)，结算前 15 分钟跳过顺费率开仓
+                            if utc_now.hour in (23, 7, 15) and utc_now.minute >= 45:
+                                fr = deriv.funding_rate if deriv else 0.0
+                                # 年化 > 30% (单期 > 0.00025) 且顺费率方向开仓
+                                if (action == SignalAction.BUY_LONG and fr > 0.00025) or (action == SignalAction.SELL_SHORT and fr < -0.00025):
+                                    patrol_summaries.append(f"{target_symbol}(资金费结算避让:年化{fr*3*365*100:.1f}%)")
+                                    continue
 
                         # 科学方向与仓位核算
                         is_short = (action == SignalAction.SELL_SHORT)
@@ -1381,8 +1580,8 @@ class AutoPilotManager:
                             patrol_summaries.append(f"{target_symbol}(风控拦截:{risk_check.rejected_rule})")
                             continue
 
-                        # 执行下单 (优先使用 POST_ONLY 或 MARKET，降低手续费摩擦)
-                        target_ot = OrderType.POST_ONLY if state.post_only_preferred else OrderType.MARKET
+                        # 执行下单 (高置信度破位 conf >= 0.85 自动升级为 MARKET 追单防踏空，常规使用 POST_ONLY 降低手续费)
+                        target_ot = OrderType.MARKET if (conf >= 0.85 or not state.post_only_preferred) else OrderType.POST_ONLY
                         try:
                             if is_live:
                                 await rest_client.place_order(
