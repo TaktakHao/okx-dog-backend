@@ -966,7 +966,7 @@ class AutoPilotManager:
         if not targets:
             return []
 
-        from state import ws_manager
+        from state import ws_manager, paper_engine
 
         scored_targets = []
         regime = market_regime.upper() if market_regime else "TRENDING_UP"
@@ -976,7 +976,7 @@ class AutoPilotManager:
             reasons = []
 
             # 1. 尝试从 WebSocket 或模拟沙盒获取行情快照
-            cur_tk = ws_manager.latest_tickers.get(sym)
+            cur_tk = ws_manager.latest_tickers.get(sym) if ws_manager else None
             if cur_tk and cur_tk.last_price > 0:
                 last_px = cur_tk.last_price
                 if getattr(cur_tk, "change_24h_pct", None) is not None:
@@ -986,7 +986,7 @@ class AutoPilotManager:
                 else:
                     chg_24h = 0.0
             else:
-                last_px = paper_engine.last_price_map.get(sym, 100.0)
+                last_px = paper_engine.last_price_map.get(sym, 100.0) if paper_engine else 100.0
                 chg_24h = 0.0
 
             # 2. 市场体制契合度深度尽调
@@ -1518,10 +1518,14 @@ class AutoPilotManager:
 
             # 资深投资研究员 (agency-investment-researcher) 资产尽调与体制动态优选排序
             current_regime = getattr(state, "market_regime", "TRENDING_UP")
-            ranked_research = await self.rank_investment_targets_by_research(
-                unheld_targets,
-                market_regime=current_regime
-            )
+            try:
+                ranked_research = await self.rank_investment_targets_by_research(
+                    unheld_targets,
+                    market_regime=current_regime
+                )
+            except Exception as rank_err:
+                logger.warning(f"【投资研究员尽调排序】跳过异常: {rank_err}")
+                ranked_research = []
             sorted_unheld_targets = [item[0] for item in ranked_research] if ranked_research else unheld_targets
             if ranked_research:
                 top_syms = ", ".join([f"{item[0]}({item[1]}分:{item[2]})" for item in ranked_research[:2]])
