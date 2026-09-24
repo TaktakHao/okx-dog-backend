@@ -55,6 +55,8 @@ from services.knowledge_base_service import KnowledgeBaseService
 from services.daily_review_service import DailyReviewService
 from services.consensus_service import ConsensusService
 from services.telegram_bot import TelegramBotService
+from services.reconciliation_service import ReconciliationService
+from services.execution_engine import SmartExecutionEngine
 
 try:
     if okx_dog_ai and hasattr(okx_dog_ai, "antigravity_bridge"):
@@ -80,6 +82,17 @@ knowledge_base_service = KnowledgeBaseService()
 daily_review_service = DailyReviewService(kb_service=knowledge_base_service)
 consensus_service = ConsensusService(kb_service=knowledge_base_service, news_service=news_service)
 telegram_bot_service = TelegramBotService()
+reconciliation_service = ReconciliationService(
+    rest_client=rest_client,
+    paper_engine=paper_engine,
+    auto_pilot_manager=auto_pilot_manager,
+    risk_controller=risk_controller
+)
+smart_execution_engine = SmartExecutionEngine(
+    rest_client=rest_client,
+    risk_controller=risk_controller
+)
+from services.position_sizer import position_sizer
 
 __all__ = [
     "logger",
@@ -97,6 +110,9 @@ __all__ = [
     "daily_review_service",
     "consensus_service",
     "telegram_bot_service",
+    "reconciliation_service",
+    "smart_execution_engine",
+    "position_sizer",
     "BACKEND_DIR",
     "ROOT_DIR",
     "AI_DIR",

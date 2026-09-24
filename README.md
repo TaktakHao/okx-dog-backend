@@ -17,13 +17,14 @@ OKX-Dog 后端是基于 Python 异步架构构建的高并发量化交易与 7x2
    - 后台协程每 15 秒自主轮巡多标的池（TradFi 黄金/美股代币/RWA/主流加密）；
    - 最大并发持仓组合敞口控制 (`max_concurrent_positions`)；
     - **两阶段阶梯止盈体系 (Two-Stage Partial Scale-Out TP)**：
-      - **阶段 1 (确定性落袋与保本)**：当持仓最高浮盈达到激活门槛（默认 `trailing_profit_threshold = 0.012` 或 ATR 波动率自适应门槛）且从最高点回撤达比例（默认 25%）或 AI 超买信号触发时，执行 **减半平仓 50% 锁定确定性胜率**；同时执行 **Cancel-Before-Close** 清空该标的挂单，并将剩余 50% 仓位止损线强制上移至开仓均价（Breakeven Locked），实现零风险长尾博取；
-      - **阶段 2 (宽幅移动吊灯博取长尾 Fat-Tail Alpha)**：剩余 50% 仓位清除固定硬止盈，放宽回调容忍度至 40%（移动吊灯止盈），直到触及策略终极波段目标 TP2 或回撤超 40% 或保本线触发时终极出清，最大化捕捉单边大趋势利润；
+      - **阶段 1 (确定性落袋与超额保本)**：当持仓最高浮盈达到激活门槛（默认 `trailing_profit_threshold = 0.012` 或 ATR 波动率自适应门槛）且从最高点回撤达比例（默认 25%）或 AI 超买信号触发时，执行 **减半平仓 50% 锁定确定性胜率**；同时执行 **Cancel-Before-Close** 清空该标的挂单，并将剩余 50% 仓位止损线强制上移至超额保本价（`entry_px * (1 ± 0.0012)`，覆盖双边手续费与滑点磨损），实现真正的「绝对零风险长尾博取」；
+      - **阶段 2 (宽幅移动吊灯博取长尾 Fat-Tail Alpha)**：剩余 50% 仓位清除固定硬止盈，放宽回调容忍度至 40%（移动吊灯止盈），直到触及策略终极波段目标 TP2 或回撤超 40% 或超额保本线触发时终极出清，最大化捕捉单边大趋势利润；
     - **ATR 波动率自适应跟踪门槛 (Volatility-Adaptive TP)**：
       - 结合 15m 周期 ATR 动态计算动态门槛 `dynamic_tp_threshold = clamp(1.6 * (ATR_15m / Price), 1.0%, 3.5%)`；高波动剧烈行情自动放宽止盈空间防止早退，低波动收敛震荡收窄门槛防利润回吐；
     - **OKX 资金费率结算时点防收割保护 (Funding Fee Rollover Guard)**：
       - 针对 OKX 永续合约 UTC 00:00 / 08:00 / 16:00 资金费结算周期，在结算前 15 分钟（如 UTC 07:45-07:59）监测到极端高费率时，自动拦截顺费率开仓，避免开单即遭扣费收割；
-    - **高置信度破位防踏空与 Cancel-Before-Close**：
+    - **POST_ONLY Maker 被动挂单深度优化与防踏空**：
+      - 首仓与加仓默认启用被动做市挂单（POST_ONLY），买单挂在买一档微观下方、卖单挂在卖一档微观上方，享受负费率/极低手续费（节省 60% 手续费成本）；
       - 当 AI 或量化研判置信度达超高等级（`confidence >= 0.85`）时，自动从 Maker 挂单升级为市价单（MARKET）快速上车，防止单边爆破行情因 Maker 挂单逆向选择踏空；
       - 在所有平仓、减半、反手操作前，强制执行 `cancel_all_orders` 清空挂单，杜绝残留订单被撮合变成“幽灵仓位”；
     - **持仓感知主动止盈离场 (Position-Aware AI Close)**：
@@ -31,8 +32,8 @@ OKX-Dog 后端是基于 Python 异步架构构建的高并发量化交易与 7x2
     - **冷静期重入场轮动 (Reentry Cooldown & Adaptive Re-entry)**：
       - 平仓后记录毫秒时间戳并自动进入冷静期（默认 `reentry_cooldown_seconds = 90` 秒），杜绝在同一点位假突破追高；
       - 冷静期结束后，若多周期指标顺势看好，自动以最优价格重新发起新一轮建仓开单，实现“盈利主动离场，继续看好重新开单”的良性轮动；
-    - **动态移动保本与金字塔加仓**：
-      - 浮盈 $\ge 0.8\%$ 自动上移止损线至开仓均价（Breakeven Locked）；
+    - **超额移动保本与金字塔加仓**：
+      - 浮盈 $\ge 0.8\%$ 自动上移止损线至超额保本均价（`entry_px * (1 ± 0.0012)`，覆盖双边手续费与滑点磨损）；
       - 顺势加仓前校验无见顶冲高回落（回撤 $< 0.5\%$）；加仓止盈点位锚定波段扩展止盈位，不反向压缩既有利好止盈目标。
 2. **OKX v5 长连接集群 (`okx_ws.py`)**:
    - 自动维护行情、订单簿深度、逐笔成交的 WebSocket 订阅与本地快照；
@@ -52,8 +53,54 @@ OKX-Dog 后端是基于 Python 异步架构构建的高并发量化交易与 7x2
    - 微调数据集沉淀统计 (`/api/v1/evolution/dataset/stats`)；
    - 前端一键生成与导出 Colab 训练集 (`/api/v1/evolution/dataset/export`)；
    - 数据集安全下载通道 (`/api/v1/evolution/dataset/download/{filename}`)。
-
-
+7. **资深财务分析师与资金效率服务 (`services/finance_service.py` / `routers/finance.py`)**:
+   - 映射专家角色: `agency-financial-analyst`；
+   - 对外接口: `GET /api/v1/finance/health`；
+   - 核心量化指标: 资本利用率 (Capital Utilization)、年化夏普比率 (Sharpe Ratio)、索提诺比率 (Sortino Ratio)、卡玛比率 (Calmar Ratio)；
+   - 费用摩擦与损益归因 (PnL Attribution): 深度统计累计毛利 (Gross PnL)、累计手续费支出与手续费磨损比率 (`Fee Drag Ratio = Fees / Gross Profit`)，拒绝当交易所手续费打工仔；
+   - 资深财务分析师全自动诊断报告与资金优化建议。
+8. **FP&A 滚动风险预算与高水位线回撤自适应降额 (`risk_controller.py`)**:
+   - 映射专家角色: `agency-fp-a-analyst`；
+   - 高水位线追踪 (High Water Mark, HWM) 与当前净值回撤深度计算；
+   - 阶梯式回撤自适应头寸模型 (`Drawdown-Adaptive Risk Sizing`)：
+     - 回撤 $< 3\%$: 保持基准 $1.0\%$ 满额风险预算；
+     - 回撤 $3\% \sim 6\%$: 降额至 $0.70\%$（轻度防守）；
+     - 回撤 $6\% \sim 10\%$: 降额至 $0.40\%$（中度锁定）；
+     - 回撤 $\ge 10\%$: 急冻至 $0.20\%$（极限资本保护），消除爆仓与大幅连环回撤隐患。
+9. **资深投资研究员资产尽调与体制动态优选排序 (`auto_pilot.py`)**:
+   - 映射专家角色: `agency-investment-researcher`；
+   - 标的深度尽调评分模型 (`rank_investment_targets_by_research`)：结合市场体制（多头顺势动量、空头顺势破位、震荡窄幅整理）与资金费率对未持仓标的动态打分；
+   - 颠覆死板的固定顺序遍历，优先为综合尽调评分 Top 标的分配并发开仓名额。
+10. **自动化实时对账中枢 (`reconciliation_service.py` / `routers/health.py`)**:
+   - 60 秒常驻后台异步轮巡，以远端 OKX 真实交易所账本为唯一事实源 (Remote SSOT)；
+   - 自动监测外部平仓、强制清算或非系统发起的手工订单，秒级消除本地状态漂移与幽灵持仓；
+   - 对外提供立即对账指令端点 `POST /api/v1/health/reconcile-now` 与对账健康度查询。
+11. **Smart Pegging 动态追单与被动做市执行引擎 (`execution_engine.py`)**:
+   - 毫秒级贴合盘口买一/卖一档发出 `POST_ONLY` 被动挂单，最高享受交易所 Maker 手续费优惠（节约 60%+ 交易成本）；
+   - 盘口价差自适应与微观深度检验；
+   - 智能追单看门狗：盘口价格漂移超过阈值 (0.15%) 或挂单超时时，自动并发撤单并重新贴盘，严禁裸露追单；
+   - 紧急行情（置信度 $\ge 0.85$）或市价平仓时平滑回退，保障极端行情下的即时成交能力。
+12. **ATR 波动率自适应固定风险头寸管理 (`position_sizer.py`)**:
+   - 严格遵循 Fixed Fractional Risk 金融级资金模型，单笔交易风险额度严格锁定在总资金的 1.0%；
+   - 基于 Wilder's RMA 算法精确计算 ATR(14) 动态波动率；
+   - 极端行情防插针惩罚收缩因子：当短期波动超过基准 2.5 倍时，自动收缩 50% 仓位敞口；
+   - 自动对齐 OKX 真实合约面值、最小张数与步长，统一投研、回测与实盘的一致性。
+13. **高保真事件驱动回测引擎升级 (`services/backtest_engine.py`)**:
+   - 修正名义本金（$\text{Notional} = \text{Margin} \times \text{Leverage}$）与双向 Taker 手续费（杜绝 10 倍偏差虚假繁荣）；
+   - UTC 00:00 / 08:00 / 16:00 真实资金费率 8 小时动态结算与沉淀；
+   - 严格消除前瞻未来函数（Look-ahead Bias）：Bar $i$ 产生意图并在 Bar $i+1$ Open 撮合成交；
+   - 单根 Bar 内部最高价/最低价根据阳线/阴线子路径严格模拟。
+14. **“三位一体”策略基类统一架构 (`core/strategy_base.py`)**:
+   - 抽象标准策略接口 `BaseStrategy`，提供 `on_bar`, `generate_signals`, `calculate_indicators`；
+   - 统一实盘上下文 `StrategyContext` 与回测上下文 `BacktestContext`；
+   - 策略核心逻辑一次编写，实盘与回测 100% 同构复用，彻底终结“回测一套逻辑、实盘重新实现”的双轨制隐患。
+15. **时序数据湖引擎与真实行情扩展 (`services/data_lake_service.py`)**:
+   - DuckDB 列式引擎自适应兼容模式 + 零依赖高性能内存环形缓存 (RingBuffer)；
+   - 支持毫秒级 Parquet/列式数据落盘与海量 K 线点位分析；
+   - 行情同步自动并发拉取 OKX 真实历史资金费率 (Funding Rate) 与全网持仓量 (Open Interest)。
+16. **企业级量化运维监控网关 (`routers/health.py`)**:
+   - 提供全景运维指标接口 `GET /api/v1/health/ops-metrics`；
+   - 实时采集 OKX WebSocket 毫秒级延时、REST API 往返时延 (RTT)、Maker 成交比例、对账状态及数据湖健康度。
 
 ## 快速启动与测试
 

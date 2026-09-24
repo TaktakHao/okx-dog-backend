@@ -1657,6 +1657,7 @@ class BacktestRunRequest(BaseModel):
     slippage_pct: float = Field(default=0.0005, description="保守滑点模型 (默认 0.05%)")
     atr_sl_multiplier: float = Field(default=2.0, ge=0.5, le=5.0, description="ATR 动态止损倍数")
     breakeven_ratio: float = Field(default=0.5, ge=0.1, le=0.9, description="移动保本触发浮盈比例")
+    funding_rate_8h: float = Field(default=0.0001, description="8小时资金费率基准 (默认 0.01%)")
     params: Dict[str, Any] = Field(default_factory=dict, description="额外策略参数")
 
 

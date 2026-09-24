@@ -461,6 +461,22 @@ class OKXRestClient:
         data = await self._request("GET", "/api/v5/public/funding-rate", params={"instId": symbol})
         return data[0] if data else {}
 
+    async def get_funding_rate_history(
+        self,
+        symbol: str,
+        limit: int = 100,
+        before: Optional[str] = None,
+        after: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """获取历史资金费率 GET /api/v5/public/funding-rate-history"""
+        params: Dict[str, Any] = {"instId": symbol, "limit": str(limit)}
+        if before:
+            params["before"] = before
+        if after:
+            params["after"] = after
+        data = await self._request("GET", "/api/v5/public/funding-rate-history", params=params)
+        return data or []
+
     async def get_open_interest(self, symbol: str, inst_type: str = "SWAP") -> Dict[str, Any]:
         """获取合约全网持仓量 GET /api/v5/public/open-interest"""
         params = {"instType": inst_type, "instId": symbol}
@@ -906,6 +922,63 @@ class OKXRestClient:
             raise OKXApiException(s_code, f"订单提交失败: {s_msg}", data=item)
 
         return item
+
+    async def get_pending_orders(
+        self,
+        symbol: Optional[str] = None,
+        inst_type: str = "SWAP"
+    ) -> List[Dict[str, Any]]:
+        """
+        获取当前未成交活跃挂单
+        GET /api/v5/trade/orders-pending
+        """
+        params: Dict[str, Any] = {"instType": inst_type}
+        if symbol:
+            params["instId"] = symbol
+        res = await self._request("GET", "/api/v5/trade/orders-pending", params=params)
+        return res or []
+
+    async def get_pending_algo_orders(
+        self,
+        symbol: Optional[str] = None,
+        inst_type: str = "SWAP",
+        ord_type: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        获取当前未完成策略/条件挂单 (如止盈止损单)
+        GET /api/v5/trade/orders-algo-pending
+        """
+        params: Dict[str, Any] = {"instType": inst_type}
+        if symbol:
+            params["instId"] = symbol
+        if ord_type:
+            params["ordType"] = ord_type
+        else:
+            params["ordType"] = "conditional"
+        res = await self._request("GET", "/api/v5/trade/orders-algo-pending", params=params)
+        return res or []
+
+    async def cancel_batch_algo_orders(
+        self,
+        orders: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        批量撤销策略/条件挂单 (单次最多 10 笔)
+        POST /api/v5/trade/cancel-algos
+        :param orders: [{"algoId": "...", "instId": "..."}, ...]
+        """
+        if not orders:
+            return []
+        results: List[Dict[str, Any]] = []
+        for i in range(0, len(orders), 10):
+            batch = orders[i:i + 10]
+            try:
+                res = await self._request("POST", "/api/v5/trade/cancel-algos", json_data=batch)
+                if res:
+                    results.extend(res)
+            except Exception as e:
+                logger.error(f"批量撤销策略委托失败 batch={batch}: {e}")
+        return results
 
     async def cancel_order(
         self,

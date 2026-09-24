@@ -19,6 +19,7 @@ from core.background_tasks import (
     auto_pilot_snapshot_loop,
     auto_pilot_worker_loop,
     daily_review_and_macro_watch_loop,
+    reconciliation_worker_loop,
 )
 from core.exceptions import register_exception_handlers
 from database import get_db_session, init_db
@@ -42,6 +43,7 @@ from routers import (
     vault_router,
     websocket_router,
     studio_router,
+    finance_router,
 )
 from vault import install_sensitive_data_filter
 from state import (
@@ -135,6 +137,8 @@ async def lifespan(app: FastAPI):
         worker_task = asyncio.create_task(auto_pilot_worker_loop())
         # 启动每日盘后自动复盘与宏观事件监控协程
         review_task = asyncio.create_task(daily_review_and_macro_watch_loop())
+        # 启动 60 秒常驻自动化对账中枢协程 (Remote SSOT 账本自愈)
+        reconciliation_task = asyncio.create_task(reconciliation_worker_loop())
 
     except Exception as e:
         logger.critical(f"系统启动初始化失败: {e}", exc_info=True)
@@ -149,6 +153,8 @@ async def lifespan(app: FastAPI):
         worker_task.cancel()
     if review_task and not review_task.done():
         review_task.cancel()
+    if reconciliation_task and not reconciliation_task.done():
+        reconciliation_task.cancel()
     await ws_manager.stop()
     await rest_client.close()
     logger.info("OKX-Dog 核心服务已安全停止")
@@ -209,6 +215,9 @@ app.include_router(studio_router)
 # v3.6 多智能体自适应强化奖励与 AI 员工看板路由
 from routers.evolution import router as evolution_router
 app.include_router(evolution_router)
+
+# v3.7 资深财务分析师与资金配置路由
+app.include_router(finance_router)
 
 
 

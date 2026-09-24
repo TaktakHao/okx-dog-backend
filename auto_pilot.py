@@ -72,6 +72,7 @@ class AutoPilotEnvState:
         ]
         self.symbols: List[str] = list(self.focus_symbols)
         self.focus_mode: str = "SINGLE_SYMBOL"  # SINGLE_SYMBOL | MULTI_SYMBOL_POOL
+        self.market_regime: str = "TRENDING_UP"  # TRENDING_UP | TRENDING_DOWN | RANGING | VOLATILE_BREAKOUT
         self.aggressiveness_mode: str = "BALANCED"  # CONSERVATIVE | BALANCED | AGGRESSIVE
         self.max_scale_layers: int = 3          # 最大加仓层数 (1~5)
         self.scale_in_strategy: str = "SMART_HYBRID"  # PYRAMIDING | PULLBACK_DCA | SMART_HYBRID
@@ -950,6 +951,98 @@ class AutoPilotManager:
             max_loss_limit_usdt=state.max_loss_limit_usdt,
         )
 
+    # ---------------- 资深投资研究员: 标的深度尽调与优选排序 ----------------
+
+    async def rank_investment_targets_by_research(
+        self,
+        targets: List[str],
+        market_regime: str = "TRENDING_UP"
+    ) -> List[Tuple[str, float, str]]:
+        """
+        资深投资研究员 (agency-investment-researcher) 资产尽调与标的动态优选排序
+        针对候选关注池中的标的，根据市场体制契合度、24h 涨跌动量、波动率舒适度进行深度综合打分
+        :return: List of (symbol, research_score, commentary) 降序排列
+        """
+        if not targets:
+            return []
+
+        from state import ws_manager
+
+        scored_targets = []
+        regime = market_regime.upper() if market_regime else "TRENDING_UP"
+
+        for sym in targets:
+            base_score = 50.0
+            reasons = []
+
+            # 1. 尝试从 WebSocket 或模拟沙盒获取行情快照
+            cur_tk = ws_manager.latest_tickers.get(sym)
+            if cur_tk and cur_tk.last_price > 0:
+                last_px = cur_tk.last_price
+                if getattr(cur_tk, "change_24h_pct", None) is not None:
+                    chg_24h = float(cur_tk.change_24h_pct)
+                elif cur_tk.open_24h > 0:
+                    chg_24h = (last_px - cur_tk.open_24h) / cur_tk.open_24h * 100.0
+                else:
+                    chg_24h = 0.0
+            else:
+                last_px = paper_engine.last_price_map.get(sym, 100.0)
+                chg_24h = 0.0
+
+            # 2. 市场体制契合度深度尽调
+            if regime == "TRENDING_UP":
+                # 单边多头体制: 优选突破顺势动量最强 (+1.5% ~ +12%)
+                if 1.5 <= chg_24h <= 12.0:
+                    base_score += 25.0
+                    reasons.append(f"多头领涨顺势突破(+{chg_24h:.1f}%)")
+                elif chg_24h > 12.0:
+                    base_score += 10.0
+                    reasons.append(f"超买逼空谨慎(+{chg_24h:.1f}%)")
+                elif chg_24h < -1.0:
+                    base_score -= 20.0
+                    reasons.append(f"逆势阴跌弱势({chg_24h:.1f}%)")
+                else:
+                    base_score += 5.0
+            elif regime == "TRENDING_DOWN":
+                # 单边空头体制: 优选破位领跌 (-1.5% ~ -15%)
+                if -15.0 <= chg_24h <= -1.5:
+                    base_score += 25.0
+                    reasons.append(f"空头顺势破位领跌({chg_24h:.1f}%)")
+                elif chg_24h > 2.0:
+                    base_score -= 20.0
+                    reasons.append(f"逆势抗跌({chg_24h:.1f}%)")
+                else:
+                    base_score += 5.0
+            elif regime == "RANGING":
+                # 箱体震荡体制: 优选振幅收敛稳定 (±2.5% 以内)
+                if abs(chg_24h) <= 2.5:
+                    base_score += 25.0
+                    reasons.append(f"箱体窄幅整理(±{abs(chg_24h):.1f}%)")
+                elif abs(chg_24h) > 6.0:
+                    base_score -= 25.0
+                    reasons.append(f"震荡市异常宽幅异动({chg_24h:.1f}%)")
+                else:
+                    base_score += 10.0
+            else:  # VOLATILE_BREAKOUT
+                if abs(chg_24h) >= 4.0:
+                    base_score += 25.0
+                    reasons.append(f"剧烈放量异动突破({chg_24h:.1f}%)")
+                else:
+                    base_score += 5.0
+
+            # 3. 规避流动性异常或美股休市代币
+            is_tradfi = any(t in sym.upper() for t in ["NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "SPY", "QQQ"])
+            if is_tradfi and datetime.utcnow().weekday() in (5, 6):
+                base_score -= 50.0
+                reasons.append("美股周末休市")
+
+            final_score = max(0.0, min(100.0, base_score))
+            scored_targets.append((sym, round(final_score, 1), "; ".join(reasons) or "中性观望"))
+
+        # 投资研究员打分降序排列
+        scored_targets.sort(key=lambda x: x[1], reverse=True)
+        return scored_targets
+
     # ---------------- 7x24h 后端常驻自主巡检核心循环 ----------------
 
     async def execute_patrol_step(self):
@@ -971,8 +1064,10 @@ class AutoPilotManager:
         try:
             from state import (
                 paper_engine,
+                position_sizer,
                 rest_client,
                 risk_controller,
+                smart_execution_engine,
                 ws_manager,
             )
             from services.ai_service import generate_quantitative_rule_decision
@@ -1130,10 +1225,12 @@ class AutoPilotManager:
                                 paper_engine.cancel_all_orders(symbol=sym)
                                 paper_engine.close_position(symbol=sym, pos_side=pos.pos_side, price=cur_px, size=half_sz, reason=reason_tp50)
 
-                            # 状态迁移：标记 50% 阶梯已触发，强制移损至保本均价 (Breakeven Locked)
+                            # 状态迁移：标记 50% 阶梯已触发，强制移损至「均价+摩擦覆盖缓冲」(True Breakeven Locked)
                             pos.tp_triggered_50 = True
                             pos.is_breakeven_locked = True
-                            pos.sl_trigger_price = entry_px
+                            be_friction_buf = entry_px * 0.0012
+                            be_sl_target = round(entry_px + be_friction_buf, 2 if entry_px > 10 else 4) if is_long else round(entry_px - be_friction_buf, 2 if entry_px > 10 else 4)
+                            pos.sl_trigger_price = be_sl_target
                             pos.tp_trigger_price = None  # 固定止盈清除，剩余50%仓位全面交由阶段2宽幅吊灯移动追踪或TP2出清接管
                             state._breakeven_applied_positions.add(pos_id)
 
@@ -1141,7 +1238,7 @@ class AutoPilotManager:
                                 paper_engine.update_position_stops(
                                     symbol=sym,
                                     pos_side=pos.pos_side,
-                                    stop_loss_price=entry_px,
+                                    stop_loss_price=be_sl_target,
                                     take_profit_price=None,
                                     clear_take_profit=True,
                                     is_breakeven_locked=True
@@ -1197,12 +1294,14 @@ class AutoPilotManager:
                     if profit_ratio >= 0.008:
                         state._breakeven_applied_positions.add(pos_id)
                         pos.is_breakeven_locked = True
-                        pos.sl_trigger_price = entry_px
+                        be_friction_buf = entry_px * 0.0012
+                        be_sl_target = round(entry_px + be_friction_buf, 2 if entry_px > 10 else 4) if is_long else round(entry_px - be_friction_buf, 2 if entry_px > 10 else 4)
+                        pos.sl_trigger_price = be_sl_target
                         if not is_live:
-                            paper_engine.update_position_stops(symbol=sym, stop_loss_price=entry_px)
-                        log_msg = f"🛡️ 【移动保本触发】{sym} 浮盈达 {profit_ratio*100:+.2f}%，止损线已移至均价 ${entry_px} (Breakeven Locked)"
+                            paper_engine.update_position_stops(symbol=sym, stop_loss_price=be_sl_target)
+                        log_msg = f"🛡️ 【移动保本触发】{sym} 浮盈达 {profit_ratio*100:+.2f}%，止损线已移至超额保本价 ${be_sl_target} (覆盖手续费摩擦)"
                         logger.info(log_msg)
-                        patrol_summaries.append(f"{sym}保本锁定")
+                        patrol_summaries.append(f"{sym}超额保本锁定")
 
                 cur_layers = getattr(pos, "scale_layers", None) or state.position_scale_records.get(sym, 1)
 
@@ -1367,19 +1466,37 @@ class AutoPilotManager:
                                 risk_check = await risk_controller.check_order(scale_req, tk_for_check, positions)
                                 if risk_check.passed:
                                     if is_live:
-                                        await rest_client.place_order(
-                                            symbol=sym,
-                                            side=OrderSide.BUY if is_long else OrderSide.SELL,
-                                            pos_side=pos.pos_side,
-                                            order_type=scale_ot,
-                                            px=scale_px if scale_ot == OrderType.POST_ONLY else None,
-                                            sz=calc_coins,
-                                            leverage=lev,
-                                            tp_trigger_price=tp_target,
-                                            sl_trigger_price=new_sl_px,
-                                        )
+                                        if scale_ot == OrderType.POST_ONLY:
+                                            peg_res = await smart_execution_engine.execute_smart_peg_order(
+                                                symbol=sym,
+                                                side=OrderSide.BUY if is_long else OrderSide.SELL,
+                                                pos_side=pos.pos_side,
+                                                size=calc_coins,
+                                                leverage=lev,
+                                                tp_trigger_price=tp_target,
+                                                sl_trigger_price=new_sl_px,
+                                                max_retries=2,
+                                                fallback_to_ioc=False,
+                                            )
+                                            if not peg_res.get("success"):
+                                                logger.warning(f"⚡ [AutoPilot] 加仓 Smart Pegging 未能成交: {peg_res.get('message')}")
+                                                patrol_summaries.append(f"{sym}(加仓Peg超时未成)")
+                                                continue
+                                        else:
+                                            await rest_client.place_order(
+                                                symbol=sym,
+                                                side=OrderSide.BUY if is_long else OrderSide.SELL,
+                                                pos_side=pos.pos_side,
+                                                order_type=scale_ot,
+                                                price=scale_px if scale_ot != OrderType.MARKET else None,
+                                                sz=calc_coins,
+                                                leverage=lev,
+                                                tp_trigger_price=tp_target,
+                                                sl_trigger_price=new_sl_px,
+                                            )
                                     else:
-                                        paper_engine.place_order(scale_req)
+                                        scale_req.price = scale_px
+                                        paper_engine.place_order(scale_req, current_market_price=scale_px if scale_ot == OrderType.POST_ONLY else cur_px)
 
                                     next_layer = cur_layers + 1
                                     state.position_scale_records[sym] = next_layer
@@ -1399,8 +1516,19 @@ class AutoPilotManager:
             scan_pool = [state.symbol] if state.focus_mode == "SINGLE_SYMBOL" else (state.focus_symbols or state.symbols)
             unheld_targets = [s for s in scan_pool if s not in held_pos_map]
 
+            # 资深投资研究员 (agency-investment-researcher) 资产尽调与体制动态优选排序
+            current_regime = getattr(state, "market_regime", "TRENDING_UP")
+            ranked_research = await self.rank_investment_targets_by_research(
+                unheld_targets,
+                market_regime=current_regime
+            )
+            sorted_unheld_targets = [item[0] for item in ranked_research] if ranked_research else unheld_targets
+            if ranked_research:
+                top_syms = ", ".join([f"{item[0]}({item[1]}分:{item[2]})" for item in ranked_research[:2]])
+                logger.debug(f"【投资研究员尽调排序】体制={current_regime}, 优选标的: {top_syms}")
+
             if len(held_pos_map) < state.max_concurrent_positions:
-                for target_symbol in unheld_targets:
+                for target_symbol in sorted_unheld_targets:
                     if len(held_pos_map) >= state.max_concurrent_positions:
                         break
 
@@ -1499,21 +1627,34 @@ class AutoPilotManager:
                         max_sys_lev = risk_controller.rules.max_leverage if risk_controller.rules else 5
                         lev = min(plan.suggested_leverage or 3, lev_cap, max_sys_lev)
 
-                        sl_px = plan.stop_loss_price or (ref_px * 0.985 if not is_short else ref_px * 1.015)
-                        stop_dist = max(abs(ref_px - sl_px), ref_px * 0.008)
+                        # 提取 ATR 指标进行波动率校准
+                        atr_val = None
+                        if multi_ind and hasattr(multi_ind, "indicators") and multi_ind.indicators:
+                            ind_1h = multi_ind.indicators.get("1h")
+                            ind_15m = multi_ind.indicators.get("15m")
+                            if ind_1h and ind_1h.atr_14 > 0:
+                                atr_val = ind_1h.atr_14
+                            elif ind_15m and ind_15m.atr_14 > 0:
+                                atr_val = ind_15m.atr_14
 
-                        # 使用 L0 核心硬风控根据激进程度动态计算头寸
-                        raw_coins = risk_controller.calculate_fixed_risk_position_size(
+                        # 使用企业级 PositionSizer 计算 ATR 自适应固定风险头寸 (Fixed Fractional Risk)
+                        size_result = position_sizer.calculate_adaptive_size(
+                            symbol=target_symbol,
                             equity=cur_eq,
                             entry_price=ref_px,
-                            stop_loss_price=sl_px,
-                            contract_val=1.0,
-                            risk_pct=risk_pct
+                            is_short=is_short,
+                            stop_loss_price=plan.stop_loss_price,
+                            atr=atr_val,
+                            atr_multiplier=2.0,
+                            risk_pct=risk_pct,
+                            max_leverage=lev,
+                            max_order_usdt=risk_controller.rules.max_order_usdt if risk_controller.rules else 3000.0,
+                            available_margin=avail_funds,
                         )
-                        # 双重约束：严格限制不超过当前可用保证金的安全头寸上限 (80% 可用资金缓冲)
-                        max_coins_by_margin = max(0.0001, ((avail_funds * 0.80) * lev) / max(ref_px, 1e-6))
-                        final_coins = min(raw_coins if raw_coins > 0 else 0.001, max_coins_by_margin)
-                        final_coins = max(0.0001, round(final_coins, 4))
+
+                        final_coins = size_result.calculated_size
+                        sl_px = size_result.stop_loss_price
+                        stop_dist = size_result.stop_distance
 
                         tp_target = None
                         if hasattr(plan, "take_profit_levels") and plan.take_profit_levels:
@@ -1525,24 +1666,37 @@ class AutoPilotManager:
                         else:
                             tp_target = round(ref_px + stop_dist * 2.0, 2)
 
-                        # 确定限价挂单价格 (Maker)
-                        limit_entry_px = ref_px
+                        # 确定限价挂单价格 (Maker POST_ONLY: 确保做多挂在买一档微观下方、做空挂在卖一档微观上方，避免立即吃单)
                         if hasattr(plan, "entry_range") and plan.entry_range and len(plan.entry_range) == 2:
-                            limit_entry_px = (plan.entry_range[0] + plan.entry_range[1]) / 2.0
+                            raw_entry = (plan.entry_range[0] + plan.entry_range[1]) / 2.0
+                            if is_short:
+                                limit_entry_px = round(max(raw_entry, ref_px * 1.0003), 2 if ref_px > 10 else 4)
+                            else:
+                                limit_entry_px = round(min(raw_entry, ref_px * 0.9997), 2 if ref_px > 10 else 4)
                         elif is_short:
-                            limit_entry_px = round(ref_px * 1.0005, 2)
+                            limit_entry_px = round(ref_px * 1.0005, 2 if ref_px > 10 else 4)
                         else:
-                            limit_entry_px = round(ref_px * 0.9995, 2)
+                            limit_entry_px = round(ref_px * 0.9995, 2 if ref_px > 10 else 4)
 
-                        exec_order_type = OrderType.POST_ONLY if (state.post_only_preferred or risk_controller.rules.enforce_post_only) else OrderType.LIMIT
+                        # 1. 确定最终发单类型 (确立强制 Post-Only 硬风控最高优先级，严禁破位升级绕过)
+                        if risk_controller.rules.enforce_post_only or state.post_only_preferred:
+                            target_ot = OrderType.POST_ONLY
+                        elif conf >= 0.85:
+                            # 仅在硬风控允许且置信度极高时才允许使用 MARKET 追单
+                            target_ot = OrderType.MARKET
+                        else:
+                            target_ot = OrderType.POST_ONLY
 
+                        actual_order_price = limit_entry_px if target_ot != OrderType.MARKET else ref_px
+
+                        # 2. 构造与最终发单 100% 严格一致的 PlaceOrderRequest 送检风控中枢
                         order_req = PlaceOrderRequest(
                             symbol=target_symbol,
                             inst_type=InstType.SWAP,
                             side=side,
                             pos_side=pos_side,
-                            order_type=exec_order_type,
-                            price=limit_entry_px,
+                            order_type=target_ot,
+                            price=actual_order_price,
                             size=final_coins,
                             leverage=lev,
                             tp_trigger_price=tp_target,
@@ -1574,35 +1728,51 @@ class AutoPilotManager:
                                 timestamp=now_ms,
                             )
 
-                        # 硬风控前置拦截校验
+                        # 3. 严格前置硬风控校验 (包含 Post-Only 强阻断、滑点保护、单笔限额等)
                         risk_check = await risk_controller.check_order(order_req, tk_for_new_check, positions)
                         if not risk_check.passed:
                             patrol_summaries.append(f"{target_symbol}(风控拦截:{risk_check.rejected_rule})")
                             continue
 
-                        # 执行下单 (高置信度破位 conf >= 0.85 自动升级为 MARKET 追单防踏空，常规使用 POST_ONLY 降低手续费)
-                        target_ot = OrderType.MARKET if (conf >= 0.85 or not state.post_only_preferred) else OrderType.POST_ONLY
+                        # 4. 原样执行下单 (严禁风控后篡改发单参数)
                         try:
                             if is_live:
-                                await rest_client.place_order(
-                                    symbol=target_symbol,
-                                    side=side,
-                                    pos_side=pos_side,
-                                    order_type=target_ot,
-                                    px=ref_px if target_ot == OrderType.POST_ONLY else None,
-                                    sz=final_coins,
-                                    leverage=lev,
-                                    tp_trigger_price=tp_target,
-                                    sl_trigger_price=sl_px,
-                                )
+                                if target_ot == OrderType.POST_ONLY:
+                                    peg_res = await smart_execution_engine.execute_smart_peg_order(
+                                        symbol=target_symbol,
+                                        side=side,
+                                        pos_side=pos_side,
+                                        size=final_coins,
+                                        leverage=lev,
+                                        tp_trigger_price=tp_target,
+                                        sl_trigger_price=sl_px,
+                                        max_retries=3,
+                                        fallback_to_ioc=False,
+                                    )
+                                    if not peg_res.get("success"):
+                                        logger.warning(f"🚀 [AutoPilot] 首仓 Smart Pegging 未能成交: {peg_res.get('message')}")
+                                        patrol_summaries.append(f"{target_symbol}(首仓Peg超时未成)")
+                                        continue
+                                else:
+                                    await rest_client.place_order(
+                                        symbol=target_symbol,
+                                        side=side,
+                                        pos_side=pos_side,
+                                        order_type=target_ot,
+                                        price=limit_entry_px if target_ot != OrderType.MARKET else None,
+                                        sz=final_coins,
+                                        leverage=lev,
+                                        tp_trigger_price=tp_target,
+                                        sl_trigger_price=sl_px,
+                                    )
                             else:
-                                paper_engine.place_order(order_req)
+                                paper_engine.place_order(order_req, current_market_price=actual_order_price)
 
                             state._executed_plan_ids.add(plan_uuid)
                             state.position_scale_records[target_symbol] = 1
                             state.last_scale_timestamps[target_symbol] = now_ms
                             held_pos_map[target_symbol] = None
-                            exec_msg = f"🚀 【自动首仓执行 ({target_ot.value})】{target_symbol} {pos_side.value.upper()} {final_coins} 币 @ ~${ref_px} (置信度:{conf*100:.0f}%, 止损:${sl_px:.2f})"
+                            exec_msg = f"🚀 【自动首仓执行 ({target_ot.value})】{target_symbol} {pos_side.value.upper()} {final_coins} 币 @ ~${limit_entry_px if target_ot == OrderType.POST_ONLY else ref_px} (置信度:{conf*100:.0f}%, 止损:${sl_px:.2f})"
                             logger.info(exec_msg)
                             patrol_summaries.append(f"✅{target_symbol}首仓已开")
                         except Exception as exec_err:

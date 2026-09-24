@@ -99,6 +99,9 @@ class RiskController:
         self.symbol_cooldowns: Dict[str, int] = {}    # 标的级别止损冷静期: symbol -> cooldown_until_ms
         self.last_reset_date: str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
 
+        # FP&A 滚动风险预算与账户高水位线 (High Water Mark, HWM)
+        self.high_water_mark_equity: float = 10000.0
+
         # 异步锁
         self._lock = asyncio.Lock()
 
@@ -628,25 +631,54 @@ class RiskController:
         logger.critical("【PANIC BUTTON 触发】正在启动紧急撤单与全平应急处置流程！")
 
         # ---------------------------------------------------------------------
-        # 阶段 1: Cancel All Orders (优先全撤挂单)
+        # 阶段 1: Cancel All Orders (优先全撤挂单：包含普通挂单与策略条件单)
         # ---------------------------------------------------------------------
         if req.cancel_all_orders:
             try:
-                # 获取当前所有挂单并执行撤销
-                logger.info("[Panic Button] 阶段 1: 正在撤销所有活跃挂单...")
+                logger.info("[Panic Button] 阶段 1: 正在拉取并撤销所有活跃挂单与策略单...")
                 target_symbol = req.target if req.target != "ALL" else None
-                cancel_res = await rest_client.cancel_batch_orders([])
-                canceled_orders_count = len(cancel_res)
+
+                # 1.1 查询并批量撤销普通活跃挂单
+                pending_orders = await rest_client.get_pending_orders(symbol=target_symbol, inst_type="SWAP")
+                if pending_orders:
+                    orders_to_cancel = [
+                        {"instId": o["instId"], "ordId": o["ordId"]}
+                        for o in pending_orders
+                        if "instId" in o and "ordId" in o
+                    ]
+                    cancel_res = await rest_client.cancel_batch_orders(orders_to_cancel)
+                    canceled_orders_count += len(cancel_res)
+                    logger.info(f"[Panic Button] 已撤销 {len(cancel_res)}/{len(orders_to_cancel)} 笔普通挂单")
+
+                # 1.2 查询并批量撤销策略/附条件挂单 (如止盈止损条件单)
+                for ord_tp in ["conditional", "trigger"]:
+                    try:
+                        algo_orders = await rest_client.get_pending_algo_orders(symbol=target_symbol, inst_type="SWAP", ord_type=ord_tp)
+                        if algo_orders:
+                            algos_to_cancel = [
+                                {"instId": a["instId"], "algoId": a["algoId"]}
+                                for a in algo_orders
+                                if "instId" in a and "algoId" in a
+                            ]
+                            cancel_algo_res = await rest_client.cancel_batch_algo_orders(algos_to_cancel)
+                            canceled_orders_count += len(cancel_algo_res)
+                            logger.info(f"[Panic Button] 已撤销 {len(cancel_algo_res)} 笔 {ord_tp} 策略条件单")
+                    except Exception as algo_err:
+                        logger.warning(f"[Panic Button] 撤销策略挂单 ({ord_tp}) 异常: {algo_err}")
+
                 execution_details.append(PanicExecutionDetail(
                     symbol=req.target,
                     action="CANCEL_ORDER",
                     target_id="ALL_ACTIVE_ORDERS",
                     status="SUCCESS",
-                    message="已成功撤销所有活跃挂单"
+                    message=f"已成功撤销 {canceled_orders_count} 笔挂单与策略单"
                 ))
             except Exception as e:
                 logger.error(f"[Panic Button] 批量撤单异常: {e}")
                 failed_operations.append(f"CANCEL_ORDER {req.target}: {str(e)}")
+
+        # 留出 100ms 交易所撮合引擎撤单与解冻保证金缓冲
+        await asyncio.sleep(0.1)
 
         # ---------------------------------------------------------------------
         # 阶段 2: Close All Positions (市价全平持仓)
@@ -722,6 +754,52 @@ class RiskController:
             message=msg
         )
 
+    def get_adaptive_risk_budget(self, equity: float) -> Tuple[float, str, float]:
+        """
+        FP&A 滚动风险预算与回撤自适应头寸管理 (Drawdown-Adaptive Risk Sizing)
+        由 agency-fp-a-analyst (FP&A 财务规划分析师) 主导
+        - 追踪高水位线 HWM (High Water Mark)
+        - 依据当前回撤深度阶梯式压降单笔风险暴露，防止连续亏损打穿本金
+        :return: (effective_risk_pct, budget_tier, drawdown_pct)
+        """
+        if equity > self.high_water_mark_equity:
+            self.high_water_mark_equity = equity
+
+        hwm = self.high_water_mark_equity
+        drawdown_pct = ((hwm - equity) / hwm) if hwm > 0 else 0.0
+        base_pct = self.rules.fixed_risk_per_trade_percent
+
+        if drawdown_pct < 0.03:
+            # 正常扩张期 (回撤 < 3%): 维持标准 1.0% (以 7000 本金计为 70 USDT)
+            return base_pct, "EXPANSION_NORMAL", drawdown_pct
+        elif drawdown_pct < 0.06:
+            # 轻度回撤防守 (3% <= 回撤 < 6%): 风险预算下调至基准的 70% (约 0.70%)
+            return round(base_pct * 0.70, 4), "PRE_CAUTION_DEFENSIVE", drawdown_pct
+        elif drawdown_pct < 0.10:
+            # 中度回撤防御 (6% <= 回撤 < 10%): 风险预算下调至基准的 40% (约 0.40%)
+            return round(base_pct * 0.40, 4), "MODERATE_DRAWDOWN_LOCK", drawdown_pct
+        else:
+            # 重度回撤锁定 (回撤 >= 10%): 风险预算强力急冻至基准的 20% (约 0.20%)，资本保护最高优先级
+            return round(base_pct * 0.20, 4), "CRITICAL_CAPITAL_PRESERVATION", drawdown_pct
+
+    def get_fpa_risk_budget_status(self, equity: float) -> Dict[str, Any]:
+        """获取当前 FP&A 滚动风险预算状态报告"""
+        risk_pct, tier, dd_pct = self.get_adaptive_risk_budget(equity)
+        tier_descriptions = {
+            "EXPANSION_NORMAL": "正常资本扩张期: 风险预算 100% 满额分配 (1.0% 单笔风险)",
+            "PRE_CAUTION_DEFENSIVE": "轻度回撤防守期: 风险预算收缩至 70% (0.7% 单笔风险)",
+            "MODERATE_DRAWDOWN_LOCK": "中度回撤锁定期: 风险预算收紧至 40% (0.4% 单笔风险)",
+            "CRITICAL_CAPITAL_PRESERVATION": "极限资本保护期: 风险预算急冻至 20% (0.2% 单笔风险)，全面防守",
+        }
+        return {
+            "current_equity": round(equity, 2),
+            "high_water_mark": round(self.high_water_mark_equity, 2),
+            "drawdown_pct": round(dd_pct * 100.0, 2),
+            "effective_risk_pct": round(risk_pct * 100.0, 2),
+            "budget_tier": tier,
+            "description": tier_descriptions.get(tier, "")
+        }
+
     def calculate_fixed_risk_position_size(
         self,
         equity: float,
@@ -731,11 +809,16 @@ class RiskController:
         risk_pct: Optional[float] = None
     ) -> float:
         """
-        基于恒定 1% 资金风险模型 (Fixed Fractional Risk) 计算开仓张数/币数
-        公式: Position Size = (Equity * RiskPct) / (|Entry - StopLoss| * ContractVal)
-        示例: 7000 USDT 本金, 1% 风险 = 70 USDT 亏损上限。
+        基于 FP&A 滚动风险预算与恒定资金风险模型计算开仓张数/币数
+        公式: Position Size = (Equity * AdaptiveRiskPct) / (|Entry - StopLoss| * ContractVal)
         """
-        pct = risk_pct if risk_pct is not None else self.rules.fixed_risk_per_trade_percent
+        if risk_pct is not None:
+            pct = risk_pct
+            tier_label = "MANUAL_OVERRIDE"
+            dd_pct = 0.0
+        else:
+            pct, tier_label, dd_pct = self.get_adaptive_risk_budget(equity)
+
         max_loss_usdt = equity * pct
         price_diff = abs(entry_price - stop_loss_price)
 
@@ -751,7 +834,8 @@ class RiskController:
             raw_size = self.rules.max_order_usdt / (entry_price * contract_val)
 
         logger.info(
-            f"🎯【1% 风险头寸计算】净值={equity:.2f} USDT, 风险限额={max_loss_usdt:.2f} USDT (1%), "
+            f"🎯【FP&A 自适应风险头寸计算】净值={equity:.2f} USDT, HWM={self.high_water_mark_equity:.2f}, "
+            f"回撤={dd_pct*100:.2f}%, 风险比例={pct*100:.2f}% [{tier_label}], 允许亏损={max_loss_usdt:.2f} USDT, "
             f"入场={entry_price}, 止损={stop_loss_price}, 距离={price_diff:.2f} -> 建议开仓={raw_size:.4f} 张/币 (名义价值 ${raw_size * entry_price * contract_val:.2f})"
         )
         return round(raw_size, 4)

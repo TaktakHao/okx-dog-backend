@@ -29,7 +29,14 @@ from models import (
     GridSearchResponse,
     GridSearchResultItem,
 )
+from core.strategy_base import (
+    BacktestContext,
+    BarData,
+    BaseStrategy,
+    EMABreakoutStrategy,
+)
 from services.data_lake_service import DataLakeService
+from services.position_sizer import position_sizer
 
 logger = logging.getLogger("okx_dog.backtest")
 
@@ -152,19 +159,96 @@ class BacktestEngine:
         trades: List[BacktestTradeRecord] = []
         equity_curve: List[BacktestEquityPoint] = []
         position: Optional[Dict[str, Any]] = None
+        pending_signal: Optional[Dict[str, Any]] = None
+        last_funding_window: int = -1
         trade_counter = 0
         total_fee_paid = 0.0
+        funding_rate_8h = getattr(req, "funding_rate_8h", 0.0001)
+
+        # 实例化三位一体统一策略并注入回测上下文
+        strategy: BaseStrategy = EMABreakoutStrategy(req.params)
+        ctx = BacktestContext(symbol=req.symbol, timeframe=req.timeframe, initial_equity=initial_balance, leverage=leverage)
+        strategy.on_init(ctx)
 
         for i in range(20, len(df)):
             row = df[i]
             prev_row = df[i - 1]
             ts = int(row["timestamp"])
+            open_px = float(row.get("open", row["close"]))
             close_px = float(row["close"])
             high_px = float(row["high"])
             low_px = float(row["low"])
             atr = float(row["atr14"])
+            is_bullish = (close_px >= open_px)
 
-            # 持仓判断
+            # 1. 真实 8 小时资金费率结算 (跨越 UTC 00:00/08:00/16:00 窗口)
+            funding_window = ts // (8 * 3600 * 1000)
+            if position:
+                if last_funding_window != -1 and funding_window > last_funding_window:
+                    windows_crossed = funding_window - last_funding_window
+                    cur_notional = position["size"] * close_px
+                    if position["pos_side"] == "long":
+                        funding_cost = cur_notional * funding_rate_8h * windows_crossed
+                        equity -= funding_cost
+                        total_fee_paid += funding_cost
+                        position["funding_fee_paid"] = position.get("funding_fee_paid", 0.0) + funding_cost
+                    else:
+                        funding_gain = cur_notional * funding_rate_8h * windows_crossed
+                        equity += funding_gain
+                        position["funding_fee_paid"] = position.get("funding_fee_paid", 0.0) - funding_gain
+            last_funding_window = funding_window
+
+            # 2. Next-Bar 开盘撮合成交 (严格消除 Look-ahead 偏差)
+            if pending_signal and position is None and equity > 100:
+                sig_side = pending_signal["pos_side"]
+                sig_atr = pending_signal["atr"]
+                if sig_side == "long":
+                    entry_px = open_px * (1 + slippage)
+                    sl_dist = sig_atr * atr_mult
+                    sl_px = entry_px - sl_dist
+                    tp_px = entry_px + sl_dist * 2.0
+                else:
+                    entry_px = open_px * (1 - slippage)
+                    sl_dist = sig_atr * atr_mult
+                    sl_px = entry_px + sl_dist
+                    tp_px = entry_px - sl_dist * 2.0
+
+                sizer_res = position_sizer.calculate_adaptive_size(
+                    symbol=req.symbol,
+                    equity=equity,
+                    entry_price=entry_px,
+                    is_short=(sig_side == "short"),
+                    stop_loss_price=sl_px,
+                    atr=sig_atr,
+                    atr_multiplier=atr_mult,
+                    risk_pct=0.01,
+                    max_leverage=leverage,
+                    max_order_usdt=min(equity * 0.3 * leverage, 10000.0)
+                )
+                size = sizer_res.calculated_size
+                notional = sizer_res.notional_value_usdt
+                order_margin = sizer_res.required_margin_usdt
+                fee = notional * taker_fee
+                equity -= fee
+                total_fee_paid += fee
+
+                position = {
+                    "pos_side": sig_side,
+                    "entry_price": entry_px,
+                    "sl_price": sl_px,
+                    "tp_price": tp_px,
+                    "size": size,
+                    "margin": order_margin,
+                    "notional": notional,
+                    "entry_time": ts,
+                    "mfe_pct": 0.0,
+                    "mae_pct": 0.0,
+                    "breakeven_locked": False,
+                    "funding_fee_paid": 0.0
+                }
+                pending_signal = None
+
+            # 3. 持仓风控与止盈止损巡检 (含阳线/阴线子路径歧义推导)
             if position:
                 pos_side = position["pos_side"]
                 entry_px = position["entry_price"]
@@ -183,10 +267,23 @@ class BacktestEngine:
                         if (high_px - entry_px) >= (tp_px - entry_px) * breakeven_ratio:
                             position["sl_price"] = entry_px * (1 + taker_fee * 2)
                             position["breakeven_locked"] = True
+                            sl_px = position["sl_price"]
 
-                    if low_px <= sl_px:
+                    sl_hit = (low_px <= sl_px)
+                    tp_hit = (high_px >= tp_px)
+
+                    if sl_hit and tp_hit:
+                        final_exit = "STOP_LOSS" if is_bullish else "TAKE_PROFIT"
+                    elif sl_hit:
+                        final_exit = "STOP_LOSS"
+                    elif tp_hit:
+                        final_exit = "TAKE_PROFIT"
+                    else:
+                        final_exit = None
+
+                    if final_exit == "STOP_LOSS":
                         exit_px = sl_px * (1 - slippage)
-                        pnl = (exit_px - entry_px) * size * leverage
+                        pnl = (exit_px - entry_px) * size
                         fee = exit_px * size * taker_fee
                         net_pnl = pnl - fee
                         equity += net_pnl
@@ -208,9 +305,9 @@ class BacktestEngine:
                             mae_pct=round(position["mae_pct"], 2)
                         ))
                         position = None
-                    elif high_px >= tp_px:
+                    elif final_exit == "TAKE_PROFIT":
                         exit_px = tp_px * (1 - slippage)
-                        pnl = (exit_px - entry_px) * size * leverage
+                        pnl = (exit_px - entry_px) * size
                         fee = exit_px * size * taker_fee
                         net_pnl = pnl - fee
                         equity += net_pnl
@@ -243,10 +340,23 @@ class BacktestEngine:
                         if (entry_px - low_px) >= (entry_px - tp_px) * breakeven_ratio:
                             position["sl_price"] = entry_px * (1 - taker_fee * 2)
                             position["breakeven_locked"] = True
+                            sl_px = position["sl_price"]
 
-                    if high_px >= sl_px:
+                    sl_hit = (high_px >= sl_px)
+                    tp_hit = (low_px <= tp_px)
+
+                    if sl_hit and tp_hit:
+                        final_exit = "TAKE_PROFIT" if is_bullish else "STOP_LOSS"
+                    elif sl_hit:
+                        final_exit = "STOP_LOSS"
+                    elif tp_hit:
+                        final_exit = "TAKE_PROFIT"
+                    else:
+                        final_exit = None
+
+                    if final_exit == "STOP_LOSS":
                         exit_px = sl_px * (1 + slippage)
-                        pnl = (entry_px - exit_px) * size * leverage
+                        pnl = (entry_px - exit_px) * size
                         fee = exit_px * size * taker_fee
                         net_pnl = pnl - fee
                         equity += net_pnl
@@ -268,9 +378,9 @@ class BacktestEngine:
                             mae_pct=round(position["mae_pct"], 2)
                         ))
                         position = None
-                    elif low_px <= tp_px:
+                    elif final_exit == "TAKE_PROFIT":
                         exit_px = tp_px * (1 + slippage)
-                        pnl = (entry_px - exit_px) * size * leverage
+                        pnl = (entry_px - exit_px) * size
                         fee = exit_px * size * taker_fee
                         net_pnl = pnl - fee
                         equity += net_pnl
@@ -293,58 +403,31 @@ class BacktestEngine:
                         ))
                         position = None
 
-            # 开仓信号扫描
-            if position is None and equity > 100:
-                e20_now = row["ema20"]
-                e50_now = row["ema50"]
-                e20_prev = prev_row["ema20"]
-                e50_prev = prev_row["ema50"]
-                rsi = row["rsi14"]
-
-                if e20_prev <= e50_prev and e20_now > e50_now and 50 < rsi < 70:
-                    entry_px = close_px * (1 + slippage)
-                    sl_dist = atr * atr_mult
-                    sl_px = entry_px - sl_dist
-                    tp_px = entry_px + sl_dist * 2.0
-                    order_usdt = min(equity * 0.3, 3000.0)
-                    size = order_usdt / entry_px
-                    fee = order_usdt * taker_fee
-                    equity -= fee
-                    total_fee_paid += fee
-
-                    position = {
-                        "pos_side": "long",
-                        "entry_price": entry_px,
-                        "sl_price": sl_px,
-                        "tp_price": tp_px,
-                        "size": size,
-                        "entry_time": ts,
-                        "mfe_pct": 0.0,
-                        "mae_pct": 0.0,
-                        "breakeven_locked": False
+            # 4. 开仓信号扫描 (委托三位一体 BaseStrategy 进行研判，交由 Next-Bar 开盘撮合)
+            if position is None and pending_signal is None and equity > 100:
+                bar_obj = BarData(
+                    symbol=req.symbol,
+                    timeframe=req.timeframe,
+                    timestamp=ts,
+                    open=open_px,
+                    high=high_px,
+                    low=low_px,
+                    close=close_px,
+                    volume=float(row.get("volume", 100.0)),
+                    indicators={
+                        "ema20": row["ema20"],
+                        "ema50": row["ema50"],
+                        "ema200": row["ema200"],
+                        "rsi14": row["rsi14"],
+                        "atr14": atr
                     }
-                elif e20_prev >= e50_prev and e20_now < e50_now and 30 < rsi < 50:
-                    entry_px = close_px * (1 - slippage)
-                    sl_dist = atr * atr_mult
-                    sl_px = entry_px + sl_dist
-                    tp_px = entry_px - sl_dist * 2.0
-                    order_usdt = min(equity * 0.3, 3000.0)
-                    size = order_usdt / entry_px
-                    fee = order_usdt * taker_fee
-                    equity -= fee
-                    total_fee_paid += fee
-
-                    position = {
-                        "pos_side": "short",
-                        "entry_price": entry_px,
-                        "sl_price": sl_px,
-                        "tp_price": tp_px,
-                        "size": size,
-                        "entry_time": ts,
-                        "mfe_pct": 0.0,
-                        "mae_pct": 0.0,
-                        "breakeven_locked": False
-                    }
+                )
+                strat_decision = strategy.on_bar(bar_obj, ctx)
+                if strat_decision:
+                    if strat_decision.action == SignalAction.BUY_LONG:
+                        pending_signal = {"pos_side": "long", "atr": atr}
+                    elif strat_decision.action == SignalAction.SELL_SHORT:
+                        pending_signal = {"pos_side": "short", "atr": atr}
 
             # 资金曲线
             peak_equity = max(peak_equity, equity)

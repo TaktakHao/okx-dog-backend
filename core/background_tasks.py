@@ -112,3 +112,13 @@ async def daily_review_and_macro_watch_loop():
         except Exception as e:
             logger.debug(f"宏观与复盘监控微循环轻度异常: {e}")
 
+
+async def reconciliation_worker_loop():
+    """
+    60秒常驻自动化对账中枢守护协程：
+    确立交易所为 Remote SSOT 唯一事实源，自动捕获持仓/挂单/资金漂移并闭环自愈
+    """
+    from state import reconciliation_service
+    await reconciliation_service.run_forever()
+
+

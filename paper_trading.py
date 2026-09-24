@@ -163,10 +163,11 @@ class PaperTradingEngine:
                         )
                         triggered_events.append(close_res)
 
-                        # 在内存持仓中更新状态：标记保本，止损价移至开仓均价，清空 TP1
+                        # 在内存持仓中更新状态：标记保本，止损价移至「均价+摩擦覆盖缓冲」(True Breakeven)，清空 TP1
                         pos.tp_triggered_50 = True
                         pos.is_breakeven_locked = True
-                        pos.sl_trigger_price = pos.avg_px
+                        friction_buffer = pos.avg_px * 0.0012
+                        pos.sl_trigger_price = round(pos.avg_px + friction_buffer, 2 if pos.avg_px > 10 else 4) if is_long else round(pos.avg_px - friction_buffer, 2 if pos.avg_px > 10 else 4)
                         pos.tp_trigger_price = None
                         continue
                     else:
@@ -231,11 +232,16 @@ class PaperTradingEngine:
         notional_usdt = exec_price * size
         required_margin = notional_usdt / leverage
 
-        if self.cash < required_margin:
-            raise ValueError(f"模拟账户可用资金不足！需保证金 {required_margin:.2f} USDT，当前可用现金 {self.cash:.2f} USDT")
+        # 区分 Maker 与 Taker 真实交易费率 (POST_ONLY: 0.02% Maker, MARKET: 0.05% Taker)
+        is_maker = getattr(req, "order_type", None) == OrderType.POST_ONLY
+        open_fee_rate = 0.0002 if is_maker else 0.0005
+        open_fee = round(notional_usdt * open_fee_rate, 4)
 
-        # 扣减可用现金作为保证金
-        self.cash -= required_margin
+        if self.cash < (required_margin + open_fee):
+            raise ValueError(f"模拟账户可用资金不足！需保证金 {required_margin:.2f} USDT + 开仓手续费 {open_fee:.2f} USDT，当前可用现金 {self.cash:.2f} USDT")
+
+        # 扣减可用现金作为保证金与开仓手续费
+        self.cash -= (required_margin + open_fee)
 
         # 校验并清洗止盈/止损价，过滤方向倒置的无效点位
         raw_tp = float(getattr(req, "tp_trigger_price", 0.0) or 0.0)
@@ -276,6 +282,8 @@ class PaperTradingEngine:
             leverage=leverage,
             tp_trigger_price=sanitized_tp,
             sl_trigger_price=sanitized_sl,
+            fee=open_fee,
+            fee_currency="USDT",
             risk_check_passed=True,
             risk_check_msg="通过硬风控检查 (模拟操盘撮合)",
             copilot_mode=getattr(req, "copilot_mode", CopilotMode.MANUAL),
@@ -394,9 +402,15 @@ class PaperTradingEngine:
 
             is_long = pos.pos_side == PosSide.LONG
             if is_long:
-                pnl = (close_price - pos.avg_px) * close_sz
+                raw_pnl = (close_price - pos.avg_px) * close_sz
             else:
-                pnl = (pos.avg_px - close_price) * close_sz
+                raw_pnl = (pos.avg_px - close_price) * close_sz
+
+            # 扣除平仓手续费 (市价平仓按 Taker 0.05% 计，限价平仓按 0.02% 计)
+            close_notional = close_price * close_sz
+            close_fee_rate = 0.0005  # 平仓多数为市价止损或止盈单
+            close_fee = round(close_notional * close_fee_rate, 4)
+            pnl = round(raw_pnl - close_fee, 4)
 
             released_margin = pos.margin * close_ratio
             self.cash += (released_margin + pnl)
@@ -410,6 +424,7 @@ class PaperTradingEngine:
                 "size": close_sz,
                 "leverage": pos.leverage,
                 "realized_pnl": pnl,
+                "fee": close_fee,
                 "roi_pct": (pnl / released_margin * 100) if released_margin > 0 else 0.0,
                 "reason": reason,
                 "timestamp": now_ms,

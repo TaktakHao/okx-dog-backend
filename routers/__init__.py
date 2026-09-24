@@ -24,6 +24,7 @@ from routers.consensus import router as consensus_router
 from routers.telegram import router as telegram_router
 from routers.studio import router as studio_router
 from routers.evolution import router as evolution_router
+from routers.finance import router as finance_router
 
 __all__ = [
     "health_router",
@@ -46,6 +47,7 @@ __all__ = [
     "telegram_router",
     "studio_router",
     "evolution_router",
+    "finance_router",
 ]
 
 

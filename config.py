@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 from typing import Literal
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, model_validator
 
 
 # 项目根路径与数据持久化目录
@@ -62,6 +62,17 @@ class SystemSettings(BaseSettings):
     DEFAULT_LLM_MODEL: str = "gemini-3.7-flash"
     DEFAULT_LLM_TEMPERATURE: float = 0.2
     DEFAULT_LLM_MAX_TOKENS: int = 4096
+
+    @model_validator(mode="after")
+    def validate_production_security(self):
+        """生产环境安全硬隔离：禁止使用默认弱口令或空密码启动"""
+        if self.ENV == "production":
+            if not self.MASTER_PASSWORD or self.MASTER_PASSWORD == "OKX_DOG_DEFAULT_MASTER_PASS_2026":
+                raise ValueError(
+                    "【安全红线阻断】生产环境 (ENV=production) 禁止使用默认或空 MASTER_PASSWORD！"
+                    "请在系统环境变量或 .env 中设置安全主密码后重新启动。"
+                )
+        return self
 
     model_config = SettingsConfigDict(
         env_file=[str(ROOT_DIR / ".env"), str(BASE_DIR / ".env")],
