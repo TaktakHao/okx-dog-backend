@@ -844,9 +844,10 @@ class AutoPilotManager:
         # 计算运行时长 (秒)
         if state.is_running:
             running_secs = max(0, int((now_ms - state.start_time) / 1000))
+        elif state.stop_time and state.start_time:
+            running_secs = max(0, int((state.stop_time - state.start_time) / 1000))
         else:
-            end_ms = state.stop_time or now_ms
-            running_secs = max(0, int((end_ms - state.start_time) / 1000))
+            running_secs = 0
 
         # 计算累计已实现盈亏 (仅统计属于该环境的 trades)
         tot_realized = sum(t.realized_pnl for t in state.trades)

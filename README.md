@@ -101,6 +101,9 @@ OKX-Dog 后端是基于 Python 异步架构构建的高并发量化交易与 7x2
 16. **企业级量化运维监控网关 (`routers/health.py`)**:
    - 提供全景运维指标接口 `GET /api/v1/health/ops-metrics`；
    - 实时采集 OKX WebSocket 毫秒级延时、REST API 往返时延 (RTT)、Maker 成交比例、对账状态及数据湖健康度。
+17. **7x24h 自动操盘状态机与动态运行时长修正 (`auto_pilot.py`)**:
+   - 修复未启动/重载状态下计时器累计虚假运行时长的缺陷，保证未启停状态 `running_seconds = 0`；
+   - 增强全生命周期状态一致性，与前端一键启动 API 强联锁，杜绝前端空转阻断。
 
 ## 快速启动与测试
 
