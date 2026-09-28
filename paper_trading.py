@@ -555,9 +555,13 @@ class PaperTradingEngine:
                 updated = True
         return updated
 
-    def get_positions(self) -> List[PositionModel]:
-        """获取当前活跃模拟持仓列表"""
-        return list(self.positions.values())
+    def get_positions(self, inst_type: Optional[str] = None) -> List[PositionModel]:
+        """获取当前活跃模拟持仓列表，支持按业务类型过滤 (如 SWAP / SPOT)"""
+        pos_list = list(self.positions.values())
+        if inst_type:
+            target_inst = str(inst_type).upper()
+            return [p for p in pos_list if (p.inst_type.value if hasattr(p.inst_type, "value") else str(p.inst_type)).upper() == target_inst]
+        return pos_list
 
     def get_orders(self) -> List[OrderModel]:
         """获取所有模拟订单"""
