@@ -791,6 +791,22 @@ class AutoPilotManager:
             except Exception as evo_err:
                 logger.warning(f"【自动操盘中枢】AI员工自演进联动跳过: {evo_err}")
 
+            # 同步 CFO 战绩激励引擎：派发或核销员工算力与深度思考奖励
+            try:
+                from agent.evolution.cfo_performance_manager import CfoPerformanceManager
+                cfo = CfoPerformanceManager.get_instance()
+                if realized_pnl > 0:
+                    cfo.reward_trade_profit(
+                        trade_id=order_id or record_id,
+                        pnl_usdt=realized_pnl,
+                        side="LONG" if "LONG" in str(pos_side).upper() else "SHORT"
+                    )
+                elif ("保本" in reason or "防守" in reason or "排雷" in reason or "风控" in reason):
+                    cfo.record_successful_hedge(symbol=symbol, reason=reason)
+            except Exception as cfo_err:
+                logger.debug(f"【自动操盘中枢】CFO战绩结算联动跳过: {cfo_err}")
+
+
             # 持久化到 SQLite
             try:
                 async with get_db_session() as session:

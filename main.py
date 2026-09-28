@@ -219,6 +219,11 @@ app.include_router(evolution_router)
 # v3.7 资深财务分析师与资金配置路由
 app.include_router(finance_router)
 
+# v6.0 Paperclip 虚拟量化公司与 CFO 战绩配额路由
+from routers.paperclip import router as paperclip_router
+app.include_router(paperclip_router)
+
+
 
 
 # =============================================================================

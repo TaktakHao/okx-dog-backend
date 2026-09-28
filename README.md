@@ -114,6 +114,11 @@ OKX-Dog 后端是基于 Python 异步架构构建的高并发量化交易与 7x2
    - 递归动态追踪标的对（如 BTC-USDT-SWAP vs ETH-USDT-SWAP）对数价格的协整斜率 $\beta$ 与截距 $\alpha$；
    - 滚动计算残差价差动态归一化 $Z\text{-Score}$，结合协方差矩阵迹 $\text{Tr}(P)$ 发散监控，生成低风险市场中性对冲建议。
 
+20. **Paperclip 虚拟量化公司与 CFO 战绩配额网关 (`routers/paperclip.py` & `auto_pilot.py`)**:
+    - 对外暴露 `/api/v1/paperclip/org`（公司组织架构）、`/api/v1/paperclip/quota/overview`（员工剩余可用奖励额度）；
+    - 异动任务派发端点 `/api/v1/paperclip/task/anomaly`，与 Paperclip 控制平面实现 Webhook 双向交互；
+    - 自动操盘平仓盈利或排雷避险成功时，自动向 CFO 战绩激励引擎推送事件，实现算力奖励与深度思考特权发放闭环。
+
 ## 快速启动与测试
 
 ```bash

@@ -25,6 +25,7 @@ from routers.telegram import router as telegram_router
 from routers.studio import router as studio_router
 from routers.evolution import router as evolution_router
 from routers.finance import router as finance_router
+from routers.paperclip import router as paperclip_router
 
 __all__ = [
     "health_router",
@@ -48,6 +49,8 @@ __all__ = [
     "studio_router",
     "evolution_router",
     "finance_router",
+    "paperclip_router",
 ]
+
 
 
