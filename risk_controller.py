@@ -573,6 +573,65 @@ class RiskController:
                     risk_status=self.risk_status
                 )
 
+        # ---------------------------------------------------------------------
+        # 规则 7: DCA 与加仓动态强平线穿透硬拦截 (源自 oke_auto_trade 核心优势融合)
+        # ---------------------------------------------------------------------
+        if current_positions and not is_reduce_only:
+            matching_pos = next((p for p in current_positions if p.symbol == order.symbol and p.pos != 0), None)
+            if matching_pos:
+                order_px = order.price or (current_ticker.last_price if current_ticker else 0.0)
+                liq_px = matching_pos.liquidation_price or matching_pos.liq_px
+                pos_side_str = matching_pos.pos_side.value if hasattr(matching_pos.pos_side, "value") else str(matching_pos.pos_side)
+
+                if order_px > 0 and liq_px and liq_px > 0:
+                    is_pos_long = "long" in pos_side_str.lower()
+                    # 做多补仓：若委托价格低于或等于当前强平价，说明价格尚未跌到该买入点位，仓位就早已爆仓！
+                    if is_pos_long and order_px <= liq_px:
+                        reason = (
+                            f"【强平穿透硬拦截】计划加仓买入价 ({order_px:.4f}) <= 当前持仓强平价 ({liq_px:.4f})！"
+                            f"价格跌至该加仓点前仓位将先行爆仓，已坚决阻断发单！"
+                        )
+                        await self.record_risk_event(
+                            event_type=RiskEventType.ORDER_REJECTED,
+                            rule_name="LIQUIDATION_PENETRATION_LOCK",
+                            limit_val=f"LiqPx={liq_px:.4f}",
+                            current_val=f"OrderPx={order_px:.4f}",
+                            symbol=order.symbol,
+                            is_blocked=True,
+                            action_taken="REJECT_ORDER",
+                            severity=AuditSeverity.CRITICAL,
+                            details={"liq_px": liq_px, "order_px": order_px, "pos_side": pos_side_str}
+                        )
+                        return RiskCheckResult(
+                            passed=False,
+                            rejected_rule="LIQUIDATION_PENETRATION_LOCK",
+                            message=reason,
+                            risk_status=self.risk_status
+                        )
+                    # 做空补仓：若委托价格高于或等于当前强平价，同理先行爆仓！
+                    elif (not is_pos_long) and order_px >= liq_px:
+                        reason = (
+                            f"【强平穿透硬拦截】计划加仓卖出价 ({order_px:.4f}) >= 当前持仓强平价 ({liq_px:.4f})！"
+                            f"价格涨至该加仓点前仓位将先行爆仓，已坚决阻断发单！"
+                        )
+                        await self.record_risk_event(
+                            event_type=RiskEventType.ORDER_REJECTED,
+                            rule_name="LIQUIDATION_PENETRATION_LOCK",
+                            limit_val=f"LiqPx={liq_px:.4f}",
+                            current_val=f"OrderPx={order_px:.4f}",
+                            symbol=order.symbol,
+                            is_blocked=True,
+                            action_taken="REJECT_ORDER",
+                            severity=AuditSeverity.CRITICAL,
+                            details={"liq_px": liq_px, "order_px": order_px, "pos_side": pos_side_str}
+                        )
+                        return RiskCheckResult(
+                            passed=False,
+                            rejected_rule="LIQUIDATION_PENETRATION_LOCK",
+                            message=reason,
+                            risk_status=self.risk_status
+                        )
+
         # 全部硬风控检查通过
         return RiskCheckResult(
             passed=True,
@@ -580,6 +639,33 @@ class RiskController:
             message="通过全部硬风控前置校验",
             risk_status=self.risk_status
         )
+
+    def evaluate_dca_chain_safety(
+        self,
+        direction: str,
+        initial_price: float,
+        leverage: float,
+        initial_margin: float,
+        dca_margin_base: float,
+        max_dca_orders: int = 3,
+        price_deviation_percent: float = 1.5,
+        extra_margin: float = 0.0
+    ):
+        """
+        前置调用 DCA 强平穿透与极限保证金精算模型
+        """
+        from core.dca_liquidation_calculator import DcaLiquidationCalculator
+        return DcaLiquidationCalculator.calculate_dca_chain(
+            direction=direction,
+            initial_price=initial_price,
+            leverage=leverage,
+            initial_margin=initial_margin,
+            dca_margin_base=dca_margin_base,
+            max_dca_orders=max_dca_orders,
+            price_deviation_percent=price_deviation_percent,
+            extra_margin=extra_margin
+        )
+
 
     def trigger_daily_loss_circuit_breaker(self, current_loss: float, reason: str):
         """触发单日亏损熔断锁定"""

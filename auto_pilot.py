@@ -1396,6 +1396,34 @@ class AutoPilotManager:
                             scale_reason = f"回调支撑均摊加仓 (回撤 {profit_ratio*100:.1f}%)"
 
                         if should_scale:
+                            # 【核心风控：加仓强平线穿透前置预检 (源自 oke_auto_trade 优势融合)】
+                            try:
+                                from core.dca_liquidation_calculator import DcaLiquidationCalculator
+                                cur_pos_liq = pos.liquidation_price or pos.liq_px or 0.0
+                                scale_check = DcaLiquidationCalculator.calculate_dca_chain(
+                                    direction="long" if is_long else "short",
+                                    initial_price=cur_px,
+                                    leverage=float(pos.leverage or 3),
+                                    initial_margin=max(10.0, float(pos.margin or 50.0)),
+                                    dca_margin_base=max(10.0, avail_funds * 0.02),
+                                    max_dca_orders=2,
+                                    price_deviation_percent=1.2,
+                                    extra_margin=0.0
+                                )
+                                # 检查加仓是否会导致强平击穿
+                                if is_long and cur_pos_liq > 0 and cur_px <= cur_pos_liq * 1.01:
+                                    logger.warning(f"[AUTOPILOT_SCALE_BLOCKED] 标的 {sym} 当前价 {cur_px} 过度接近强平价 {cur_pos_liq}，阻断加仓")
+                                    should_scale = False
+                                elif (not is_long) and cur_pos_liq > 0 and cur_px >= cur_pos_liq * 0.99:
+                                    logger.warning(f"[AUTOPILOT_SCALE_BLOCKED] 标的 {sym} 当前价 {cur_px} 过度接近强平价 {cur_pos_liq}，阻断加仓")
+                                    should_scale = False
+                                elif not scale_check.is_safe:
+                                    logger.warning(f"[AUTOPILOT_SCALE_BLOCKED] 标的 {sym} 连锁加仓强平预演未通过: {scale_check.violation_reason}")
+                                    should_scale = False
+                            except Exception as e_dca:
+                                logger.debug(f"[AUTOPILOT_DCA_CHECK_ERR] 强平预检计算辅助异常 (放行): {e_dca}")
+
+                        if should_scale:
                             try:
                                 lev = min(plan.suggested_leverage or 3, risk_controller.rules.max_leverage if risk_controller.rules else 5)
                                 risk_budget = max(5.0, avail_funds * 0.016)

@@ -104,6 +104,15 @@ OKX-Dog 后端是基于 Python 异步架构构建的高并发量化交易与 7x2
 17. **7x24h 自动操盘状态机与动态运行时长修正 (`auto_pilot.py`)**:
    - 修复未启动/重载状态下计时器累计虚假运行时长的缺陷，保证未启停状态 `running_seconds = 0`；
    - 增强全生命周期状态一致性，与前端一键启动 API 强联锁，杜绝前端空转阻断。
+18. **DCA 动态强平线穿透预判与极限承压保证金精算 (`core/dca_liquidation_calculator.py` / `risk_controller.py`)**:
+   - 融合自 `oke_auto_trade` (`calculate_dca.py` 与 `calculate_multi_group_margin.py`) 实战数理优势；
+   - 逐层前瞻推导 DCA 加仓链条的持仓均价、累计保证金、以及下一档推导强平价格；
+   - **强平穿透硬拦截 (Liquidation Penetration Check)**：做多加仓委托价 $\le$ 上一轮持仓强平价，或做空加仓委托价 $\ge$ 上一轮持仓强平价时，判定价格未跌至补仓点即已先行穿仓，在风控拦截器与自动驾驶加仓分支中一票否决；
+   - **30% 极端逆势极限承压保证金精算**：推导在承受极端暴跌/暴涨时所需锁定的最低隔离保证金总额。
+19. **两状态自适应卡尔曼滤波协整配对与对冲套利中枢 (`core/kalman_pair_engine.py`)**:
+   - 融合自 `oke_auto_trade` (`run_pair_backest.py` & `run_pair.py`)；
+   - 递归动态追踪标的对（如 BTC-USDT-SWAP vs ETH-USDT-SWAP）对数价格的协整斜率 $\beta$ 与截距 $\alpha$；
+   - 滚动计算残差价差动态归一化 $Z\text{-Score}$，结合协方差矩阵迹 $\text{Tr}(P)$ 发散监控，生成低风险市场中性对冲建议。
 
 ## 快速启动与测试
 
