@@ -119,6 +119,11 @@ OKX-Dog 后端是基于 Python 异步架构构建的高并发量化交易与 7x2
     - 异动任务派发端点 `/api/v1/paperclip/task/anomaly`，与 Paperclip 控制平面实现 Webhook 双向交互；
     - 自动操盘平仓盈利或排雷避险成功时，自动向 CFO 战绩激励引擎推送事件，实现算力奖励与深度思考特权发放闭环。
 
+21. **欧易全量真实标的检索与一键订阅引擎 (`services/instrument_service.py` & `routers/market.py`) (v7.0)**:
+    - **全量真实在架标的库**：启动时自动异步同步 OKX 官方 `/api/v5/public/instruments` 全量 SWAP (永续) 与 SPOT (现货) 交易对，支持本地磁盘文件快速持久化与 6 小时自动静默刷新；
+    - **高性能二级索引与模糊搜索**：暴露 `GET /api/v1/market/instruments/search`，支持关键词前缀、币种名、全称多维检索，耗时 < 5ms；
+    - **长连接动态订阅**：端点 `POST /api/v1/market/subscribe-focus` 支持批量向 WebSocket 建立实时推流，杜绝用户手工输入错误代码。
+
 ## 快速启动与测试
 
 ```bash

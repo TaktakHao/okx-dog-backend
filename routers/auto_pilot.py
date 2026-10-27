@@ -150,11 +150,11 @@ async def get_auto_pilot_status():
 
 
 @router.get("/history", response_model=ApiResponse[AutoPilotHistoryResponse], summary="获取自动操盘收益曲线与流水")
-async def get_auto_pilot_history():
+async def get_auto_pilot_history(limit: int = 3000):
     """获取开启以来的时序收益曲线采样点与自动交易流水"""
     now_ms = int(time.time() * 1000)
     is_live = rest_client.is_live_mode and bool(rest_client.api_key)
-    history = auto_pilot_manager.get_history(is_live_mode=is_live)
+    history = await auto_pilot_manager.get_history_async(is_live_mode=is_live, limit=limit)
     return ApiResponse(code=0, msg="自动操盘收益曲线与流水", data=history, timestamp=now_ms)
 
 

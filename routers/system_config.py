@@ -57,18 +57,39 @@ async def update_system_config(
     """更新协同模式 (MANUAL / SEMI_AUTO / FULL_AUTO) 与活跃标的"""
     now_ms = int(time.time() * 1000)
 
-    sql = text("""
-        UPDATE system_config SET
-            copilot_mode = COALESCE(:mode, copilot_mode),
-            active_symbol = COALESCE(:symbol, active_symbol),
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = (SELECT id FROM system_config ORDER BY id DESC LIMIT 1)
-    """)
-    await db.execute(sql, {
-        "mode": req.copilot_mode.value if req.copilot_mode else None,
-        "symbol": req.active_symbol
-    })
-    await db.commit()
+    try:
+        sql = text("""
+            UPDATE system_config SET
+                copilot_mode = COALESCE(:mode, copilot_mode),
+                active_symbol = COALESCE(:symbol, active_symbol),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = (SELECT id FROM system_config ORDER BY id DESC LIMIT 1)
+        """)
+        await db.execute(sql, {
+            "mode": req.copilot_mode.value if req.copilot_mode else None,
+            "symbol": req.active_symbol
+        })
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        # 兼容旧版未包含 copilot_mode / active_symbol 列的 SQLite 表结构
+        for col_ddl in [
+            "ALTER TABLE system_config ADD COLUMN copilot_mode TEXT NOT NULL DEFAULT 'MANUAL'",
+            "ALTER TABLE system_config ADD COLUMN active_symbol TEXT NOT NULL DEFAULT 'BTC-USDT-SWAP'",
+        ]:
+            try:
+                await db.execute(text(col_ddl))
+                await db.commit()
+            except Exception:
+                await db.rollback()
+        try:
+            await db.execute(sql, {
+                "mode": req.copilot_mode.value if req.copilot_mode else None,
+                "symbol": req.active_symbol
+            })
+            await db.commit()
+        except Exception:
+            await db.rollback()
 
     return ApiResponse(
         code=0,

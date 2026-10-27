@@ -84,26 +84,34 @@ def generate_quantitative_rule_decision(
     rsi_15m = (tf_15m.rsi_14 if tf_15m else 52.0)
     bb_up_15m = (tf_15m.bb_upper if (tf_15m and tf_15m.bb_upper > 0) else current_price * 1.012)
     bb_low_15m = (tf_15m.bb_lower if (tf_15m and tf_15m.bb_lower > 0) else current_price * 0.988)
+    macd_hist_1h = (tf_1h.macd_histogram if (tf_1h and tf_1h.macd_histogram is not None) else 0.0)
 
-    # 波动率挤压检测 (激进模式下放宽挤压过滤，鼓励捕捉短线突破)
+    # 波动率挤压与均线纠缠窄幅震荡过滤 (防止震荡市频繁左右挨耳光)
     bb_bandwidth = (bb_up_15m - bb_low_15m) / max(current_price, 1e-6)
+    ema_spread_1h = abs(ema20_1h - ema50_1h) / max(current_price, 1e-6)
     is_agg = (aggressiveness_mode.upper() == "AGGRESSIVE")
-    is_squeezed = False if is_agg else ((bb_bandwidth < 0.015) or (atr_15m / max(current_price, 1e-6) < 0.0035))
+    is_choppy_tangled = (ema_spread_1h < 0.0020 and 44.0 <= rsi_1h <= 56.0)
+    is_squeezed = False if is_agg else ((bb_bandwidth < 0.015) or (atr_15m / max(current_price, 1e-6) < 0.0035) or is_choppy_tangled)
 
-    # 判定多空趋势与共振状态
+    # 判定多空趋势与多周期共振状态 (要求 1h 均线结构、价格位置与动能协同)
     if is_squeezed:
         is_bullish = False
         is_bearish = False
     elif is_agg:
-        # 激进模式：以 15m/1h 动量优先触发
-        is_bullish = (rsi_15m >= 48.0 and current_price >= ema20_1h * 0.997) or (rsi_1h >= 50.0)
-        is_bearish = (rsi_15m <= 52.0 and current_price <= ema20_1h * 1.003) or (rsi_1h <= 48.0)
+        is_bullish = (rsi_15m >= 52.0 and current_price >= ema20_1h and ema20_1h >= ema50_1h * 0.998) or (rsi_1h >= 56.0 and current_price >= ema20_1h)
+        is_bearish = (rsi_15m <= 48.0 and current_price <= ema20_1h and ema20_1h <= ema50_1h * 1.002) or (rsi_1h <= 44.0 and current_price <= ema20_1h)
     else:
-        is_bullish = (ema20_1h >= ema50_1h and rsi_1h >= 48.0) or (rsi_1h > 58.0)
-        is_bearish = (ema20_1h < ema50_1h and rsi_1h <= 45.0) or (rsi_1h < 38.0)
+        is_bullish = (
+            (ema20_1h > ema50_1h and current_price >= ema20_1h * 0.998 and 51.0 <= rsi_1h <= 72.0 and macd_hist_1h >= -0.05 * atr_1h)
+            or (rsi_1h >= 58.0 and ema20_4h >= ema50_4h and current_price >= ema20_1h)
+        )
+        is_bearish = (
+            (ema20_1h < ema50_1h and current_price <= ema20_1h * 1.002 and 28.0 <= rsi_1h <= 48.0 and macd_hist_1h <= 0.05 * atr_1h)
+            or (rsi_1h <= 40.0 and ema20_4h < ema50_4h and current_price <= ema20_1h)
+        )
 
-    # 持仓感知 (Position-Aware) 动态离场研判：
-    # 若已有持仓处于浮盈状态，且指标出现严重超买/超卖或冲高动能衰竭，触发主动平仓离场 (CLOSE_POSITION)，落袋为安！
+    # 持仓感知 (Position-Aware) 两阶段动态离场研判：
+    # 严格区分阶段1 (未减半，浮盈门槛 ≥ max(1.2%, 1.3*ATR)) 与阶段2 (已减半长尾波段，浮盈门槛 ≥ max(2.5%, 2.5*ATR))，杜绝 0.6% 蚊子肉秒平死循环！
     should_close_tp = False
     close_reason_summary = ""
     close_reasoning_details = ""
@@ -112,31 +120,38 @@ def generate_quantitative_rule_decision(
     if position and hasattr(position, "avg_px") and position.avg_px > 0 and position.pos > 0:
         is_pos_long = (position.pos_side == PosSide.LONG)
         pos_profit_ratio = (current_price - position.avg_px) / position.avg_px if is_pos_long else (position.avg_px - current_price) / position.avg_px
-        
-        # 多单主动止盈判定：浮盈 ≥ 0.6% 且 (15m RSI ≥ 70 超买 或 触及布林上轨受阻 或 1h RSI ≥ 75)
-        if is_pos_long and pos_profit_ratio >= 0.006:
-            if rsi_15m >= 70.0 or (current_price >= bb_up_15m * 0.998 and rsi_15m >= 65.0) or rsi_1h >= 75.0:
+        has_stage1_tp = bool(getattr(position, "tp_triggered_50", False))
+        atr_1h_ratio = atr_1h / max(current_price, 1e-6)
+        min_tp_ratio = max(0.025, 2.5 * atr_1h_ratio) if has_stage1_tp else max(0.012, 1.3 * atr_1h_ratio)
+        rsi_ob_15m = 78.0 if has_stage1_tp else 72.0
+        rsi_os_15m = 22.0 if has_stage1_tp else 28.0
+
+        # 多单主动止盈判定
+        if is_pos_long and pos_profit_ratio >= min_tp_ratio:
+            if rsi_15m >= rsi_ob_15m or (current_price >= bb_up_15m * 0.999 and rsi_15m >= (rsi_ob_15m - 3.0)) or rsi_1h >= 76.0:
                 should_close_tp = True
-                close_reason_summary = f"多单持仓顺势浮盈达 +{pos_profit_ratio*100:.2f}%，15m RSI({round(rsi_15m, 1)}) 触及超买高危区且受阻于布林上轨，短期动能衰减，触发主动获利了结平仓！"
-                close_reasoning_details = f"当前持有多头仓位 (开仓均价 ${position.avg_px})，现价 ${current_price}。15m RSI 达到 {round(rsi_15m, 1)}，盘面短线存在冲高回落洗盘风险，执行主动止盈离场，锁定正收益胜果。"
+                stage_label = "阶段2长尾波段" if has_stage1_tp else "阶段1半仓锁定"
+                close_reason_summary = f"多单持仓顺势浮盈达 +{pos_profit_ratio*100:.2f}% ({stage_label})，15m RSI({round(rsi_15m, 1)}) 触及超买衰竭区，触发主动获利了结！"
+                close_reasoning_details = f"当前持有多头仓位 (开仓均价 ${position.avg_px})，现价 ${current_price}。15m RSI 达到 {round(rsi_15m, 1)}，盘面短线动能衰减，执行{stage_label}主动止盈。"
                 close_thinking_process = (
                     f"<think>\n"
-                    f"1. 持仓盯市：多单持仓现价 {current_price} USDT，持仓浮盈率达 +{pos_profit_ratio*100:.2f}%。\n"
-                    f"2. 动能研判：15m RSI 达到 {round(rsi_15m, 1)} 超买区，价格逼近布林线上轨 {round(bb_up_15m, prec)}，短线动能出现衰竭背离迹象。\n"
-                    f"3. 策略决策：贯彻【利润落袋为安】原则，主动平仓离场 (CLOSE_POSITION)，锁定胜率与本金收益，等待行情回踩走稳后再行重新开单。\n"
+                    f"1. 持仓盯市：多单持仓现价 {current_price} USDT，持仓浮盈率达 +{pos_profit_ratio*100:.2f}% (达标门槛 +{min_tp_ratio*100:.2f}%)。\n"
+                    f"2. 动能研判：15m RSI 达到 {round(rsi_15m, 1)} 超买区，价格逼近布林线上轨 {round(bb_up_15m, prec)}。\n"
+                    f"3. 策略决策：执行{stage_label}主动止盈 (CLOSE_POSITION)，保障正数学期望值。\n"
                     f"</think>"
                 )
-        # 空单主动止盈判定：浮盈 ≥ 0.6% 且 (15m RSI ≤ 30 超卖 或 触及布林下轨支撑 或 1h RSI ≤ 25)
-        elif (not is_pos_long) and pos_profit_ratio >= 0.006:
-            if rsi_15m <= 30.0 or (current_price <= bb_low_15m * 1.002 and rsi_15m <= 35.0) or rsi_1h <= 25.0:
+        # 空单主动止盈判定
+        elif (not is_pos_long) and pos_profit_ratio >= min_tp_ratio:
+            if rsi_15m <= rsi_os_15m or (current_price <= bb_low_15m * 1.001 and rsi_15m <= (rsi_os_15m + 3.0)) or rsi_1h <= 24.0:
                 should_close_tp = True
-                close_reason_summary = f"空单持仓顺势浮盈达 +{pos_profit_ratio*100:.2f}%，15m RSI({round(rsi_15m, 1)}) 探底超卖区且触及布林下轨支撑，触发主动获利平仓！"
-                close_reasoning_details = f"当前持有空头仓位 (开仓均价 ${position.avg_px})，现价 ${current_price}。15m RSI 降至 {round(rsi_15m, 1)} 超卖区，有短期超跌反弹风险，执行主动止盈离场。"
+                stage_label = "阶段2长尾波段" if has_stage1_tp else "阶段1半仓锁定"
+                close_reason_summary = f"空单持仓顺势浮盈达 +{pos_profit_ratio*100:.2f}% ({stage_label})，15m RSI({round(rsi_15m, 1)}) 探底超卖衰竭区，触发主动获利平仓！"
+                close_reasoning_details = f"当前持有空头仓位 (开仓均价 ${position.avg_px})，现价 ${current_price}。15m RSI 降至 {round(rsi_15m, 1)} 超卖区，执行{stage_label}主动止盈离场。"
                 close_thinking_process = (
                     f"<think>\n"
-                    f"1. 持仓盯市：空单持仓现价 {current_price} USDT，持仓浮盈率达 +{pos_profit_ratio*100:.2f}%。\n"
+                    f"1. 持仓盯市：空单持仓现价 {current_price} USDT，持仓浮盈率达 +{pos_profit_ratio*100:.2f}% (达标门槛 +{min_tp_ratio*100:.2f}%)。\n"
                     f"2. 动能研判：15m RSI 降至 {round(rsi_15m, 1)} 超卖区，触及布林下轨 {round(bb_low_15m, prec)}。\n"
-                    f"3. 策略决策：规避空头轧空反弹，主动平仓离场 (CLOSE_POSITION)，锁定利润。\n"
+                    f"3. 策略决策：规避空头轧空反弹，执行{stage_label}主动平仓离场 (CLOSE_POSITION)。\n"
                     f"</think>"
                 )
 
@@ -250,12 +265,11 @@ def generate_quantitative_rule_decision(
 
         entry_low = round(max(support_1, current_price * 0.995), prec)
         entry_high = round(current_price * 1.002, prec)
-        stop_loss = round(current_price - 1.6 * atr_1h, prec)
+        stop_loss = round(current_price - 1.35 * atr_1h, prec)
         
-        # 阶梯止盈：TP1 基于 1.25倍 ATR 或近期合理阻力位（高触达性与兑现率），TP2 作为波段扩展位
-        tp_1 = round(min(resistance_1, entry_high + 1.25 * atr_1h), prec)
-        tp_1 = max(tp_1, round(entry_high * 1.008, prec))
-        tp_2 = round(max(resistance_2, entry_high + 2.2 * atr_1h), prec)
+        # 正期望值阶梯止盈：TP1 基于 2.0倍 ATR (净盈亏比 >= 1.5:1)，TP2 基于 3.4倍 ATR 博取长尾波段
+        tp_1 = round(max(entry_high * 1.014, entry_high + 2.0 * atr_1h), prec)
+        tp_2 = round(max(resistance_2, entry_high + 3.4 * atr_1h), prec)
         
         # 扣除摩擦后的真实净盈亏比
         net_reward = max(0.0, tp_1 - entry_high - friction_cost)
@@ -314,12 +328,11 @@ def generate_quantitative_rule_decision(
 
         entry_high = round(min(resistance_1, current_price * 1.005), prec)
         entry_low = round(current_price * 0.998, prec)
-        stop_loss = round(current_price + 1.6 * atr_1h, prec)
+        stop_loss = round(current_price + 1.35 * atr_1h, prec)
         
-        # 阶梯止盈：TP1 基于 1.25倍 ATR 或近期合理支撑位（高触达性与兑现率），TP2 作为波段扩展位
-        tp_1 = round(max(support_1, entry_low - 1.25 * atr_1h), prec)
-        tp_1 = min(tp_1, round(entry_low * 0.992, prec))
-        tp_2 = round(min(support_2, entry_low - 2.2 * atr_1h), prec)
+        # 正期望值阶梯止盈：TP1 基于 2.0倍 ATR (净盈亏比 >= 1.5:1)，TP2 基于 3.4倍 ATR 博取长尾波段
+        tp_1 = round(min(entry_low * 0.986, entry_low - 2.0 * atr_1h), prec)
+        tp_2 = round(min(support_2, entry_low - 3.4 * atr_1h), prec)
         
         # 扣除摩擦后的真实净盈亏比
         net_reward = max(0.0, entry_low - tp_1 - friction_cost)

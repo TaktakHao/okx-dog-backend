@@ -15,14 +15,18 @@ from models import (
     DerivativesMetrics,
     InstrumentCategory,
     InstrumentInfo,
+    InstrumentSearchResponse,
     InstType,
     KlineCandle,
     MultiPeriodIndicators,
     SinglePeriodIndicators,
+    SubscribeFocusRequest,
+    SubscribeFocusResponse,
     SymbolCategoryGroup,
     SymbolListResponse,
     TickerData,
 )
+from services.instrument_service import instrument_manager
 from state import rest_client, ws_manager
 
 router = APIRouter(prefix="/api/v1/market", tags=["行情与多周期指标"])
@@ -306,7 +310,7 @@ async def get_market_symbols(
     now_ms = int(time.time() * 1000)
     filtered = CURATED_SYMBOLS
 
-    # 1. 关键字过滤
+    # 1. 关键字过滤与全量检索对齐
     kw_str = keyword if isinstance(keyword, str) else None
     if kw_str and kw_str.strip():
         kw = kw_str.strip().upper()
@@ -314,27 +318,13 @@ async def get_market_symbols(
             s for s in CURATED_SYMBOLS
             if kw in s.symbol.upper() or kw in s.name.upper() or kw in s.base_ccy.upper()
         ]
-        # 如果未在精选库中找到，动态根据输入构造一个合法标的元数据
-        if not matched and ("-" in kw or len(kw) >= 2):
-            norm_symbol = kw if "-USDT" in kw else f"{kw}-USDT-SWAP"
-            base_ccy = norm_symbol.split("-")[0]
-            is_tradfi_guess = any(t in base_ccy for t in ["XAU", "XAG", "EUR", "GBP", "JPY", "NVDA", "TSLA", "AAPL", "ONDO", "PAXG"])
-            cat = InstrumentCategory.TRADFI if is_tradfi_guess else InstrumentCategory.CUSTOM
-            custom_inst = InstrumentInfo(
-                symbol=norm_symbol,
-                inst_id=norm_symbol,
-                inst_type=InstType.SPOT if not norm_symbol.endswith("-SWAP") else InstType.SWAP,
-                base_ccy=base_ccy,
-                quote_ccy="USDT",
-                name=f"{base_ccy} 交易对",
-                category=cat,
-                is_tradfi=is_tradfi_guess,
-                ct_val=1.0,
-                tick_sz=0.01,
-                lot_sz=1.0,
-                min_sz=1.0
-            )
-            matched.append(custom_inst)
+        # 联动全量真实标的库，仅匹配 OKX 官方真实在架产品
+        search_res = instrument_manager.search(query=kw, limit=20)
+        existing_symbols = {s.symbol for s in matched}
+        for real_inst in search_res.instruments:
+            if real_inst.symbol not in existing_symbols:
+                matched.append(real_inst)
+                existing_symbols.add(real_inst.symbol)
         filtered = matched
 
     # 2. 分类过滤
@@ -544,14 +534,41 @@ async def get_multi_period_indicators(symbol: str = Query("BTC-USDT-SWAP", descr
     return ApiResponse(code=0, msg="success", data=multi_ind, timestamp=now_ms)
 
 
-@router.post("/subscribe-focus", response_model=ApiResponse[Dict[str, Any]], summary="批量订阅专注标的行情通道")
-async def subscribe_focus_symbols(symbols: List[str]):
+@router.get("/instruments/search", response_model=ApiResponse[InstrumentSearchResponse], summary="在OKX全量在架产品池中执行模糊检索")
+async def search_okx_instruments(
+    query: Optional[str] = Query(None, description="搜索关键词 (如 pepe, sui, btc, gold)"),
+    inst_type: Optional[str] = Query("ALL", description="产品类型 (SWAP, SPOT, ALL)"),
+    quote_ccy: Optional[str] = Query("ALL", description="计价货币 (USDT, USDC, ALL)"),
+    limit: int = Query(30, ge=1, le=100, description="返回条数上限")
+):
+    """
+    在 OKX 官方全量真实产品库中执行检索：
+    - 严格杜绝用户乱写手误产生的不存在代码
+    - 返回合规的最小下单步长、面值与最大杠杆
+    """
+    now_ms = int(time.time() * 1000)
+    res = instrument_manager.search(query=query, inst_type=inst_type, quote_ccy=quote_ccy, limit=limit)
+    return ApiResponse(
+        code=0,
+        msg="success",
+        data=res,
+        timestamp=now_ms
+    )
+
+
+@router.post("/subscribe-focus", response_model=ApiResponse[SubscribeFocusResponse], summary="批量订阅专注标的行情通道")
+async def subscribe_focus_symbols(req: SubscribeFocusRequest):
     """批量订阅前端自选与专注标的的 WebSocket 行情"""
     now_ms = int(time.time() * 1000)
     subscribed = []
-    for sym in symbols:
+    for sym in req.symbols:
         clean_sym = sym.strip().upper()
         if clean_sym:
             await ws_manager.subscribe_market_symbol(clean_sym)
             subscribed.append(clean_sym)
-    return ApiResponse(code=0, msg=f"成功订阅 {len(subscribed)} 个专注标的", data={"subscribed_symbols": subscribed}, timestamp=now_ms)
+    return ApiResponse(
+        code=0,
+        msg=f"成功订阅 {len(subscribed)} 个专注标的",
+        data=SubscribeFocusResponse(subscribed_symbols=subscribed),
+        timestamp=now_ms
+    )

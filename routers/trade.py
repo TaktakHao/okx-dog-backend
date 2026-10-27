@@ -328,13 +328,31 @@ async def set_position_tpsl(req: SetPositionTPSLRequest):
     if not rest_client.api_key:
         raise HTTPException(status_code=400, detail="实盘模式未配置 OKX API Key！")
 
+    # 查找当前持仓的方向与数量，向 OKX 提交策略委托止盈止损单
+    target_pos_side = "long"
+    target_sz = None
+    for k, p in ws_manager.latest_positions.items():
+        if p.symbol == req.symbol and p.pos > 0:
+            target_pos_side = p.pos_side.value if hasattr(p.pos_side, "value") else str(p.pos_side)
+            target_sz = p.pos
+            break
+
+    algo_res = await rest_client.place_tpsl_algo_order(
+        symbol=req.symbol,
+        pos_side=target_pos_side,
+        sz=target_sz,
+        tp_trigger_price=req.tp_trigger_price,
+        sl_trigger_price=req.sl_trigger_price,
+    )
+
     return ApiResponse(
         code=0,
-        msg="止盈止损参数已成功更新",
+        msg="实盘止盈止损策略委托已成功挂载至 OKX",
         data={
             "symbol": req.symbol,
             "tp_trigger_price": req.tp_trigger_price,
-            "sl_trigger_price": req.sl_trigger_price
+            "sl_trigger_price": req.sl_trigger_price,
+            "algo_result": algo_res,
         },
         timestamp=now_ms
     )
@@ -372,9 +390,32 @@ async def close_position_endpoint(req: ClosePositionRequest):
     res = await rest_client.close_position(
         symbol=req.symbol,
         mgn_mode="cross",
-        pos_side=req.pos_side.value if req.pos_side else None,
+        pos_side=req.pos_side.value if hasattr(req.pos_side, "value") else (str(req.pos_side) if req.pos_side else None),
         auto_cancel=True
     )
+
+    # 异步刷新实盘持仓与资产快照并广播
+    try:
+        live_pos = await rest_client.get_positions(inst_type=None, include_spot=True)
+        ws_manager.latest_positions.clear()
+        for p in live_pos:
+            ws_manager.latest_positions[f"{p.symbol}:{p.pos_side}"] = p
+        await ws_manager.broadcast_to_subscribers(WSPushPayload[List[PositionModel]](
+            channel="positions",
+            event=WSServerEvent.SNAPSHOT,
+            data=live_pos,
+            timestamp=now_ms
+        ))
+        live_bal = await rest_client.get_account_balance()
+        await ws_manager.broadcast_to_subscribers(WSPushPayload[AccountBalanceModel](
+            channel="account",
+            event=WSServerEvent.UPDATE,
+            data=live_bal,
+            timestamp=now_ms
+        ))
+    except Exception as sync_err:
+        logger.debug(f"实盘平仓后刷新状态快照异常: {sync_err}")
+
     return ApiResponse(code=0, msg="平仓指令已提交 OKX", data=res, timestamp=now_ms)
 
 

@@ -27,6 +27,7 @@ from state import (
     logger,
     paper_engine,
     rest_client,
+    risk_controller,
     vault,
     ws_manager,
 )
@@ -79,15 +80,18 @@ async def switch_system_mode(
     now_ms = int(time.time() * 1000)
 
     try:
+        # 切换环境时重置风控单日累计盈亏与熔断计数，确保实盘与模拟沙盒风控物理隔离
+        risk_controller.reset_for_mode_switch()
+
         if req.target_live_mode:
             # 切换至实盘：从数据库中查询实盘凭证
             res = await db.execute(
-                text("SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_live_mode = 1 AND is_valid = 1 LIMIT 1")
+                text("SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_live_mode = 1 AND is_valid = 1 ORDER BY updated_at DESC, id DESC LIMIT 1")
             )
             row = res.mappings().first()
             if not row:
                 res_any = await db.execute(
-                    text("SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_valid = 1 LIMIT 1")
+                    text("SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_valid = 1 ORDER BY updated_at DESC, id DESC LIMIT 1")
                 )
                 row = res_any.mappings().first()
 

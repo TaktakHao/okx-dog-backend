@@ -7,8 +7,15 @@ OKX-Dog 个人量化智能交易系统 - 全局配置模块
 import os
 from pathlib import Path
 from typing import Literal
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+try:
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+except ImportError:
+    BaseSettings = BaseModel  # type: ignore
+
+    def SettingsConfigDict(**kwargs):  # type: ignore
+        return ConfigDict(extra=kwargs.get("extra", "ignore"))
 
 
 # 项目根路径与数据持久化目录

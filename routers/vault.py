@@ -30,6 +30,7 @@ from okx_rest import OKXRestClient
 from state import (
     antigravity_bridge,
     rest_client,
+    risk_controller,
     vault,
     ws_manager,
 )
@@ -58,11 +59,14 @@ async def save_credentials(
     # 触发提现权限强拦截
     vault.verify_permissions(mock_permissions)
 
+    if req.master_password and req.master_password.strip():
+        vault.register_master_password(req.master_password.strip())
+
     # 2. 加密敏感字段
     custom_vault = vault if not req.master_password else vault.__class__(master_password=req.master_password)
-    enc_bundle = custom_vault.encrypt_credentials(req.api_key, req.secret_key, req.passphrase)
+    enc_bundle = custom_vault.encrypt_credentials(req.api_key.strip(), req.secret_key.strip(), req.passphrase.strip())
 
-    masked_key = vault.mask_api_key(req.api_key)
+    masked_key = vault.mask_api_key(req.api_key.strip())
     is_live_val = 1 if req.is_live_mode else 0
 
     # 3. 写入 SQLite credentials_vault 表
@@ -96,9 +100,12 @@ async def save_credentials(
     })
     await db.commit()
 
-    # 4. 热更新内存中 REST 与 WebSocket 客户端凭证
-    rest_client.update_credentials(req.api_key, req.secret_key, req.passphrase, req.is_live_mode)
-    ws_manager.update_credentials(req.api_key, req.secret_key, req.passphrase)
+    # 4. 热更新内存中 REST 与 WebSocket 客户端凭证并隔离风控状态
+    if rest_client.is_live_mode != bool(req.is_live_mode):
+        risk_controller.reset_for_mode_switch()
+    rest_client.update_credentials(req.api_key.strip(), req.secret_key.strip(), req.passphrase.strip(), req.is_live_mode)
+    ws_manager.update_credentials(req.api_key.strip(), req.secret_key.strip(), req.passphrase.strip())
+    ws_manager.set_live_mode(bool(req.is_live_mode))
 
     res_data = CredentialsStatusResponse(
         has_configured_okx=True,
@@ -112,7 +119,7 @@ async def save_credentials(
 
     return ApiResponse(
         code=0,
-        msg="OKX 凭证已使用 AES-256-GCM 安全加密落库",
+        msg="OKX 凭证已使用 AES-256-GCM 安全加密落库并激活",
         data=res_data,
         timestamp=now_ms
     )
@@ -123,7 +130,7 @@ async def get_credentials_status(db: AsyncSession = Depends(get_db)):
     """查询当前已配置的 OKX 凭证状态与脱敏信息"""
     now_ms = int(time.time() * 1000)
     res = await db.execute(
-        text("SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_valid = 1 LIMIT 1")
+        text("SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_valid = 1 ORDER BY updated_at DESC, id DESC LIMIT 1")
     )
     row = res.mappings().first()
 
@@ -133,7 +140,7 @@ async def get_credentials_status(db: AsyncSession = Depends(get_db)):
             msg="尚未配置 OKX 凭证",
             data=CredentialsStatusResponse(
                 has_configured_okx=False,
-                is_live_mode=False,
+                is_live_mode=rest_client.is_live_mode,
                 api_key_masked=None,
                 permissions=[],
                 has_withdraw_permission=False,
@@ -144,12 +151,13 @@ async def get_credentials_status(db: AsyncSession = Depends(get_db)):
         )
 
     perms = json.loads(row["permissions"]) if row.get("permissions") else ["read", "trade"]
+    active_live_mode = rest_client.is_live_mode if rest_client.api_key else bool(row["is_live_mode"])
     return ApiResponse(
         code=0,
         msg="success",
         data=CredentialsStatusResponse(
             has_configured_okx=True,
-            is_live_mode=bool(row["is_live_mode"]),
+            is_live_mode=active_live_mode,
             api_key_masked=row["api_key_masked"],
             permissions=perms,
             has_withdraw_permission=False,
@@ -172,14 +180,22 @@ async def test_connection(
     dec_sec = req.secret_key.strip() if req.secret_key else None
     dec_pass = req.passphrase.strip() if req.passphrase else None
 
+    if req.master_password and req.master_password.strip():
+        vault.register_master_password(req.master_password.strip())
+
     # 若请求未同时附带完整的三项凭证，则从本地密盒数据库中读取已保存凭证
     if not (dec_key and dec_sec and dec_pass):
         is_live_val = 1 if req.is_live_mode else 0
         res = await db.execute(
-            text("SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_live_mode = :is_live LIMIT 1"),
+            text("SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_live_mode = :is_live ORDER BY updated_at DESC, id DESC LIMIT 1"),
             {"is_live": is_live_val}
         )
         row = res.mappings().first()
+        if not row:
+            res_any = await db.execute(
+                text("SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_valid = 1 ORDER BY updated_at DESC, id DESC LIMIT 1")
+            )
+            row = res_any.mappings().first()
 
         if not row:
             return ApiResponse(
@@ -225,6 +241,11 @@ async def test_connection(
     )
     connected, latency, perms, err = await test_client.test_credentials()
     await test_client.close()
+
+    # 若测试连通成功，热同步至内存中的 rest_client 与 ws_manager，确保测试通过后即可无缝交易
+    if connected:
+        rest_client.update_credentials(dec_key, dec_sec, dec_pass, is_live_mode=bool(req.is_live_mode))
+        ws_manager.update_credentials(dec_key, dec_sec, dec_pass)
 
     return ApiResponse(
         code=0 if connected else 4001,

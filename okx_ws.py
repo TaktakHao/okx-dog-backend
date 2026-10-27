@@ -432,14 +432,21 @@ class OKXWSManager:
         if is_live_mode:
             self.public_url = settings.OKX_LIVE_WS_PUBLIC
             self.private_url = settings.OKX_LIVE_WS_PRIVATE
+            self.business_url = self.public_url.replace("/ws/v5/public", "/ws/v5/business")
         else:
             self.public_url = settings.OKX_DEMO_WS_PUBLIC
             self.private_url = settings.OKX_DEMO_WS_PRIVATE
+            self.business_url = self.public_url.replace("/ws/v5/public", "/ws/v5/business")
 
         self.public_client = OKXWebSocketClient(
             ws_url=self.public_url,
             is_private=False,
             name="OKX-Public"
+        )
+        self.business_client = OKXWebSocketClient(
+            ws_url=self.business_url,
+            is_private=False,
+            name="OKX-Business"
         )
         self.private_client = OKXWebSocketClient(
             ws_url=self.private_url,
@@ -509,15 +516,18 @@ class OKXWSManager:
 
         # 绑定消息解析处理器
         self.public_client.add_listener("*", self._on_public_message)
+        self.business_client.add_listener("*", self._on_public_message)
         self.private_client.add_listener("*", self._on_private_message)
 
         await self.public_client.start()
+        await self.business_client.start()
         await self.private_client.start()
 
     async def stop(self):
         """优雅停止 WebSocket 管理中枢"""
         self._is_running = False
         await self.public_client.stop()
+        await self.business_client.stop()
         await self.private_client.stop()
         logger.info("OKX WebSocket 管理中枢已停止")
 
@@ -527,21 +537,21 @@ class OKXWSManager:
         1. tickers (行情)
         2. books5 (买卖前5档深度)
         3. trades (逐笔成交)
-        4. funding-rate (资金费率)
-        5. open-interest (持仓总量)
+        4. funding-rate (资金费率，仅永续合约)
+        5. open-interest (持仓总量，仅永续合约)
         """
         args = [
             {"channel": "tickers", "instId": symbol},
             {"channel": "books5", "instId": symbol},
             {"channel": "trades", "instId": symbol},
-            {"channel": "funding-rate", "instId": symbol},
-            {"channel": "open-interest", "instId": symbol},
         ]
+        if "SWAP" in symbol:
+            args.append({"channel": "funding-rate", "instId": symbol})
         await self.public_client.subscribe(args)
         logger.info(f"已为标的 {symbol} 注册全套公共行情 WebSocket 订阅")
 
     async def subscribe_kline(self, symbol: str, timeframe: str = "1h"):
-        """动态订阅指定标的与周期的 K 线频道 (candle15m / candle1H / candle4H / candle1D)"""
+        """动态订阅指定标的与周期的 K 线频道 (OKX v5 K线频道位于 business WS 端点)"""
         tf_map = {
             "1m": "candle1m",
             "5m": "candle5m",
@@ -554,8 +564,8 @@ class OKXWSManager:
         }
         ch = tf_map.get(timeframe.lower(), "candle1H")
         args = [{"channel": ch, "instId": symbol}]
-        await self.public_client.subscribe(args)
-        logger.info(f"已为标的 {symbol} 注册 {ch} K 线 WebSocket 订阅")
+        await self.business_client.subscribe(args)
+        logger.info(f"已为标的 {symbol} 注册 {ch} K 线 WebSocket 订阅 (Business 端点)")
 
     async def subscribe_private_channels(self, inst_type: str = "SWAP"):
         """快捷订阅私有通道：orders, positions, account"""
@@ -582,17 +592,24 @@ class OKXWSManager:
         # 1. Tickers 频道
         if channel == "tickers":
             for item in data_list:
+                last_px = float(item.get("last") or 0.0)
+                bid_px = float(item.get("bidPx") or 0.0) if item.get("bidPx") else last_px
+                ask_px = float(item.get("askPx") or 0.0) if item.get("askPx") else last_px
+                open_24h = float(item.get("open24h") or last_px)
+                chg_pct = ((last_px - open_24h) / open_24h * 100.0) if open_24h > 0 else 0.0
                 ticker = TickerData(
                     symbol=item.get("instId", inst_id),
-                    last_price=float(item.get("last", 0.0)),
-                    last_sz=float(item.get("lastSz", 0.0)) if item.get("lastSz") else 0.0,
-                    high_24h=float(item.get("high24h", 0.0)) if item.get("high24h") else float(item.get("last", 0.0)),
-                    low_24h=float(item.get("low24h", 0.0)) if item.get("low24h") else float(item.get("last", 0.0)),
-                    open_24h=float(item.get("open24h", 0.0)) if item.get("open24h") else float(item.get("last", 0.0)),
-                    change_24h_pct=float(item.get("sodUtc8", 0.0)) if item.get("sodUtc8") else 0.0,
-                    volume_24h=float(item.get("vol24h", 0.0)) if item.get("vol24h") else 0.0,
-                    vol_currency_24h=float(item.get("volCcy24h", 0.0)) if item.get("volCcy24h") else 0.0,
-                    timestamp=int(item.get("ts", now_ms))
+                    last_price=last_px,
+                    last_sz=float(item.get("lastSz") or 0.0),
+                    bid_price=bid_px if bid_px > 0 else None,
+                    ask_price=ask_px if ask_px > 0 else None,
+                    high_24h=float(item.get("high24h") or last_px),
+                    low_24h=float(item.get("low24h") or last_px),
+                    open_24h=open_24h,
+                    change_24h_pct=round(chg_pct, 2),
+                    volume_24h=float(item.get("vol24h") or 0.0),
+                    vol_currency_24h=float(item.get("volCcy24h") or 0.0),
+                    timestamp=int(item.get("ts") or now_ms)
                 )
                 self.latest_tickers[ticker.symbol] = ticker
 
@@ -736,25 +753,44 @@ class OKXWSManager:
         elif channel == "positions":
             pos_list: List[PositionModel] = []
             for p in data_list:
+                inst_id_p = p.get("instId", "")
+                inst_tp_p = str(p.get("instType", "SWAP")).upper()
+                raw_pos_c = float(p.get("pos") or 0.0)
+                raw_avail_c = float(p.get("availPos") or abs(raw_pos_c))
+                ct_val = 1.0
+                if "SWAP" in inst_tp_p or "FUTURES" in inst_tp_p:
+                    try:
+                        from services.instrument_service import instrument_manager
+                        inst_info = instrument_manager.get_by_symbol(inst_id_p)
+                        if inst_info and inst_info.ct_val > 0:
+                            ct_val = float(inst_info.ct_val)
+                    except Exception:
+                        pass
+                pos_coins = round(abs(raw_pos_c) * ct_val, 6)
+                avail_coins = round(abs(raw_avail_c) * ct_val, 6)
+                raw_side_p = str(p.get("posSide", "net")).lower()
+                if raw_side_p not in ("long", "short"):
+                    raw_side_p = "long" if raw_pos_c >= 0 else "short"
+
                 pos_model = PositionModel(
                     pos_id=p.get("posId", ""),
-                    symbol=p.get("instId", ""),
-                    inst_type=p.get("instType", "SWAP"),
-                    pos_side=p.get("posSide", "net"),
-                    pos=float(p.get("pos", 0.0)),
-                    avail_pos=float(p.get("availPos", 0.0)) if p.get("availPos") else 0.0,
-                    avg_px=float(p.get("avgPx", 0.0)) if p.get("avgPx") else 0.0,
-                    mark_px=float(p.get("markPx", 0.0)) if p.get("markPx") else 0.0,
-                    liq_px=float(p.get("liqPx", 0.0)) if p.get("liqPx") else None,
-                    margin_ratio=float(p.get("mgnRatio", 0.0)) if p.get("mgnRatio") else 0.0,
-                    maint_margin_ratio=float(p.get("mmr", 0.01)) if p.get("mmr") else 0.01,
-                    leverage=int(p.get("lever", 1)) if p.get("lever") else 1,
-                    notional_usd=float(p.get("notionalUsd", 0.0)) if p.get("notionalUsd") else 0.0,
-                    upl=float(p.get("upl", 0.0)) if p.get("upl") else 0.0,
-                    upl_ratio=float(p.get("uplRatio", 0.0)) if p.get("uplRatio") else 0.0,
-                    realized_pnl=float(p.get("realizedPnl", 0.0)) if p.get("realizedPnl") else 0.0,
-                    margin=float(p.get("margin", 0.0)) if p.get("margin") else 0.0,
-                    last_synced_at=int(p.get("uTime", now_ms))
+                    symbol=inst_id_p,
+                    inst_type=inst_tp_p,
+                    pos_side=raw_side_p,
+                    pos=pos_coins,
+                    avail_pos=avail_coins,
+                    avg_px=float(p.get("avgPx") or 0.0),
+                    mark_px=float(p.get("markPx") or 0.0),
+                    liq_px=float(p.get("liqPx") or 0.0) if p.get("liqPx") else None,
+                    margin_ratio=float(p.get("mgnRatio") or 0.0),
+                    maint_margin_ratio=float(p.get("mmr") or 0.01),
+                    leverage=int(float(p.get("lever") or 1)),
+                    notional_usd=float(p.get("notionalUsd") or 0.0),
+                    upl=float(p.get("upl") or 0.0),
+                    upl_ratio=float(p.get("uplRatio") or 0.0),
+                    realized_pnl=float(p.get("realizedPnl") or 0.0),
+                    margin=float(p.get("margin") or p.get("imr") or 0.0),
+                    last_synced_at=int(p.get("uTime") or now_ms)
                 )
                 self.latest_positions[f"{pos_model.symbol}:{pos_model.pos_side}"] = pos_model
                 pos_list.append(pos_model)

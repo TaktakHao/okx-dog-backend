@@ -511,6 +511,8 @@ class TickerData(BaseModel):
     symbol: str = Field(..., description="标的代码 (如 BTC-USDT-SWAP)")
     last_price: float = Field(..., description="最新成交价")
     last_sz: float = Field(0.0, description="最新成交数量")
+    bid_price: Optional[float] = Field(None, description="最优买一价 (Best Bid)")
+    ask_price: Optional[float] = Field(None, description="最优卖一价 (Best Ask)")
     high_24h: float = Field(..., description="24小时最高价")
     low_24h: float = Field(..., description="24小时最低价")
     open_24h: float = Field(0.0, description="24小时开盘价")
@@ -1580,14 +1582,36 @@ class InstrumentInfo(BaseModel):
     inst_type: InstType = Field(InstType.SWAP, description="产品类型 SPOT/SWAP/FUTURES")
     base_ccy: str = Field(..., description="交易基础币种 (如 BTC, XAU, NVDA, ONDO)")
     quote_ccy: str = Field("USDT", description="计价币种 (如 USDT, USD)")
+    settle_ccy: Optional[str] = Field("USDT", description="盈亏结算币种")
     name: str = Field(..., description="中文展示全称 (如 黄金永续, 英伟达代币化合约, 比特币永续)")
     category: InstrumentCategory = Field(InstrumentCategory.CRYPTO, description="标的资产分类")
     is_tradfi: bool = Field(False, description="是否属于 TradFi / RWA / 大宗 / 美股类标的")
     ct_val: Optional[float] = Field(1.0, description="合约面值")
+    ct_mult: Optional[float] = Field(None, description="合约乘数")
+    ct_val_ccy: Optional[str] = Field(None, description="合约面值计价货币")
     tick_sz: Optional[float] = Field(0.1, description="价格下单最小变动单位 (步长)")
     lot_sz: Optional[float] = Field(0.01, description="数量下单最小变动单位 (步长)")
     min_sz: Optional[float] = Field(0.01, description="最小下单数量")
+    lever: Optional[float] = Field(None, description="最大可用杠杆倍数")
     state: Optional[str] = Field("live", description="交易状态 (live 正常交易)")
+
+
+class InstrumentSearchResponse(BaseModel):
+    """标的搜索响应模型"""
+    instruments: List[InstrumentInfo] = Field(default_factory=list, description="匹配的OKX交易标的列表")
+    total_count: int = Field(0, description="匹配结果总数")
+    query: str = Field("", description="检索关键词")
+    cached: bool = Field(True, description="是否来自本地内存索引缓存")
+
+
+class SubscribeFocusRequest(BaseModel):
+    """批量订阅专注标的请求"""
+    symbols: List[str] = Field(..., description="标的代码列表 (如 ['BTC-USDT-SWAP', 'PEPE-USDT-SWAP'])")
+
+
+class SubscribeFocusResponse(BaseModel):
+    """批量订阅专注标的响应"""
+    subscribed_symbols: List[str] = Field(default_factory=list, description="成功订阅的标的列表")
 
 
 class SymbolCategoryGroup(BaseModel):

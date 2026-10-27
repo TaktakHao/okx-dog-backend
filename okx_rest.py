@@ -22,6 +22,7 @@ from models import (
     OrderSide,
     PosSide,
     OrderType,
+    OrderState,
     TickerData,
     KlineCandle,
     OrderBookDepth,
@@ -160,6 +161,7 @@ class OKXRestClient:
         if is_live_mode is not None:
             self.is_live_mode = is_live_mode
             self.base_url = settings.OKX_LIVE_REST_URL.rstrip("/") if is_live_mode else settings.OKX_DEMO_REST_URL.rstrip("/")
+        self._account_pos_mode = None
 
     async def _get_client(self) -> httpx.AsyncClient:
         """获取或创建单例 HTTPX 异步客户端 (自适应当前 Event Loop)"""
@@ -360,17 +362,24 @@ class OKXRestClient:
 
         item = data[0]
         now_ms = int(time.time() * 1000)
+        last_px = float(item.get("last") or 0.0)
+        bid_px = float(item.get("bidPx") or 0.0) if item.get("bidPx") else last_px
+        ask_px = float(item.get("askPx") or 0.0) if item.get("askPx") else last_px
+        open_24h = float(item.get("open24h") or last_px)
+        chg_pct = ((last_px - open_24h) / open_24h * 100.0) if open_24h > 0 else 0.0
         return TickerData(
             symbol=item.get("instId", symbol),
-            last_price=float(item.get("last", 0.0)),
-            last_sz=float(item.get("lastSz", 0.0)) if item.get("lastSz") else 0.0,
-            high_24h=float(item.get("high24h", 0.0)) if item.get("high24h") else float(item.get("last", 0.0)),
-            low_24h=float(item.get("low24h", 0.0)) if item.get("low24h") else float(item.get("last", 0.0)),
-            open_24h=float(item.get("open24h", 0.0)) if item.get("open24h") else float(item.get("last", 0.0)),
-            change_24h_pct=float(item.get("sodUtc8", 0.0)) if item.get("sodUtc8") else 0.0,
-            volume_24h=float(item.get("vol24h", 0.0)) if item.get("vol24h") else 0.0,
-            vol_currency_24h=float(item.get("volCcy24h", 0.0)) if item.get("volCcy24h") else 0.0,
-            timestamp=int(item.get("ts", now_ms))
+            last_price=last_px,
+            last_sz=float(item.get("lastSz") or 0.0),
+            bid_price=bid_px if bid_px > 0 else None,
+            ask_price=ask_px if ask_px > 0 else None,
+            high_24h=float(item.get("high24h") or last_px),
+            low_24h=float(item.get("low24h") or last_px),
+            open_24h=open_24h,
+            change_24h_pct=round(chg_pct, 2),
+            volume_24h=float(item.get("vol24h") or 0.0),
+            vol_currency_24h=float(item.get("volCcy24h") or 0.0),
+            timestamp=int(item.get("ts") or now_ms)
         )
 
     async def get_candles(
@@ -512,31 +521,38 @@ class OKXRestClient:
             )
 
         item = data[0]
-        total_eq = float(item.get("totalEq", 0.0) or 0.0)
-        adj_eq = float(item.get("adjEq", 0.0) or 0.0)
+        total_eq = float(item.get("totalEq") or 0.0)
+        adj_eq = float(item.get("adjEq") or 0.0)
         mgn_ratio_str = item.get("mgnRatio", "")
         mgn_ratio = float(mgn_ratio_str) if mgn_ratio_str else 999.0
 
         details = item.get("details", [])
-        avail_margin = float(item.get("availMgn", 0.0) or 0.0) if item.get("availMgn") else 0.0
-        used_margin = float(item.get("imr", 0.0) or 0.0) if item.get("imr") else 0.0
-        frozen_bal = float(item.get("ordFzn", 0.0) or 0.0) if item.get("ordFzn") else 0.0
-        upl = float(item.get("upl", 0.0) or 0.0) if item.get("upl") else 0.0
+        avail_margin = float(item.get("availEq") or item.get("availMgn") or 0.0)
+        used_margin = float(item.get("imr") or 0.0)
+        frozen_bal = float(item.get("ordFzn") or 0.0)
+        upl = float(item.get("upl") or 0.0)
 
-        # 从各币种资产细节汇总 (防止 simple 模式或非跨币种全仓模式下 totalEq 为空)
+        # 从各币种资产细节汇总 (兼容统一账户单币种/跨币种/组合保证金模式及空字符串回退)
         if details:
             details_eq_sum = 0.0
             details_avail_sum = 0.0
             details_upl_sum = 0.0
             details_frozen_sum = 0.0
             for d in details:
-                eq_usd = float(d.get("eqUsd", 0.0) or 0.0)
-                eq_native = float(d.get("eq", d.get("cashBal", 0.0)) or 0.0)
+                eq_usd = float(d.get("eqUsd") or 0.0)
+                eq_native = float(d.get("eq") or d.get("cashBal") or 0.0)
                 details_eq_sum += eq_usd if eq_usd > 0 else (eq_native if d.get("ccy") == "USDT" else 0.0)
-                details_upl_sum += float(d.get("upl", 0.0) or 0.0)
-                details_frozen_sum += float(d.get("ordFrozen", d.get("frozenBal", 0.0)) or 0.0)
-                if d.get("ccy") == "USDT":
-                    avail_val = float(d.get("availMgn", d.get("availBal", d.get("cashBal", 0.0))) or 0.0)
+                details_upl_sum += float(d.get("upl") or 0.0)
+                details_frozen_sum += float(d.get("ordFrozen") or d.get("frozenBal") or 0.0)
+                if d.get("ccy") in ("USDT", "USDC", "USD"):
+                    avail_val = float(
+                        d.get("availEq")
+                        or d.get("availBal")
+                        or d.get("availMgn")
+                        or d.get("cashBal")
+                        or d.get("eq")
+                        or 0.0
+                    )
                     details_avail_sum += avail_val
 
             if total_eq <= 0.0 and details_eq_sum > 0.0:
@@ -548,6 +564,12 @@ class OKXRestClient:
             if frozen_bal <= 0.0 and details_frozen_sum > 0.0:
                 frozen_bal = details_frozen_sum
 
+        # 终极兜底：若统一账户跨币种模式仅返回了 adjEq 或 totalEq，按权益扣除已用与冻结保证金推算可用保证金
+        if avail_margin <= 0.0:
+            base_eq = adj_eq if adj_eq > 0 else total_eq
+            if base_eq > 0:
+                avail_margin = max(0.0, base_eq - used_margin - frozen_bal)
+
         # 计算今日已实现盈亏与收益率 (从 OKX bills 账单流水中汇总当日平仓及资金费盈亏)
         today_realized_pnl = 0.0
         try:
@@ -556,7 +578,7 @@ class OKXRestClient:
             bills_data = await self._request("GET", "/api/v5/account/bills", params={"begin": str(today_start_ms), "limit": "100"})
             if bills_data:
                 for b in bills_data:
-                    today_realized_pnl += float(b.get("pnl", 0.0) or 0.0)
+                    today_realized_pnl += float(b.get("pnl") or 0.0)
         except Exception as bill_err:
             logger.debug(f"拉取今日账单流水盈亏异常 (非阻塞): {bill_err}")
 
@@ -577,10 +599,64 @@ class OKXRestClient:
             timestamp=now_ms
         )
 
-
     def set_credentials(self, api_key: str, secret_key: str, passphrase: str, is_live_mode: Optional[bool] = None):
         """设置凭证信息 (update_credentials 别名)"""
         self.update_credentials(api_key, secret_key, passphrase, is_live_mode)
+
+    def get_instrument_spec(self, symbol: str) -> Tuple[float, float, float, float]:
+        """
+        查询标的精确交易规格: (ct_val, tick_sz, lot_sz, min_sz)
+        优先从全量缓存 InstrumentManager 获取，兜底采用内建字典
+        """
+        try:
+            from services.instrument_service import instrument_manager
+            inst = instrument_manager.get_by_symbol(symbol)
+            if inst:
+                return (
+                    float(inst.ct_val or 1.0),
+                    float(inst.tick_sz or 0.01),
+                    float(inst.lot_sz or 0.01),
+                    float(inst.min_sz or 0.01),
+                )
+        except Exception:
+            pass
+
+        ct_val_map = {
+            "BTC": 0.01,
+            "ETH": 0.1,
+            "SOL": 1.0,
+            "DOGE": 1000.0,
+            "PEPE": 10000000.0,
+            "XRP": 100.0,
+            "SUI": 1.0,
+            "BNB": 0.01,
+            "XAU": 0.001,
+            "PAXG": 0.001,
+            "XAG": 0.1,
+            "NVDA": 0.1,
+            "TSLA": 0.01,
+            "AAPL": 0.01,
+            "EUR": 100.0,
+            "GBP": 100.0,
+            "ONDO": 10.0,
+            "PENDLE": 1.0,
+            "MKR": 0.001,
+        }
+        ct_val = 1.0
+        if "SWAP" in symbol or "FUTURES" in symbol:
+            for k, v in ct_val_map.items():
+                if symbol.upper().startswith(k + "-") or k in symbol.upper():
+                    ct_val = v
+                    break
+        tick_sz = 0.1 if "BTC" in symbol else (0.01 if any(x in symbol for x in ("ETH", "SOL", "BNB", "XAU")) else 0.0001)
+        return (ct_val, tick_sz, 0.01, 0.01)
+
+    def get_contract_value(self, symbol: str) -> float:
+        """获取单张合约对应的基础币面值 (ctVal)"""
+        if "SWAP" in symbol or "FUTURES" in symbol:
+            ct_val, _, _, _ = self.get_instrument_spec(symbol)
+            return ct_val
+        return 1.0
 
     async def get_positions(
         self,
@@ -590,7 +666,7 @@ class OKXRestClient:
     ) -> List[PositionModel]:
         """
         获取当前持仓列表 (包括 SWAP 永续合约、MARGIN 币币杠杆、FUTURES 交割以及 SPOT 现货持有资产)
-        GET /api/v5/account/positions & GET /api/v5/account/balance
+        统一将 SWAP 合约张数转换为币数 (Coins = Contracts * ctVal)，确保与模拟盘及全系统单位 100% 对齐
         """
         params = {}
         if inst_type:
@@ -604,10 +680,11 @@ class OKXRestClient:
         try:
             data = await self._request("GET", "/api/v5/account/positions", params=params)
             for p in data:
-                pos_sz = float(p.get("pos", 0.0))
-                if pos_sz == 0.0:
+                raw_pos_contracts = float(p.get("pos") or 0.0)
+                if raw_pos_contracts == 0.0:
                     continue
 
+                inst_id = p.get("instId", "")
                 raw_inst = str(p.get("instType", "SWAP")).upper()
                 if "MARGIN" in raw_inst:
                     inst_enum = InstType.MARGIN
@@ -624,27 +701,33 @@ class OKXRestClient:
                 elif raw_side == "short":
                     side_enum = PosSide.SHORT
                 else:
-                    side_enum = PosSide.NET
+                    # net_mode 单向持仓模式下，正数为多头，为空头
+                    side_enum = PosSide.LONG if raw_pos_contracts > 0 else PosSide.SHORT
+
+                ct_val = self.get_contract_value(inst_id) if inst_enum in (InstType.SWAP, InstType.FUTURES) else 1.0
+                pos_coins = round(abs(raw_pos_contracts) * ct_val, 6)
+                raw_avail = float(p.get("availPos") or abs(raw_pos_contracts))
+                avail_coins = round(abs(raw_avail) * ct_val, 6)
 
                 pos_model = PositionModel(
                     pos_id=p.get("posId", ""),
-                    symbol=p.get("instId", ""),
+                    symbol=inst_id,
                     inst_type=inst_enum,
                     pos_side=side_enum,
-                    pos=pos_sz,
-                    avail_pos=float(p.get("availPos", pos_sz)),
-                    avg_px=float(p.get("avgPx", 0.0)),
-                    mark_px=float(p.get("markPx", 0.0)),
-                    liq_px=float(p.get("liqPx", 0.0)) if p.get("liqPx") else None,
-                    margin_ratio=float(p.get("mgnRatio", 0.0)) if p.get("mgnRatio") else 0.0,
-                    maint_margin_ratio=float(p.get("mmr", 0.01)) if p.get("mmr") else 0.01,
-                    leverage=int(p.get("lever", 1)),
-                    notional_usd=float(p.get("notionalUsd", 0.0)) if p.get("notionalUsd") else 0.0,
-                    upl=float(p.get("upl", 0.0)) if p.get("upl") else 0.0,
-                    upl_ratio=float(p.get("uplRatio", 0.0)) if p.get("uplRatio") else 0.0,
-                    realized_pnl=float(p.get("realizedPnl", 0.0)) if p.get("realizedPnl") else 0.0,
-                    margin=float(p.get("margin", 0.0)) if p.get("margin") else 0.0,
-                    last_synced_at=int(p.get("uTime", now_ms))
+                    pos=pos_coins,
+                    avail_pos=avail_coins,
+                    avg_px=float(p.get("avgPx") or 0.0),
+                    mark_px=float(p.get("markPx") or 0.0),
+                    liq_px=float(p.get("liqPx") or 0.0) if p.get("liqPx") else None,
+                    margin_ratio=float(p.get("mgnRatio") or 0.0),
+                    maint_margin_ratio=float(p.get("mmr") or 0.01),
+                    leverage=int(float(p.get("lever") or 1)),
+                    notional_usd=float(p.get("notionalUsd") or 0.0),
+                    upl=float(p.get("upl") or 0.0),
+                    upl_ratio=float(p.get("uplRatio") or 0.0),
+                    realized_pnl=float(p.get("realizedPnl") or 0.0),
+                    margin=float(p.get("margin") or p.get("imr") or 0.0),
+                    last_synced_at=int(p.get("uTime") or now_ms)
                 )
                 positions.append(pos_model)
         except Exception as e:
@@ -658,20 +741,16 @@ class OKXRestClient:
                     details = bal_data[0].get("details", [])
                     for d in details:
                         ccy = str(d.get("ccy", "")).upper()
-                        # 过滤 USDT/USDC 等稳定币基础计价资产，仅将主流币/现货币种 (ETH, BTC, SOL 等) 作为现货持仓呈现
                         if ccy in ("USDT", "USDC", "USD"):
                             continue
-                        pos_sz = float(d.get("eq", 0.0))
-                        eq_usd = float(d.get("eqUsd", 0.0))
-                        # 仅展示名义价值大于 0.5 USDT 的实际持有现货
+                        pos_sz = float(d.get("eq") or 0.0)
+                        eq_usd = float(d.get("eqUsd") or 0.0)
                         if pos_sz > 0 and eq_usd >= 0.5:
                             unit_px = (eq_usd / pos_sz) if pos_sz > 0 else 0.0
-                            avail_sz = float(d.get("availBal", pos_sz))
+                            avail_sz = float(d.get("availBal") or d.get("availEq") or pos_sz)
                             spot_symbol = f"{ccy}-USDT"
-                            # 尝试从本地订单数据库/缓存回溯该现货币种历史成交买入均价
                             avg_cost_px = round(unit_px, 6)
-                            raw_upl = float(d.get("upl", 0.0)) if d.get("upl") else 0.0
-                            raw_upl_ratio = 0.0
+                            raw_upl = float(d.get("upl") or 0.0)
 
                             spot_pos = PositionModel(
                                 pos_id=f"spot_{ccy.lower()}",
@@ -692,17 +771,16 @@ class OKXRestClient:
                                 leverage=1,
                                 notional_usd=round(eq_usd, 2),
                                 upl=raw_upl,
-                                upl_ratio=raw_upl_ratio,
+                                upl_ratio=0.0,
                                 realized_pnl=0.0,
                                 margin=round(eq_usd, 2),
-                                last_synced_at=int(d.get("uTime", now_ms))
+                                last_synced_at=int(d.get("uTime") or now_ms)
                             )
                             positions.append(spot_pos)
             except Exception as spot_err:
                 logger.warning(f"获取 OKX 现货资产明细转换为持仓异常: {spot_err}")
 
         return positions
-
 
     async def set_leverage(
         self,
@@ -748,46 +826,43 @@ class OKXRestClient:
 
     def _format_order_sz(self, symbol: str, sz: float) -> str:
         """
-        将委托数量自适应转换为 OKX 交易所要求的标准数量:
-        - 现货 SPOT: 支持按币种精度格式化
-        - 永续/交割 SWAP/FUTURES: OKX v5 以合约张数 (Contracts) 结算
+        将委托币数 (Coins) 自适应转换为 OKX 交易所要求的标准张数 (Contracts) 或现货数量:
+        - 永续/交割 SWAP/FUTURES: Contracts = sz / ctVal，按 lotSz 步长与 minSz 下限精准对齐 (支持 0.01 张小数合约)
+        - 现货 SPOT: 按 lotSz 步长对齐
         """
-        if "SWAP" in symbol or "FUTURES" in symbol:
-            ct_val_map = {
-                "BTC": 0.01,
-                "ETH": 0.1,
-                "SOL": 1.0,
-                "DOGE": 1000.0,
-                "XAU": 0.01,
-                "PAXG": 0.01,
-                "XAG": 1.0,
-                "NVDA": 0.1,
-                "TSLA": 0.01,
-                "AAPL": 0.01,
-                "EUR": 100.0,
-                "GBP": 100.0,
-                "ONDO": 10.0,
-                "PENDLE": 1.0,
-                "MKR": 0.001,
-            }
-            ct_val = 1.0
-            for k, v in ct_val_map.items():
-                if k in symbol:
-                    ct_val = v
-                    break
+        from decimal import Decimal, ROUND_DOWN
 
-            if sz < ct_val:
-                contracts = 1
-            else:
-                contracts = max(1, round(sz / ct_val) if sz < 100 else int(round(sz)))
-            return str(int(contracts))
+        ct_val, _, lot_sz, min_sz = self.get_instrument_spec(symbol)
+        if "SWAP" in symbol or "FUTURES" in symbol:
+            raw_contracts = float(sz) / max(ct_val, 1e-12)
+            d_contracts = Decimal(str(max(min_sz, raw_contracts)))
+            d_lot = Decimal(str(max(lot_sz, 1e-8)))
+            d_min = Decimal(str(max(min_sz, d_lot)))
+            steps = (d_contracts / d_lot).quantize(Decimal("1"), rounding=ROUND_DOWN)
+            if steps < 1:
+                steps = Decimal("1")
+            aligned = max(d_min, steps * d_lot)
+            formatted = format(aligned.normalize(), "f")
+            return formatted if formatted != "" else str(min_sz)
         else:
-            if sz >= 100:
-                return f"{sz:.2f}"
-            elif sz >= 1:
-                return f"{sz:.3f}"
-            else:
-                return f"{sz:.4f}"
+            d_sz = Decimal(str(max(min_sz, float(sz))))
+            d_lot = Decimal(str(max(lot_sz, 1e-8)))
+            steps = (d_sz / d_lot).quantize(Decimal("1"), rounding=ROUND_DOWN)
+            aligned = max(Decimal(str(min_sz)), steps * d_lot)
+            return format(aligned.normalize(), "f")
+
+    def _format_order_px(self, symbol: str, px: float) -> str:
+        """将委托价格或触发价格按 OKX 标的 tickSz 最小步长对齐，杜绝 51006/51000 价格精度拒单"""
+        from decimal import Decimal, ROUND_HALF_UP
+
+        if px is None or px <= 0:
+            return "0"
+        _, tick_sz, _, _ = self.get_instrument_spec(symbol)
+        d_px = Decimal(str(float(px)))
+        d_tick = Decimal(str(max(tick_sz, 1e-10)))
+        steps = (d_px / d_tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        aligned_px = max(d_tick, steps * d_tick)
+        return format(aligned_px.normalize(), "f")
 
     # =========================================================================
     # 3. 交易委托与订单管理接口 (Trading & Order APIs)
@@ -808,17 +883,24 @@ class OKXRestClient:
         tp_trigger_price: Optional[float] = None,
         tp_order_price: Optional[float] = None,
         sl_trigger_price: Optional[float] = None,
-        sl_order_price: Optional[float] = None
+        sl_order_price: Optional[float] = None,
+        size: Optional[float] = None
     ) -> Dict[str, Any]:
         """
         提交委托下单 (支持现货/永续、市价/限价、附带 TP/SL 委托、自动对齐账户持仓模式与合约张数)
         POST /api/v5/trade/order
         """
+        if size is not None and size > 0:
+            sz = size
+
         side_val = side.value if isinstance(side, OrderSide) else str(side).lower()
         pos_side_val = pos_side.value if isinstance(pos_side, PosSide) else str(pos_side).lower()
         ord_type_val = order_type.value if isinstance(order_type, OrderType) else str(order_type).lower()
+        if ord_type_val == "optimal_limit_ioc":
+            ord_type_val = "optimal_limit_ioc"
 
         # 1. 自动对齐 OKX 账户持仓模式 (net_mode 单向 vs long_short_mode 双向)
+        acc_mode = "long_short_mode"
         if "SWAP" in symbol or "FUTURES" in symbol:
             try:
                 acc_mode = await self.get_account_pos_mode()
@@ -826,14 +908,17 @@ class OKXRestClient:
                     pos_side_val = "net"
                 else:
                     if pos_side_val == "net":
-                        pos_side_val = "long" if side_val == "buy" else "short"
+                        if reduce_only:
+                            pos_side_val = "long" if side_val == "sell" else "short"
+                        else:
+                            pos_side_val = "long" if side_val == "buy" else "short"
             except Exception as mode_err:
                 logger.debug(f"自适应持仓模式检测提示: {mode_err}")
 
         # 2. 数量转换为 OKX 交易所标准张数或小数
         formatted_sz = self._format_order_sz(symbol, float(sz))
 
-        # 3. 如果没有指定 client_order_id，自动生成金融级防碰撞全局唯一 ID (OKXD + 13位毫秒时间戳 + 8位安全随机数)
+        # 3. 如果没有指定 client_order_id，自动生成金融级防碰撞全局唯一 ID
         if not client_order_id:
             client_order_id = f"OKXD{int(time.time()*1000)}{secrets.token_hex(4)}"
 
@@ -845,29 +930,31 @@ class OKXRestClient:
             "ordType": ord_type_val,
             "sz": formatted_sz,
             "clOrdId": client_order_id,
-            "reduceOnly": reduce_only
         }
+        # 在双向持仓模式 (long_short_mode) 下，OKX 根据 side + posSide 自动区分开平仓，仅在 net_mode 或减仓时传 reduceOnly
+        if reduce_only and acc_mode == "net_mode":
+            body["reduceOnly"] = True
 
-        # 限价单必须包含价格
-        if ord_type_val in ("limit", "post_only", "fok", "ioc") and price is not None:
-            body["px"] = str(price)
+        # 限价单必须包含按 tickSz 对齐的价格
+        if ord_type_val in ("limit", "post_only", "fok", "ioc") and price is not None and price > 0:
+            body["px"] = self._format_order_px(symbol, price)
 
         # 附带止盈止损 (attachAlgoOrds)
         attach_algos: List[Dict[str, Any]] = []
-        if tp_trigger_price is not None and tp_trigger_price > 0:
-            tp_ord_px_str = str(tp_order_price) if (tp_order_price and tp_order_price > 0) else "-1"
+        if tp_trigger_price is not None and tp_trigger_price > 0 and not reduce_only:
+            tp_ord_px_str = self._format_order_px(symbol, tp_order_price) if (tp_order_price and tp_order_price > 0) else "-1"
             attach_algos.append({
                 "attachAlgoId": "",
-                "tpTriggerPx": str(tp_trigger_price),
+                "tpTriggerPx": self._format_order_px(symbol, tp_trigger_price),
                 "tpOrdPx": tp_ord_px_str,
                 "tpTriggerPxType": "last"
             })
 
-        if sl_trigger_price is not None and sl_trigger_price > 0:
-            sl_ord_px_str = str(sl_order_price) if (sl_order_price and sl_order_price > 0) else "-1"
+        if sl_trigger_price is not None and sl_trigger_price > 0 and not reduce_only:
+            sl_ord_px_str = self._format_order_px(symbol, sl_order_price) if (sl_order_price and sl_order_price > 0) else "-1"
             attach_algos.append({
                 "attachAlgoId": "",
-                "slTriggerPx": str(sl_trigger_price),
+                "slTriggerPx": self._format_order_px(symbol, sl_trigger_price),
                 "slOrdPx": sl_ord_px_str,
                 "slTriggerPxType": "mark"
             })
@@ -889,7 +976,7 @@ class OKXRestClient:
             body["attachAlgoOrds"] = [attach_data]
 
         # 4. 开仓前自适应更新杠杆
-        if leverage and leverage > 1 and "SWAP" in symbol:
+        if leverage and leverage >= 1 and "SWAP" in symbol and not reduce_only:
             try:
                 await self.set_leverage(
                     symbol=symbol,
@@ -937,6 +1024,74 @@ class OKXRestClient:
             params["instId"] = symbol
         res = await self._request("GET", "/api/v5/trade/orders-pending", params=params)
         return res or []
+
+    async def get_orders(
+        self,
+        symbol: Optional[str] = None,
+        state: Optional[str] = None,
+        limit: int = 50
+    ) -> List[OrderModel]:
+        """
+        查询实盘当前挂单与历史订单并转换为标准 OrderModel 列表
+        """
+        now_ms = int(time.time() * 1000)
+        raw_orders: List[Dict[str, Any]] = []
+        try:
+            pending = await self.get_pending_orders(symbol=symbol, inst_type="SWAP")
+            raw_orders.extend(pending)
+        except Exception as e:
+            logger.debug(f"拉取实盘活跃挂单提示: {e}")
+
+        if state != "live":
+            try:
+                hist_params: Dict[str, Any] = {"instType": "SWAP", "limit": str(min(limit, 50))}
+                if symbol:
+                    hist_params["instId"] = symbol
+                hist = await self._request("GET", "/api/v5/trade/orders-history", params=hist_params)
+                if hist:
+                    raw_orders.extend(hist)
+            except Exception as e:
+                logger.debug(f"拉取实盘历史订单提示: {e}")
+
+        result: List[OrderModel] = []
+        for o in raw_orders[:limit]:
+            inst_id = o.get("instId", symbol or "BTC-USDT-SWAP")
+            ct_val = self.get_contract_value(inst_id)
+            raw_sz = float(o.get("sz") or 0.0)
+            raw_fill_sz = float(o.get("accFillSz") or o.get("fillSz") or 0.0)
+            coins_sz = round(raw_sz * ct_val, 6)
+            coins_fill = round(raw_fill_sz * ct_val, 6)
+            avg_px = float(o.get("avgPx") or 0.0)
+            px = float(o.get("px") or 0.0) if o.get("px") else None
+            ref_px = avg_px if avg_px > 0 else (px or 0.0)
+            notional = round(coins_sz * ref_px, 2)
+
+            try:
+                result.append(OrderModel(
+                    client_order_id=o.get("clOrdId") or o.get("ordId") or f"OKX_{now_ms}",
+                    okx_order_id=o.get("ordId", ""),
+                    symbol=inst_id,
+                    inst_type=InstType.SWAP,
+                    side=OrderSide.BUY if str(o.get("side", "buy")).lower() == "buy" else OrderSide.SELL,
+                    pos_side=PosSide(str(o.get("posSide", "net")).lower()) if str(o.get("posSide", "net")).lower() in ("long", "short", "net") else PosSide.NET,
+                    order_type=OrderType(str(o.get("ordType", "limit")).lower()) if str(o.get("ordType", "limit")).lower() in ("market", "limit", "post_only", "fok", "ioc") else OrderType.LIMIT,
+                    price=px,
+                    sz=coins_sz,
+                    notional_usdt=notional,
+                    filled_sz=coins_fill,
+                    avg_price=avg_px,
+                    state=OrderState(str(o.get("state", "live")).lower()) if str(o.get("state", "live")).lower() in ("live", "partially_filled", "filled", "canceled") else OrderState.LIVE,
+                    leverage=int(float(o.get("lever") or 1)),
+                    fee=float(o.get("fee") or 0.0),
+                    pnl=float(o.get("pnl") or 0.0),
+                    tp_trigger_price=float(o.get("tpTriggerPx")) if o.get("tpTriggerPx") else None,
+                    sl_trigger_price=float(o.get("slTriggerPx")) if o.get("slTriggerPx") else None,
+                    created_at=int(o.get("cTime") or now_ms),
+                    updated_at=int(o.get("uTime") or now_ms)
+                ))
+            except Exception:
+                continue
+        return result
 
     async def get_pending_algo_orders(
         self,
@@ -1027,16 +1182,92 @@ class OKXRestClient:
 
         return results
 
+    async def cancel_all_orders(
+        self,
+        symbol: Optional[str] = None,
+        inst_type: str = "SWAP"
+    ) -> List[Dict[str, Any]]:
+        """
+        撤销指定标的（或全部标的）的所有普通活跃挂单与策略条件挂单 (Cancel-Before-Close)
+        """
+        canceled: List[Dict[str, Any]] = []
+        try:
+            pending = await self.get_pending_orders(symbol=symbol, inst_type=inst_type)
+            if pending:
+                to_cancel = [
+                    {"instId": o["instId"], "ordId": o["ordId"]}
+                    for o in pending if "instId" in o and "ordId" in o
+                ]
+                if to_cancel:
+                    res = await self.cancel_batch_orders(to_cancel)
+                    canceled.extend(res)
+        except Exception as e:
+            logger.debug(f"撤销普通挂单异常 (非阻塞): {e}")
+
+        for ord_tp in ("conditional", "oco", "trigger"):
+            try:
+                algos = await self.get_pending_algo_orders(symbol=symbol, inst_type=inst_type, ord_type=ord_tp)
+                if algos:
+                    to_cancel_algo = [
+                        {"instId": a["instId"], "algoId": a["algoId"]}
+                        for a in algos if "instId" in a and "algoId" in a
+                    ]
+                    if to_cancel_algo:
+                        res_algo = await self.cancel_batch_algo_orders(to_cancel_algo)
+                        canceled.extend(res_algo)
+            except Exception:
+                pass
+        return canceled
+
+    async def place_tpsl_algo_order(
+        self,
+        symbol: str,
+        pos_side: Union[PosSide, str],
+        sz: float,
+        tp_trigger_price: Optional[float] = None,
+        sl_trigger_price: Optional[float] = None,
+        trade_mode: str = "cross"
+    ) -> Dict[str, Any]:
+        """
+        为现有实盘持仓挂载/更新止盈止损策略委托单
+        POST /api/v5/trade/order-algo
+        """
+        pos_side_val = pos_side.value if isinstance(pos_side, PosSide) else str(pos_side).lower()
+        side_val = "sell" if pos_side_val == "long" else "buy"
+        acc_mode = await self.get_account_pos_mode()
+
+        body: Dict[str, Any] = {
+            "instId": symbol,
+            "tdMode": trade_mode,
+            "side": side_val,
+            "posSide": "net" if acc_mode == "net_mode" else pos_side_val,
+            "ordType": "oco" if (tp_trigger_price and sl_trigger_price) else "conditional",
+            "sz": self._format_order_sz(symbol, sz),
+            "reduceOnly": True
+        }
+        if tp_trigger_price and tp_trigger_price > 0:
+            body["tpTriggerPx"] = self._format_order_px(symbol, tp_trigger_price)
+            body["tpOrdPx"] = "-1"
+            body["tpTriggerPxType"] = "last"
+        if sl_trigger_price and sl_trigger_price > 0:
+            body["slTriggerPx"] = self._format_order_px(symbol, sl_trigger_price)
+            body["slOrdPx"] = "-1"
+            body["slTriggerPxType"] = "mark"
+
+        res = await self._request("POST", "/api/v5/trade/order-algo", json_data=body)
+        return res[0] if res else {}
+
     async def close_position(
         self,
         symbol: str,
         mgn_mode: str = "cross",
-        pos_side: Optional[str] = None,
+        pos_side: Optional[Union[PosSide, str]] = None,
         ccy: Optional[str] = None,
-        auto_cancel: bool = True
+        auto_cancel: bool = True,
+        order_type: Optional[Any] = None
     ) -> Dict[str, Any]:
         """
-        快捷市价平仓
+        快捷市价平仓 (兼容 PosSide 枚举及 order_type 冗余参数，自动对齐账户持仓模式)
         POST /api/v5/trade/close-position
         """
         body: Dict[str, Any] = {
@@ -1044,8 +1275,15 @@ class OKXRestClient:
             "mgnMode": mgn_mode,
             "autoCxl": auto_cancel
         }
-        if pos_side:
-            body["posSide"] = pos_side
+        if pos_side is not None:
+            pos_side_str = pos_side.value if isinstance(pos_side, PosSide) else str(pos_side).lower()
+            try:
+                acc_mode = await self.get_account_pos_mode()
+                if acc_mode == "net_mode":
+                    pos_side_str = "net"
+            except Exception:
+                pass
+            body["posSide"] = pos_side_str
         if ccy:
             body["ccy"] = ccy
 
@@ -1059,18 +1297,32 @@ class OKXRestClient:
 
     async def test_credentials(self) -> Tuple[bool, int, List[str], Optional[str]]:
         """
-        测试当前 API 凭证连通性、测算网络延迟并探测权限列表
+        测试当前 API 凭证连通性、测算网络延迟并真实解析 OKX 账户权限列表 (perm)
         :return: (is_connected, latency_ms, permissions, error_message)
         """
         start_time = time.monotonic()
         try:
-            # 请求用户配置接口验证鉴权与只读/交易权限
             data = await self._request("GET", "/api/v5/account/config")
             latency = int((time.monotonic() - start_time) * 1000)
 
-            permissions = ["read", "trade"]
-            # 检查返回配置中是否涉及提现权限标识
-            return True, latency, permissions, None
+            permissions: List[str] = []
+            warning_msg: Optional[str] = None
+            if data and isinstance(data, list):
+                cfg = data[0]
+                self._account_pos_mode = cfg.get("posMode", "long_short_mode")
+                raw_perm = str(cfg.get("perm", "")).lower()
+                if "read_only" in raw_perm or "read" in raw_perm or not raw_perm:
+                    permissions.append("read")
+                if "trade" in raw_perm or not raw_perm:
+                    permissions.append("trade")
+                if "withdraw" in raw_perm:
+                    permissions.append("withdraw")
+                if raw_perm and "trade" not in raw_perm:
+                    warning_msg = "当前 OKX API Key 仅开启了只读 (read_only) 权限，未勾选交易 (trade) 权限，请在欧易后台开启交易权限！"
+            else:
+                permissions = ["read", "trade"]
+
+            return True, latency, permissions, warning_msg
         except OKXApiException as okx_err:
             latency = int((time.monotonic() - start_time) * 1000)
             return False, latency, [], str(okx_err)

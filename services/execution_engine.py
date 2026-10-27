@@ -60,17 +60,17 @@ class SmartExecutionEngine:
         leverage: int,
         tp_trigger_price: Optional[float] = None,
         sl_trigger_price: Optional[float] = None,
-        max_retries: int = 3,
-        check_interval_seconds: float = 2.0,
-        timeout_seconds: float = 20.0,
-        fallback_to_ioc: bool = False,
+        max_retries: int = 2,
+        check_interval_seconds: float = 1.5,
+        timeout_seconds: float = 10.0,
+        fallback_to_ioc: bool = True,
     ) -> Dict[str, Any]:
         """
         执行 Smart Pegging 动态追单流程:
         1. 抓取最新盘口 BBO (买一/卖一档)
         2. 以 POST_ONLY 挂单进入深度首档
         3. 巡检订单状态，若盘口脱离，自动撤单重挂
-        4. 达到最大重试或超时后，依配置决定取消或降级 IOC 成交
+        4. 达到最大重试或超时后，依配置自动降级为市价/IOC 确保实盘可靠进场
         """
         self.total_orders += 1
         start_ts = time.time()
@@ -86,18 +86,16 @@ class SmartExecutionEngine:
 
         try:
             while current_retry <= max_retries:
-                # 1. 获取最新盘口并计算贴盘价格
+                # 1. 获取最新盘口并按 OKX tickSz 精度计算贴盘价格
                 try:
                     tk = await self.rest_client.get_ticker(symbol)
                     ref_px = tk.last_price or 0.0
-                    # 确定首档挂单价 (针对币种精度自适应取整)
-                    price_dec = 2 if ref_px > 10 else 4
+                    _, tick_sz, _, _ = self.rest_client.get_instrument_spec(symbol)
                     if is_buy:
-                        # 买单挂在买一或微低于现价
-                        peg_px = round(tk.bid_price if (tk.bid_price and tk.bid_price > 0) else ref_px * 0.9998, price_dec)
+                        raw_peg = tk.bid_price if (tk.bid_price and tk.bid_price > 0) else (ref_px - tick_sz)
                     else:
-                        # 卖单挂在卖一或微高于现价
-                        peg_px = round(tk.ask_price if (tk.ask_price and tk.ask_price > 0) else ref_px * 1.0002, price_dec)
+                        raw_peg = tk.ask_price if (tk.ask_price and tk.ask_price > 0) else (ref_px + tick_sz)
+                    peg_px = float(self.rest_client._format_order_px(symbol, raw_peg))
                 except Exception as tk_err:
                     logger.warning(f"[SmartPeg] 获取盘口行情异常: {tk_err}")
                     peg_px = last_peg_px if last_peg_px > 0 else 0.0
@@ -197,16 +195,16 @@ class SmartExecutionEngine:
                 self.peg_adjustments_count += 1
                 current_retry += 1
 
-            # 4. 追单次数耗尽或超时处理
+            # 4. 追单次数耗尽或超时处理 -> 自动降级市价单 (MARKET) 确保实盘信号不漏单
             if fallback_to_ioc:
-                logger.warning(f"⚠️ [SmartPeg 降级] 追单 {max_retries} 次仍未成交，降级为 optimal_limit_ioc 确保进场")
+                logger.warning(f"⚠️ [SmartPeg 降级] 追单 {max_retries} 次仍未以 Maker 成交，自动降级为 MARKET 市价单确保可靠进场")
                 try:
                     ioc_res = await self.rest_client.place_order(
                         symbol=symbol,
                         side=side,
                         pos_side=pos_side,
-                        order_type=OrderType.OPTIMAL_LIMIT_IOC,
-                        price=last_peg_px,
+                        order_type=OrderType.MARKET,
+                        price=None,
                         sz=size,
                         leverage=leverage,
                         tp_trigger_price=tp_trigger_price,
@@ -214,9 +212,9 @@ class SmartExecutionEngine:
                     )
                     self.taker_fill_count += 1
                     fill_latency = int((time.time() - start_ts) * 1000)
-                    return {"success": True, "fill_type": "IOC_FALLBACK", "price": last_peg_px, "order_id": ioc_res.get("ordId"), "latency_ms": fill_latency}
+                    return {"success": True, "fill_type": "MARKET_FALLBACK", "price": last_peg_px, "order_id": ioc_res.get("ordId"), "latency_ms": fill_latency}
                 except Exception as ioc_err:
-                    logger.error(f"[SmartPeg] 降级 IOC 发单异常: {ioc_err}")
+                    logger.error(f"[SmartPeg] 降级市价发单异常: {ioc_err}")
 
             self.timeout_cancel_count += 1
             logger.info(f"[SmartPeg 结束] {symbol} 挂单未能成交，已安全取消，杜绝长期悬挂孤立单")

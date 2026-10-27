@@ -339,6 +339,16 @@ class AutoPilotManager:
     def max_concurrent_positions(self) -> int:
         return self.active_state.max_concurrent_positions
 
+    @property
+    def live_state(self) -> EnvRuntimeState:
+        """实盘自动操盘状态引用 (供 ReconciliationService 对账使用)"""
+        return self._states[True]
+
+    @property
+    def paper_state(self) -> EnvRuntimeState:
+        """模拟盘自动操盘状态引用 (供 ReconciliationService 对账使用)"""
+        return self._states[False]
+
     # ---------------- 核心生命周期与操作 ----------------
 
     async def switch_environment(
@@ -433,6 +443,7 @@ class AutoPilotManager:
         auto_leverage_enabled: bool = True,
         stop_loss_equity_floor: Optional[float] = None,
         max_loss_limit_usdt: Optional[float] = None,
+        force_reset: bool = False,
     ) -> AutoPilotStatusModel:
         """
         开启或恢复指定环境的自动量化操盘会话 (7x24h 后端常驻)
@@ -442,8 +453,15 @@ class AutoPilotManager:
             self._active_is_live = effective_is_live
             state = self._states[effective_is_live]
 
-            # 开启新会话并重置统计基准
-            state.reset_for_start(initial_equity=initial_equity)
+            # 若已有历史曲线且非强制重置，则保留连续时序曲线与历史战绩，仅恢复运行状态
+            if force_reset or (len(state.snapshots) <= 1 and len(state.trades) == 0):
+                state.reset_for_start(initial_equity=initial_equity)
+            else:
+                state.is_running = True
+                state.stop_time = None
+                if state.start_equity <= 0 and initial_equity > 0:
+                    state.start_equity = max(10.0, initial_equity)
+                state.current_equity = initial_equity if initial_equity > 0 else state.current_equity
             if aggressiveness_mode:
                 state.apply_aggressiveness_preset(aggressiveness_mode)
             state.symbol = symbol
@@ -699,7 +717,7 @@ class AutoPilotManager:
                 pnl_ratio=round(pnl_ratio, 4),
             )
 
-            if len(state.snapshots) >= 500:
+            if len(state.snapshots) >= 5000:
                 state.snapshots.pop(0)
             state.snapshots.append(point)
 
@@ -942,6 +960,88 @@ class AutoPilotManager:
             trades=list(state.trades),
         )
 
+    async def get_history_async(
+        self,
+        is_live_mode: Optional[bool] = None,
+        limit: int = 3000
+    ) -> AutoPilotHistoryResponse:
+        """获取指定环境的完整时序收益曲线与交易流水 (若内存刚重启则自动从 SQLite 恢复长周期历史)"""
+        state = self.get_state(is_live_mode)
+        eff_live = state.is_live_mode
+        sess_prefix = "auto_live_%" if eff_live else "auto_paper_%"
+
+        if len(state.snapshots) <= 2:
+            try:
+                async with get_db_session() as session:
+                    res = await session.execute(
+                        text(
+                            """
+                            SELECT timestamp, equity, realized_pnl, unrealized_pnl, total_pnl, pnl_ratio
+                            FROM auto_pilot_pnl_snapshots
+                            WHERE session_id LIKE :prefix
+                            ORDER BY timestamp DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"prefix": sess_prefix, "lim": max(100, min(5000, limit))},
+                    )
+                    rows = res.mappings().all()
+                    if rows and len(rows) > len(state.snapshots):
+                        restored = [
+                            AutoPilotHistoryPoint(
+                                timestamp=int(r["timestamp"]),
+                                equity=round(float(r["equity"]), 2),
+                                realized_pnl=round(float(r["realized_pnl"]), 2),
+                                unrealized_pnl=round(float(r["unrealized_pnl"]), 2),
+                                total_pnl=round(float(r["total_pnl"]), 2),
+                                pnl_ratio=round(float(r["pnl_ratio"]), 4),
+                            )
+                            for r in reversed(rows)
+                        ]
+                        state.snapshots = restored
+
+                    if len(state.trades) == 0:
+                        t_res = await session.execute(
+                            text(
+                                """
+                                SELECT order_id, symbol, pos_side, entry_price, exit_price,
+                                       size, leverage, realized_pnl, roi_pct, reason, timestamp
+                                FROM auto_pilot_trades
+                                WHERE session_id LIKE :prefix
+                                ORDER BY timestamp DESC
+                                LIMIT 200
+                                """
+                            ),
+                            {"prefix": sess_prefix},
+                        )
+                        t_rows = t_res.mappings().all()
+                        if t_rows:
+                            state.trades = [
+                                AutoPilotTradeRecord(
+                                    id=str(tr["order_id"]),
+                                    symbol=str(tr["symbol"]),
+                                    pos_side=str(tr["pos_side"]),
+                                    entry_price=float(tr["entry_price"]),
+                                    exit_price=float(tr["exit_price"]),
+                                    size=float(tr["size"]),
+                                    leverage=int(tr["leverage"]),
+                                    realized_pnl=float(tr["realized_pnl"]),
+                                    roi_pct=float(tr["roi_pct"]),
+                                    reason=str(tr["reason"] or "AI策略自动平仓"),
+                                    timestamp=int(tr["timestamp"]),
+                                )
+                                for tr in t_rows
+                            ]
+            except Exception as db_err:
+                logger.debug(f"从数据库恢复历史时序曲线跳过: {db_err}")
+
+        return AutoPilotHistoryResponse(
+            session_id=state.session_id,
+            is_running=state.is_running,
+            curve=list(state.snapshots[-limit:]),
+            trades=list(state.trades[:200]),
+        )
+
     async def reset_stats(
         self,
         current_equity: float,
@@ -966,6 +1066,7 @@ class AutoPilotManager:
             auto_leverage_enabled=state.auto_leverage_enabled,
             stop_loss_equity_floor=state.stop_loss_equity_floor,
             max_loss_limit_usdt=state.max_loss_limit_usdt,
+            force_reset=True,
         )
 
     # ---------------- 资深投资研究员: 标的深度尽调与优选排序 ----------------
@@ -1163,9 +1264,13 @@ class AutoPilotManager:
                 is_long = pos.pos_side == PosSide.LONG
                 profit_ratio = (cur_px - entry_px) / entry_px if is_long else (entry_px - cur_px) / entry_px
 
-                # 动态跟踪并记录持仓生命周期最高价与最高浮盈峰值
+                # 动态跟踪并记录持仓生命周期最高价、最高浮盈峰值与阶段1减仓标记 (兼容实盘每次拉取新 Position 对象)
                 if sym not in state.position_peaks:
-                    state.position_peaks[sym] = {"peak_price": cur_px, "peak_profit_ratio": profit_ratio}
+                    state.position_peaks[sym] = {
+                        "peak_price": cur_px,
+                        "peak_profit_ratio": profit_ratio,
+                        "tp_stage1_done": bool(getattr(pos, "tp_triggered_50", False)),
+                    }
                 else:
                     pk = state.position_peaks[sym]
                     if is_long:
@@ -1173,10 +1278,14 @@ class AutoPilotManager:
                     else:
                         pk["peak_price"] = min(pk.get("peak_price", cur_px), cur_px)
                     pk["peak_profit_ratio"] = max(pk.get("peak_profit_ratio", profit_ratio), profit_ratio)
+                    if getattr(pos, "tp_triggered_50", False):
+                        pk["tp_stage1_done"] = True
 
+                has_tp_50 = bool(state.position_peaks[sym].get("tp_stage1_done", False))
+                pos.tp_triggered_50 = has_tp_50
                 peak_profit = state.position_peaks[sym].get("peak_profit_ratio", profit_ratio)
 
-                # 1.1 先行提取多周期指标、衍生品情绪与 AI 量化策略研判
+                # 1.1 先行提取多周期指标、衍生品情绪与 AI 量化策略研判 (携带准确的 pos.tp_triggered_50 状态)
                 try:
                     multi_ind = await get_multi_period_indicators_data(sym)
                     deriv = await get_derivatives_metrics_data(sym)
@@ -1204,27 +1313,26 @@ class AutoPilotManager:
                 if multi_ind and "15m" in multi_ind.indicators and multi_ind.indicators["15m"].atr_14:
                     atr_15m = multi_ind.indicators["15m"].atr_14
                 atr_ratio = (atr_15m / max(cur_px, 1.0)) if atr_15m > 0 else 0.008
-                dynamic_tp_threshold = max(0.010, min(0.035, 1.6 * atr_ratio))
+                dynamic_tp_threshold = max(0.012, min(0.035, 1.6 * atr_ratio))
                 effective_tp_threshold = max(state.trailing_profit_threshold, dynamic_tp_threshold)
 
-                has_tp_50 = getattr(pos, "tp_triggered_50", False)
-
-                # 1.2 两阶段阶梯止盈：阶段 1 (未减半状态，平仓 50% 锁定确定性胜率 + 移损保本)
+                # 1.2 两阶段阶梯止盈：阶段 1 (未减半状态，平仓 50% 锁定确定性利润 + 移损保本)
                 if state.trailing_stop_enabled and not has_tp_50:
                     drawdown_from_peak = peak_profit - profit_ratio
-                    callback_limit = peak_profit * state.trailing_profit_callback
-                    is_trailing_hit = (peak_profit >= effective_tp_threshold) and (drawdown_from_peak >= callback_limit or (profit_ratio <= 0.005 and peak_profit >= 0.012))
-                    is_ai_close_hit = (action == SignalAction.CLOSE_POSITION and conf >= 0.70)
+                    callback_limit = max(0.004, peak_profit * state.trailing_profit_callback)
+                    is_trailing_hit = (peak_profit >= effective_tp_threshold) and (drawdown_from_peak >= callback_limit or (profit_ratio <= 0.005 and peak_profit >= 0.014))
+                    is_ai_close_hit = (action == SignalAction.CLOSE_POSITION and conf >= 0.75 and profit_ratio >= 0.012)
 
                     if is_trailing_hit or is_ai_close_hit:
-                        half_sz = max(0.001, round(pos.pos * 0.5, 4))
+                        ct_val, _, _, min_sz = rest_client.get_instrument_spec(sym)
+                        min_coin_sz = max(0.0001, ct_val * min_sz)
+                        half_sz = max(min_coin_sz, round(pos.pos * 0.5, 5))
                         reason_tp50 = (
                             f"🎯 阶段1阶梯止盈50% (最高浮盈+{peak_profit*100:.2f}%, 现浮盈+{profit_ratio*100:.2f}%, "
                             f"{'AI超买触发' if is_ai_close_hit else '动态追踪触发'})"
                         )
-                        logger.info(f"【自动操盘-阶梯止盈50%】{sym} {reason_tp50}, 平仓张数: {half_sz}")
+                        logger.info(f"【自动操盘-阶梯止盈50%】{sym} {reason_tp50}, 平仓币数: {half_sz}")
                         try:
-                            # Cancel-Before-Close: 先行撤单清理，杜绝幽灵挂单
                             if is_live:
                                 try:
                                     await rest_client.cancel_all_orders(symbol=sym)
@@ -1235,7 +1343,7 @@ class AutoPilotManager:
                                     side=OrderSide.SELL if is_long else OrderSide.BUY,
                                     pos_side=pos.pos_side,
                                     order_type=OrderType.MARKET,
-                                    size=half_sz,
+                                    sz=half_sz,
                                     reduce_only=True
                                 )
                             else:
@@ -1245,13 +1353,24 @@ class AutoPilotManager:
                             # 状态迁移：标记 50% 阶梯已触发，强制移损至「均价+摩擦覆盖缓冲」(True Breakeven Locked)
                             pos.tp_triggered_50 = True
                             pos.is_breakeven_locked = True
-                            be_friction_buf = entry_px * 0.0012
-                            be_sl_target = round(entry_px + be_friction_buf, 2 if entry_px > 10 else 4) if is_long else round(entry_px - be_friction_buf, 2 if entry_px > 10 else 4)
+                            be_friction_buf = entry_px * 0.0015
+                            be_sl_target = float(rest_client._format_order_px(sym, entry_px + be_friction_buf if is_long else entry_px - be_friction_buf))
                             pos.sl_trigger_price = be_sl_target
-                            pos.tp_trigger_price = None  # 固定止盈清除，剩余50%仓位全面交由阶段2宽幅吊灯移动追踪或TP2出清接管
+                            pos.tp_trigger_price = None
                             state._breakeven_applied_positions.add(pos_id)
 
-                            if not is_live:
+                            if is_live:
+                                try:
+                                    rem_sz = max(min_coin_sz, round(pos.pos - half_sz, 5))
+                                    await rest_client.place_tpsl_algo_order(
+                                        symbol=sym,
+                                        pos_side=pos.pos_side,
+                                        sz=rem_sz,
+                                        sl_trigger_price=be_sl_target
+                                    )
+                                except Exception as algo_e:
+                                    logger.debug(f"实盘阶段1移损保本条件单挂载提示: {algo_e}")
+                            else:
                                 paper_engine.update_position_stops(
                                     symbol=sym,
                                     pos_side=pos.pos_side,
@@ -1261,29 +1380,38 @@ class AutoPilotManager:
                                     is_breakeven_locked=True
                                 )
 
-                            # 重置波段追踪峰值基准，以当前浮盈继续跟踪剩余 50% 仓位
-                            state.position_peaks[sym] = {"peak_price": cur_px, "peak_profit_ratio": profit_ratio}
+                            # 保持峰值并记录 tp_stage1_done = True，交由阶段2宽幅 ATR 吊灯止盈跟踪剩余 50% 仓位
+                            state.position_peaks[sym] = {
+                                "peak_price": max(cur_px, state.position_peaks[sym].get("peak_price", cur_px)) if is_long else min(cur_px, state.position_peaks[sym].get("peak_price", cur_px)),
+                                "peak_profit_ratio": max(peak_profit, profit_ratio),
+                                "tp_stage1_done": True,
+                            }
                             patrol_summaries.append(f"🎯{sym}阶梯止盈50%(+{profit_ratio*100:.1f}%)")
                             continue
                         except Exception as tp_err:
                             logger.warning(f"阶段1阶梯止盈异常 {sym}: {tp_err}")
 
-                # 1.3 两阶段阶梯止盈：阶段 2 (已完成50%减半，剩余50%长尾波段博取 - 宽幅40%容忍度或触及TP2出清)
+                # 1.3 两阶段阶梯止盈：阶段 2 (已完成50%减半，剩余50%长尾波段博取 - ATR 吊灯宽幅容忍度或触及TP2出清)
                 elif state.trailing_stop_enabled and has_tp_50:
                     drawdown_from_peak = peak_profit - profit_ratio
-                    # 宽幅波段容忍度：允许从新高回调 40%
-                    wave_dd_limit = peak_profit * 0.40
+                    # 宽幅波段容忍度：取 1.5倍 15m ATR (至少 0.8% 价格波动空间) 与峰值 45% 回撤的较大值，防止正常震荡秒平剩余半仓
+                    wave_dd_limit = max(0.008, 1.5 * atr_ratio, peak_profit * 0.45)
                     tp2_hit = False
                     if plan and plan.take_profit_levels and len(plan.take_profit_levels) > 1:
                         tp2_px = plan.take_profit_levels[-1].price
                         tp2_hit = (cur_px >= tp2_px) if is_long else (cur_px <= tp2_px)
 
-                    # 出清条件：宽幅回撤40% / 浮盈回踩至保本线(0.2%) / 触及波段终极目标TP2 / AI超买强平
-                    is_tail_exit = (drawdown_from_peak >= wave_dd_limit) or (profit_ratio <= 0.002) or tp2_hit or (action == SignalAction.CLOSE_POSITION and conf >= 0.70)
+                    is_stage2_ai_exit = (action == SignalAction.CLOSE_POSITION and conf >= 0.80 and profit_ratio >= max(0.024, 2.4 * atr_ratio))
+                    is_tail_exit = (
+                        (peak_profit >= 0.018 and drawdown_from_peak >= wave_dd_limit)
+                        or (profit_ratio <= 0.0020)
+                        or tp2_hit
+                        or is_stage2_ai_exit
+                    )
                     if is_tail_exit:
                         reason_tail = (
                             f"🏁 阶段2长尾波段出清 (最高浮盈+{peak_profit*100:.2f}%, 现浮盈+{profit_ratio*100:.2f}%, "
-                            f"{'触及TP2' if tp2_hit else ('宽幅回撤达标' if drawdown_from_peak >= wave_dd_limit else '回踩保本线')})"
+                            f"{'触及TP2' if tp2_hit else ('ATR吊灯回撤止盈' if drawdown_from_peak >= wave_dd_limit else '回踩保本线')})"
                         )
                         logger.info(f"【自动操盘-波段出清】{sym} {reason_tail}")
                         try:
@@ -1292,7 +1420,19 @@ class AutoPilotManager:
                                     await rest_client.cancel_all_orders(symbol=sym)
                                 except Exception:
                                     pass
-                                await rest_client.close_position(symbol=sym, pos_side=pos.pos_side, order_type=OrderType.MARKET)
+                                await rest_client.close_position(symbol=sym, pos_side=pos.pos_side)
+                                est_pnl = (cur_px - entry_px) * pos.pos if is_long else (entry_px - cur_px) * pos.pos
+                                await self.record_trade(
+                                    symbol=sym,
+                                    pos_side=pos.pos_side.value if hasattr(pos.pos_side, "value") else str(pos.pos_side),
+                                    entry_price=entry_px,
+                                    exit_price=cur_px,
+                                    size=pos.pos,
+                                    leverage=pos.leverage or 3,
+                                    realized_pnl=round(est_pnl, 2),
+                                    roi_pct=round(profit_ratio * (pos.leverage or 3) * 100.0, 2),
+                                    reason=reason_tail,
+                                )
                             else:
                                 paper_engine.cancel_all_orders(symbol=sym)
                                 paper_engine.close_position(symbol=sym, pos_side=pos.pos_side, price=cur_px, reason=reason_tail)
@@ -1306,13 +1446,13 @@ class AutoPilotManager:
                         except Exception as tail_err:
                             logger.warning(f"阶段2波段出清异常 {sym}: {tail_err}")
 
-                # 1.4 常规移动保本锁定 (浮盈超 0.8% 且尚未触发过保本)
+                # 1.4 常规移动保本锁定 (浮盈超 1.0% 且尚未触发过保本)
                 if state.trailing_stop_enabled and pos_id not in state._breakeven_applied_positions:
-                    if profit_ratio >= 0.008:
+                    if profit_ratio >= 0.010:
                         state._breakeven_applied_positions.add(pos_id)
                         pos.is_breakeven_locked = True
-                        be_friction_buf = entry_px * 0.0012
-                        be_sl_target = round(entry_px + be_friction_buf, 2 if entry_px > 10 else 4) if is_long else round(entry_px - be_friction_buf, 2 if entry_px > 10 else 4)
+                        be_friction_buf = entry_px * 0.0015
+                        be_sl_target = float(rest_client._format_order_px(sym, entry_px + be_friction_buf if is_long else entry_px - be_friction_buf))
                         pos.sl_trigger_price = be_sl_target
                         if not is_live:
                             paper_engine.update_position_stops(symbol=sym, stop_loss_price=be_sl_target)
@@ -1322,31 +1462,31 @@ class AutoPilotManager:
 
                 cur_layers = getattr(pos, "scale_layers", None) or state.position_scale_records.get(sym, 1)
 
-                # 1.5 强反向信号 -> 趋势反转平反开 (Directional Reversal)
+                # 1.5 强反向信号 -> 趋势反转平反开 (Directional Reversal，增加 10 分钟持仓保护期与 0.82 置信度门槛防震荡磨损)
+                last_entry_or_scale_ts = state.last_scale_timestamps.get(sym, 0)
+                holding_elapsed_ms = now_ms - last_entry_or_scale_ts
                 is_opposite_signal = (is_long and action == SignalAction.SELL_SHORT) or ((not is_long) and action == SignalAction.BUY_LONG)
-                if state.auto_reversal_enabled and is_opposite_signal and conf >= 0.75 and plan:
+                if state.auto_reversal_enabled and is_opposite_signal and conf >= 0.82 and plan and holding_elapsed_ms >= 600000:
                     try:
                         logger.info(f"🔄 【趋势反转触发】{sym} 当前持仓 {pos.pos_side.value} 遭遇强反向信号 ({action.value}, 置信度:{conf*100:.0f}%)，执行平仓并反手！")
-                        # (1) Cancel-Before-Close 清理挂单并平掉当前反向持仓
                         if is_live:
                             try:
                                 await rest_client.cancel_all_orders(symbol=sym)
                             except Exception:
                                 pass
-                            await rest_client.close_position(symbol=sym, pos_side=pos.pos_side, order_type=OrderType.MARKET)
+                            await rest_client.close_position(symbol=sym, pos_side=pos.pos_side)
                         else:
                             paper_engine.cancel_all_orders(symbol=sym)
                             paper_engine.close_position(symbol=sym, pos_side=pos.pos_side, price=cur_px, reason=f"趋势反转强信号 ({action.value}) 自动平仓反手")
 
-                        # 清理旧持仓峰值与标记
                         state.position_peaks.pop(sym, None)
                         state._breakeven_applied_positions.discard(pos_id)
 
-                        # (2) 立即反向开仓 (Layer 1)
                         new_side = OrderSide.SELL if action == SignalAction.SELL_SHORT else OrderSide.BUY
                         new_pos_side = PosSide.SHORT if action == SignalAction.SELL_SHORT else PosSide.LONG
-                        lev = min(plan.suggested_leverage or 3, risk_controller.rules.max_leverage if risk_controller.rules else 5)
-                        risk_budget = max(5.0, avail_funds * 0.02)
+                        eff_max_lev = risk_controller.get_effective_max_leverage() if risk_controller else 5
+                        lev = min(plan.suggested_leverage or 3, eff_max_lev)
+                        risk_budget = max(5.0, avail_funds * 0.015)
                         sl_px = plan.stop_loss_price or (cur_px * 1.015 if new_pos_side == PosSide.SHORT else cur_px * 0.985)
                         stop_dist = max(abs(cur_px - sl_px), cur_px * 0.008)
                         raw_coins = risk_budget / stop_dist
@@ -1356,7 +1496,9 @@ class AutoPilotManager:
                             avail_funds * lev * 0.85
                         )
                         final_notional = min(raw_notional, max_order_cap)
-                        calc_coins = max(0.001, math.floor((final_notional / cur_px) * 1000) / 1000.0)
+                        ct_val, _, _, min_sz = rest_client.get_instrument_spec(sym)
+                        min_coin_sz = max(0.0001, ct_val * min_sz)
+                        calc_coins = max(min_coin_sz, math.floor((final_notional / cur_px) * 10000) / 10000.0)
 
                         tp_target = None
                         if hasattr(plan, "take_profit_levels") and plan.take_profit_levels:
@@ -1441,7 +1583,8 @@ class AutoPilotManager:
 
                         if should_scale:
                             try:
-                                lev = min(plan.suggested_leverage or 3, risk_controller.rules.max_leverage if risk_controller.rules else 5)
+                                eff_max_lev = risk_controller.get_effective_max_leverage() if risk_controller else 5
+                                lev = min(plan.suggested_leverage or 3, eff_max_lev)
                                 risk_budget = max(5.0, avail_funds * 0.016)
                                 sl_px = plan.stop_loss_price or (cur_px * 0.985 if is_long else cur_px * 1.015)
                                 stop_dist = max(abs(cur_px - sl_px), cur_px * 0.008)
@@ -1452,7 +1595,9 @@ class AutoPilotManager:
                                     avail_funds * lev * 0.80
                                 )
                                 final_notional = min(raw_notional, max_order_cap)
-                                calc_coins = max(0.001, math.floor((final_notional / cur_px) * 1000) / 1000.0)
+                                ct_val, _, _, min_sz = rest_client.get_instrument_spec(sym)
+                                min_coin_sz = max(0.0001, ct_val * min_sz)
+                                calc_coins = max(min_coin_sz, math.floor((final_notional / cur_px) * 10000) / 10000.0)
 
                                 new_sl_px = max(entry_px, cur_px * 0.99) if is_long else min(entry_px, cur_px * 1.01)
                                 tp_target = plan.take_profit_levels[-1].price if (plan and plan.take_profit_levels) else None
@@ -1521,7 +1666,7 @@ class AutoPilotManager:
                                                 tp_trigger_price=tp_target,
                                                 sl_trigger_price=new_sl_px,
                                                 max_retries=2,
-                                                fallback_to_ioc=False,
+                                                fallback_to_ioc=True,
                                             )
                                             if not peg_res.get("success"):
                                                 logger.warning(f"⚡ [AutoPilot] 加仓 Smart Pegging 未能成交: {peg_res.get('message')}")
@@ -1673,7 +1818,7 @@ class AutoPilotManager:
                             risk_pct = 0.010
                             lev_cap = 5
 
-                        max_sys_lev = risk_controller.rules.max_leverage if risk_controller.rules else 5
+                        max_sys_lev = risk_controller.get_effective_max_leverage() if risk_controller else 5
                         lev = min(plan.suggested_leverage or 3, lev_cap, max_sys_lev)
 
                         # 提取 ATR 指标进行波动率校准
@@ -1795,8 +1940,8 @@ class AutoPilotManager:
                                         leverage=lev,
                                         tp_trigger_price=tp_target,
                                         sl_trigger_price=sl_px,
-                                        max_retries=3,
-                                        fallback_to_ioc=False,
+                                        max_retries=2,
+                                        fallback_to_ioc=True,
                                     )
                                     if not peg_res.get("success"):
                                         logger.warning(f"🚀 [AutoPilot] 首仓 Smart Pegging 未能成交: {peg_res.get('message')}")

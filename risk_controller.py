@@ -139,8 +139,38 @@ class RiskController:
             self.cooldown_reason = None
             return False, 0, None
 
-    def record_symbol_stop_loss(self, symbol: str, cooldown_minutes: int = 30, reason: str = "触发止损平仓"):
-        """记录单币种止损，触发 30 分钟防洗盘追单冷静期"""
+    def reset_for_mode_switch(self):
+        """
+        实盘/模拟盘环境切换时的风控状态物理隔离重置：
+        防止模拟盘产生的亏损计数、防上头冷却锁、标的止损锁污染实盘交易权限
+        """
+        self.today_realized_loss = 0.0
+        self.today_unrealized_loss = 0.0
+        self.consecutive_loss_count = 0
+        self.loss_timestamps.clear()
+        self.cooldown_until_ts = None
+        self.cooldown_reason = None
+        self.symbol_cooldowns.clear()
+        if self.risk_status == RiskStatus.CIRCUIT_BROKEN:
+            self.risk_status = RiskStatus.NORMAL
+            self.is_circuit_broken = False
+            self.circuit_break_reason = None
+            self.circuit_break_at = None
+        logger.info("【硬风控环境隔离】已重置当前环境的亏损累计与冷却锁定状态")
+
+    def get_effective_max_leverage(self) -> int:
+        """
+        获取当前动态有效最大杠杆倍数：
+        仅当单日累计亏损超过熔断阈值的 50% 时才触发降杠杆防守 (降至 3x)，避免微幅亏损锁死正常 3x 开仓
+        """
+        base_max = self.rules.max_leverage
+        loss_threshold = max(50.0, self.rules.max_daily_loss_usdt * 0.5)
+        if self.today_realized_loss >= loss_threshold:
+            return min(3, base_max)
+        return base_max
+
+    def record_symbol_stop_loss(self, symbol: str, cooldown_minutes: int = 10, reason: str = "触发止损平仓"):
+        """记录单币种止损，触发 10 分钟防洗盘追单冷静期"""
         now_ms = int(time.time() * 1000)
         until_ms = now_ms + cooldown_minutes * 60 * 1000
         self.symbol_cooldowns[symbol] = until_ms
@@ -173,17 +203,17 @@ class RiskController:
             self.loss_timestamps.append(now_sec)
             self.consecutive_loss_count = len(self.loss_timestamps)
 
-            # 若 2 小时内连续触发 2 笔止损单，强制锁定 60 分钟防上头
-            if self.consecutive_loss_count >= 2:
-                self.cooldown_until_ts = int((now_sec + 3600) * 1000)
-                self.cooldown_reason = f"2小时内连续触发 {self.consecutive_loss_count} 笔止损，系统激活 60 分钟防上头强制冷静锁"
+            # 若 2 小时内连续触发 3 笔及以上止损单，激活 15 分钟防上头冷静锁
+            if self.consecutive_loss_count >= 3:
+                self.cooldown_until_ts = int((now_sec + 900) * 1000)
+                self.cooldown_reason = f"2小时内连续触发 {self.consecutive_loss_count} 笔止损，系统激活 15 分钟防上头强制冷静锁"
                 logger.warning(f"【交易心理防上头触发】{self.cooldown_reason}")
-                # 触发当日亏损熔断判断
-                if self.today_realized_loss >= self.rules.max_daily_loss_usdt:
-                    self.trigger_daily_loss_circuit_breaker(
-                        self.today_realized_loss,
-                        f"当日累计亏损 {self.today_realized_loss:.2f} USDT 超过上限 {self.rules.max_daily_loss_usdt} USDT"
-                    )
+            # 触发当日亏损熔断判断
+            if self.today_realized_loss >= self.rules.max_daily_loss_usdt:
+                self.trigger_daily_loss_circuit_breaker(
+                    self.today_realized_loss,
+                    f"当日累计亏损 {self.today_realized_loss:.2f} USDT 超过上限 {self.rules.max_daily_loss_usdt} USDT"
+                )
         else:
             # 盈利单可缓解连续止损压力
             if self.loss_timestamps:
@@ -193,15 +223,15 @@ class RiskController:
     def get_tilt_status(self) -> Dict[str, Any]:
         """获取交易心理防上头状态"""
         is_cd, rem_mins, cd_reason = self.is_in_cooldown()
-        # 是否触发降杠杆惩罚
-        leverage_penalty = self.today_realized_loss > 0
+        loss_threshold = max(50.0, self.rules.max_daily_loss_usdt * 0.5)
+        leverage_penalty = self.today_realized_loss >= loss_threshold
         return {
             "is_in_cooldown": is_cd,
             "cooldown_until_ts": self.cooldown_until_ts,
             "cooldown_remaining_mins": rem_mins,
             "consecutive_loss_count": self.consecutive_loss_count,
             "leverage_penalty_applied": leverage_penalty,
-            "reason": cd_reason or ("当日产生亏损，最大可用杠杆已自动降至 2x" if leverage_penalty else None)
+            "reason": cd_reason or ("当日亏损已达熔断线 50%，最大可用杠杆已自动收敛至 3x" if leverage_penalty else None)
         }
 
     async def get_status(self) -> RiskStatusResponse:
@@ -404,44 +434,20 @@ class RiskController:
             )
 
         # ---------------------------------------------------------------------
-        # 规则 2.5: 强制 Post-Only (Maker) 保护与市价单 Taker 阻断
+        # 规则 2.5: Post-Only 与市价单协同路由
+        # 允許交易员手动市价单与 AI 一键市价委托通行，并交由下方规则 5 (MAX_SLIPPAGE_PROTECTION) 严格检验滑点
         # ---------------------------------------------------------------------
-        if self.rules.enforce_post_only and not is_reduce_only and order.order_type == OrderType.MARKET:
-            reason = "【硬风控拦截】为彻底消除 Taker 吃单滑点与高额手续费损耗，系统已强制锁定仅允许 Post-Only/限价委托开仓！"
-            await self.record_risk_event(
-                event_type=RiskEventType.ORDER_REJECTED,
-                rule_name="ENFORCE_POST_ONLY_MAKER",
-                limit_val="POST_ONLY_ONLY",
-                current_val="MARKET_ATTEMPT",
-                symbol=order.symbol,
-                is_blocked=True,
-                action_taken="REJECT_ORDER",
-                severity=AuditSeverity.WARNING
-            )
-            return RiskCheckResult(
-                passed=False,
-                rejected_rule="ENFORCE_POST_ONLY_MAKER",
-                message=reason,
-                risk_status=self.risk_status
-            )
 
         # ---------------------------------------------------------------------
-        # 规则 3: 杠杆倍数硬锁上限与单日亏损降杠杆惩罚
+        # 规则 3: 杠杆倍数硬锁上限与单日亏损自适应降杠杆保护
         # ---------------------------------------------------------------------
-        effective_max_leverage = self.rules.max_leverage
-        if self.today_realized_loss > 0:
-            # 降杠杆惩罚: 限制最大 2x
-            effective_max_leverage = min(2, effective_max_leverage)
-
-        if order.leverage > effective_max_leverage:
-            reason = (
-                f"委托杠杆倍数 ({order.leverage}x) 超过当前有效上限 ({effective_max_leverage}x)"
-                + (" (因当日存在亏损，触发降杠杆保护至 2x)" if self.today_realized_loss > 0 else "")
-            )
+        effective_max_leverage = self.get_effective_max_leverage()
+        if order.leverage > self.rules.max_leverage:
+            reason = f"委托杠杆倍数 ({order.leverage}x) 超过系统最高硬锁上限 ({self.rules.max_leverage}x)"
             await self.record_risk_event(
                 event_type=RiskEventType.LEVERAGE_EXCEEDED,
                 rule_name="MAX_LEVERAGE",
-                limit_val=f"{effective_max_leverage}x",
+                limit_val=f"{self.rules.max_leverage}x",
                 current_val=f"{order.leverage}x",
                 symbol=order.symbol,
                 is_blocked=True,
@@ -454,6 +460,9 @@ class RiskController:
                 message=reason,
                 risk_status=self.risk_status
             )
+        elif order.leverage > effective_max_leverage:
+            logger.info(f"触发当日回撤降杠杆保护，自动将订单杠杆由 {order.leverage}x 收敛至 {effective_max_leverage}x")
+            order.leverage = effective_max_leverage
 
         # 估算委托名义价值 (Notional USDT)
         price_to_use = order.price

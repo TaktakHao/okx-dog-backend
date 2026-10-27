@@ -46,6 +46,7 @@ from routers import (
     finance_router,
 )
 from vault import install_sensitive_data_filter
+from services.instrument_service import instrument_manager
 from state import (
     antigravity_bridge,
     auto_pilot_manager,
@@ -84,10 +85,10 @@ async def lifespan(app: FastAPI):
         # 加载风控规则
         await risk_controller.load_config_from_db()
 
-        # 尝试从凭证密盒加载已保存的 OKX 凭证
+        # 尝试从凭证密盒加载已保存的 OKX 凭证 (按最新更新时间优先加载)
         async with get_db_session() as db:
             res = await db.execute(
-                text("SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_valid = 1 LIMIT 1")
+                text("SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_valid = 1 ORDER BY updated_at DESC, id DESC LIMIT 1")
             )
             cred = res.mappings().first()
             if cred:
@@ -102,12 +103,16 @@ async def lifespan(app: FastAPI):
                     is_live = bool(cred["is_live_mode"])
                     rest_client.update_credentials(dec_key, dec_sec, dec_pass, is_live)
                     ws_manager.update_credentials(dec_key, dec_sec, dec_pass)
+                    ws_manager.set_live_mode(is_live)
                     logger.info(f"成功从本地密盒恢复 OKX 凭证 (实盘={is_live}, 脱敏Key={cred['api_key_masked']})")
                 except Exception as dec_err:
                     logger.warning(f"自动解密本地凭证失败 (可能使用了自定义主密码，切换实盘时请输入主密码): {dec_err}")
 
         # 启动 WebSocket 管理器
         await ws_manager.start()
+
+        # 初始化 OKX 全量产品元数据管理与高速缓存服务
+        await instrument_manager.initialize()
 
         # 注册默认标的行情与私有订阅
         await ws_manager.subscribe_market_symbol("BTC-USDT-SWAP")

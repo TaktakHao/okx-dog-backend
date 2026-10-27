@@ -82,7 +82,7 @@ async def process_adopt_ai_trade_plan(
         avail_margin = paper_bal.available_margin_usdt if paper_bal.available_margin_usdt > 0 else paper_bal.total_equity_usdt
         total_equity = paper_bal.total_equity_usdt
 
-    max_lev = risk_controller.rules.max_leverage if (risk_controller and risk_controller.rules) else 20
+    max_lev = risk_controller.get_effective_max_leverage() if risk_controller else 20
     lev_to_use = min(req.leverage or req.suggested_leverage or 3, max_lev)
 
     # 基于当前可用资金允许的最大名义开仓上限 (预留 5% 缓冲防止极端行情保证金不足)
@@ -104,10 +104,13 @@ async def process_adopt_ai_trade_plan(
         # 若传入的名义价值高于当前实盘可用保证金上限或风控上限，自动裁切至安全上限以内
         notional_to_use = min(notional_to_use, max_cap)
 
-    sz_val = max(0.001, math.floor((notional_to_use / entry_px) * 10000) / 10000.0) if entry_px > 0 else 0.01
+    ct_val, _, lot_sz, min_sz = rest_client.get_instrument_spec(req.symbol)
+    min_coin_sz = max(1e-6, ct_val * min_sz) if ("SWAP" in req.symbol or "FUTURES" in req.symbol) else max(1e-6, min_sz)
+
+    sz_val = max(min_coin_sz, math.floor((notional_to_use / entry_px) * 100000) / 100000.0) if entry_px > 0 else min_coin_sz
     # 终验：保证 sz_val * entry_px 严格在安全上限以内
-    if sz_val * entry_px > max_cap:
-        sz_val = max(0.001, math.floor((max_cap / entry_px) * 10000) / 10000.0)
+    if sz_val * entry_px > max_cap and entry_px > 0:
+        sz_val = max(min_coin_sz, math.floor((max_cap / entry_px) * 100000) / 100000.0)
 
     is_mkt = req.order_type == OrderType.MARKET or (isinstance(req.order_type, str) and req.order_type.lower() == "market")
 

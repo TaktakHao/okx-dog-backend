@@ -48,6 +48,9 @@ from vault import vault, CredentialsVault
 from paper_trading import paper_engine, PaperTradingEngine
 from auto_pilot import auto_pilot_manager, AutoPilotManager
 
+# 全局 REST 客户端单例 (默认模拟盘模式，优先初始化避免服务引入产生循环依赖)
+rest_client = OKXRestClient(is_live_mode=False)
+
 from services.data_lake_service import DataLakeService
 from services.backtest_engine import BacktestEngine
 from services.news_service import NewsService
@@ -70,9 +73,6 @@ except (ImportError, PermissionError, Exception):
 
 # 日志记录器
 logger = logging.getLogger("okx_dog.gateway")
-
-# 全局 REST 客户端单例 (默认模拟盘模式)
-rest_client = OKXRestClient(is_live_mode=False)
 
 # v3.0 核心服务单例
 data_lake_service = DataLakeService(rest_client=rest_client)
