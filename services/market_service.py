@@ -155,6 +155,10 @@ async def fetch_full_market_context_snapshot(
     for tf, c_list in zip(timeframes, candles_results):
         if isinstance(c_list, list) and c_list:
             indicators_map[tf] = compute_single_timeframe_indicators(c_list, tf)
+            if tf == "15m" and c_list[-1].close > 0:
+                cur_tk = ws_manager.latest_tickers.get(symbol)
+                if not cur_tk or (now_ms - getattr(cur_tk, "timestamp", 0)) > 10000:
+                    paper_engine.last_price_map[symbol] = c_list[-1].close
         else:
             indicators_map[tf] = compute_single_timeframe_indicators([], tf)
 
@@ -332,6 +336,10 @@ async def get_multi_period_indicators_data(symbol: str) -> MultiPeriodIndicators
     for tf, c_list in zip(timeframes, candles_results):
         if isinstance(c_list, list) and c_list:
             indicators_map[tf] = compute_single_timeframe_indicators(c_list, tf)
+            if tf == "15m" and c_list[-1].close > 0:
+                cur_tk = ws_manager.latest_tickers.get(symbol)
+                if not cur_tk or (now_ms - getattr(cur_tk, "timestamp", 0)) > 10000:
+                    paper_engine.last_price_map[symbol] = c_list[-1].close
         else:
             indicators_map[tf] = compute_single_timeframe_indicators([], tf)
 

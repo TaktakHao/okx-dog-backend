@@ -657,6 +657,11 @@ class SinglePeriodIndicators(BaseModel):
     bb_lower: float = Field(..., description="布林带下轨")
     atr_14: float = Field(..., description="ATR 14 真实波动区间")
 
+    @property
+    def macd_histogram(self) -> float:
+        """兼容 macd_histogram 属性访问"""
+        return self.macd_hist
+
 
 TechnicalIndicatorSet = SinglePeriodIndicators  # 别名兼容
 

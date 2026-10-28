@@ -124,6 +124,10 @@ OKX-Dog 后端是基于 Python 异步架构构建的高并发量化交易与 7x2
     - **高性能二级索引与模糊搜索**：暴露 `GET /api/v1/market/instruments/search`，支持关键词前缀、币种名、全称多维检索，耗时 < 5ms；
     - **长连接动态订阅**：端点 `POST /api/v1/market/subscribe-focus` 支持批量向 WebSocket 建立实时推流，杜绝用户手工输入错误代码。
 
+22. **7x24h 自动操盘多标的巡检容错与实时价格同步修复 (`services/ai_service.py` / `auto_pilot.py` / `services/market_service.py`)**:
+    - 修复 `SinglePeriodIndicators` 的 `macd_hist` / `macd_histogram` 属性兼容，消除巡检循环中的 `AttributeError` 静默跳过问题；
+    - 在多标的自动巡检（`MULTI_SYMBOL`）的持仓盯市与新标的首仓扫描阶段，自动对非主图订阅标的执行 OKX 实时 Ticker / 15m 最新收盘价按需刷新，杜绝回退到静态默认价格导致信号失真。
+
 ## 快速启动与测试
 
 ```bash

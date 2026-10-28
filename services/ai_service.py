@@ -84,7 +84,7 @@ def generate_quantitative_rule_decision(
     rsi_15m = (tf_15m.rsi_14 if tf_15m else 52.0)
     bb_up_15m = (tf_15m.bb_upper if (tf_15m and tf_15m.bb_upper > 0) else current_price * 1.012)
     bb_low_15m = (tf_15m.bb_lower if (tf_15m and tf_15m.bb_lower > 0) else current_price * 0.988)
-    macd_hist_1h = (tf_1h.macd_histogram if (tf_1h and tf_1h.macd_histogram is not None) else 0.0)
+    macd_hist_1h = (tf_1h.macd_hist if (tf_1h and getattr(tf_1h, "macd_hist", None) is not None) else 0.0)
 
     # 波动率挤压与均线纠缠窄幅震荡过滤 (防止震荡市频繁左右挨耳光)
     bb_bandwidth = (bb_up_15m - bb_low_15m) / max(current_price, 1e-6)
@@ -98,8 +98,14 @@ def generate_quantitative_rule_decision(
         is_bullish = False
         is_bearish = False
     elif is_agg:
-        is_bullish = (rsi_15m >= 52.0 and current_price >= ema20_1h and ema20_1h >= ema50_1h * 0.998) or (rsi_1h >= 56.0 and current_price >= ema20_1h)
-        is_bearish = (rsi_15m <= 48.0 and current_price <= ema20_1h and ema20_1h <= ema50_1h * 1.002) or (rsi_1h <= 44.0 and current_price <= ema20_1h)
+        is_bullish = (
+            50.0 <= rsi_15m <= 75.0 and 50.0 <= rsi_1h <= 75.0
+            and ((rsi_15m >= 52.0 and current_price >= ema20_1h and ema20_1h >= ema50_1h * 0.998) or (rsi_1h >= 56.0 and current_price >= ema20_1h))
+        )
+        is_bearish = (
+            25.0 <= rsi_15m <= 50.0 and 25.0 <= rsi_1h <= 50.0
+            and ((rsi_15m <= 48.0 and current_price <= ema20_1h and ema20_1h <= ema50_1h * 1.002) or (rsi_1h <= 44.0 and current_price <= ema20_1h))
+        )
     else:
         is_bullish = (
             (ema20_1h > ema50_1h and current_price >= ema20_1h * 0.998 and 51.0 <= rsi_1h <= 72.0 and macd_hist_1h >= -0.05 * atr_1h)

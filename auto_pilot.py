@@ -1253,8 +1253,18 @@ class AutoPilotManager:
                 pos_id = pos.pos_id or f"{sym}_{pos.pos_side}"
                 entry_px = pos.avg_px
                 cur_tk = ws_manager.latest_tickers.get(sym)
+                if not cur_tk or (now_ms - getattr(cur_tk, "timestamp", 0)) > 8000:
+                    try:
+                        fresh_tk = await rest_client.get_ticker(sym)
+                        if fresh_tk and fresh_tk.last_price > 0:
+                            cur_tk = fresh_tk
+                            ws_manager.latest_tickers[sym] = fresh_tk
+                            if not is_live:
+                                paper_engine.update_market_price(sym, fresh_tk.last_price)
+                    except Exception:
+                        pass
                 if not is_live:
-                    cur_px = paper_engine.last_price_map.get(sym) or (cur_tk.last_price if cur_tk else 0) or pos.mark_px or entry_px
+                    cur_px = (cur_tk.last_price if (cur_tk and cur_tk.last_price > 0) else 0) or paper_engine.last_price_map.get(sym) or pos.mark_px or entry_px
                 else:
                     cur_px = (cur_tk.last_price if (cur_tk and cur_tk.last_price > 0) else 0) or pos.mark_px or entry_px
 
@@ -1763,7 +1773,17 @@ class AutoPilotManager:
                         multi_ind = await get_multi_period_indicators_data(target_symbol)
                         deriv = await get_derivatives_metrics_data(target_symbol)
                         cur_tk = ws_manager.latest_tickers.get(target_symbol)
-                        ref_px = cur_tk.last_price if (cur_tk and cur_tk.last_price > 0) else paper_engine.last_price_map.get(target_symbol, 100.0)
+                        if not cur_tk or (now_ms - getattr(cur_tk, "timestamp", 0)) > 8000:
+                            try:
+                                fresh_tk = await rest_client.get_ticker(target_symbol)
+                                if fresh_tk and fresh_tk.last_price > 0:
+                                    cur_tk = fresh_tk
+                                    ws_manager.latest_tickers[target_symbol] = fresh_tk
+                                    if not is_live:
+                                        paper_engine.last_price_map[target_symbol] = fresh_tk.last_price
+                            except Exception:
+                                pass
+                        ref_px = (cur_tk.last_price if (cur_tk and cur_tk.last_price > 0) else 0.0) or paper_engine.last_price_map.get(target_symbol, 100.0)
 
                         agg_mode = getattr(state, "aggressiveness_mode", "BALANCED").upper()
                         decision = generate_quantitative_rule_decision(
@@ -1775,7 +1795,8 @@ class AutoPilotManager:
                             aggressiveness_mode=agg_mode,
                         )
                     except Exception as eval_err:
-                        logger.debug(f"标的 {target_symbol} 决策推导跳过: {eval_err}")
+                        logger.warning(f"标的 {target_symbol} 决策推导跳过: {eval_err}")
+                        patrol_summaries.append(f"{target_symbol}(指标异常跳过)")
                         continue
 
                     sig = decision.signal
