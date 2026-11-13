@@ -67,15 +67,15 @@ class AutoPilotEnvState:
             "ETH-USDT-SWAP",
             "SOL-USDT-SWAP",
             "XAU-USDT-SWAP",
-            "NVDA-USDT-SWAP",
             "ONDO-USDT-SWAP",
+            "DOGE-USDT-SWAP",
         ]
         self.symbols: List[str] = list(self.focus_symbols)
-        self.focus_mode: str = "SINGLE_SYMBOL"  # SINGLE_SYMBOL | MULTI_SYMBOL_POOL
+        self.focus_mode: str = "MULTI_SYMBOL_POOL"  # SINGLE_SYMBOL | MULTI_SYMBOL_POOL
         self.market_regime: str = "TRENDING_UP"  # TRENDING_UP | TRENDING_DOWN | RANGING | VOLATILE_BREAKOUT
         self.aggressiveness_mode: str = "BALANCED"  # CONSERVATIVE | BALANCED | AGGRESSIVE
-        self.max_scale_layers: int = 3          # 最大加仓层数 (1~5)
-        self.scale_in_strategy: str = "SMART_HYBRID"  # PYRAMIDING | PULLBACK_DCA | SMART_HYBRID
+        self.max_scale_layers: int = 2          # 最大加仓层数 (经自驱进化收敛为最多2层顺势金字塔)
+        self.scale_in_strategy: str = "PYRAMIDING"  # PYRAMIDING | PULLBACK_DCA | SMART_HYBRID
         self.auto_reversal_enabled: bool = True  # 遇到强反向信号是否自动反手
 
         self.max_concurrent_positions: int = 3
@@ -119,6 +119,97 @@ class AutoPilotEnvState:
                 pnl_ratio=0.0,
             )
         )
+        self._restore_from_sqlite_sync()
+
+    def _restore_from_sqlite_sync(self) -> None:
+        """
+        启动时从本地 SQLite 与模拟盘快照无缝恢复最近一次会话、历史曲线与平仓流水，
+        确保后端重启后资金净值、回撤统计与 7x24h 运行状态不重置、不断裂
+        """
+        try:
+            import os
+            import sqlite3
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "okx_dog.db")
+            if not os.path.exists(db_path):
+                return
+
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            live_flag = 1 if self.is_live_mode else 0
+            sess_prefix = "auto_live_%" if self.is_live_mode else "auto_paper_%"
+
+            sess_row = conn.execute(
+                "SELECT session_id, is_running, start_time, stop_time, start_equity, current_equity, symbol, min_confidence "
+                "FROM auto_pilot_sessions WHERE is_live_mode = ? ORDER BY id DESC LIMIT 1",
+                (live_flag,)
+            ).fetchone()
+            if sess_row:
+                self.session_id = str(sess_row["session_id"])
+                self.is_running = bool(sess_row["is_running"])
+                self.start_time = int(sess_row["start_time"] or self.start_time)
+                self.stop_time = int(sess_row["stop_time"]) if sess_row["stop_time"] else None
+                self.start_equity = float(sess_row["start_equity"] or 10000.0)
+                self.current_equity = float(sess_row["current_equity"] or self.start_equity)
+
+            # 恢复平仓流水 (保留全部历史战绩用于胜率与盈亏比统计)
+            t_rows = conn.execute(
+                "SELECT id, order_id, symbol, pos_side, entry_price, exit_price, size, leverage, realized_pnl, roi_pct, reason, timestamp "
+                "FROM auto_pilot_trades WHERE session_id LIKE ? ORDER BY timestamp DESC LIMIT 500",
+                (sess_prefix,)
+            ).fetchall()
+            if t_rows:
+                self.trades = [
+                    AutoPilotTradeRecord(
+                        id=str(tr["order_id"] or f"apt_{tr['id']}"),
+                        symbol=str(tr["symbol"]),
+                        pos_side=str(tr["pos_side"]),
+                        entry_price=float(tr["entry_price"] or 0.0),
+                        exit_price=float(tr["exit_price"] or 0.0),
+                        size=float(tr["size"] or 0.0),
+                        leverage=int(tr["leverage"] or 3),
+                        realized_pnl=float(tr["realized_pnl"] or 0.0),
+                        roi_pct=float(tr["roi_pct"] or 0.0),
+                        reason=str(tr["reason"] or "AI策略自动平仓"),
+                        timestamp=int(tr["timestamp"] or 0),
+                    )
+                    for tr in t_rows
+                ]
+
+            # 恢复最近 2000 个时序净值采样点并重算峰值与最大回撤
+            s_rows = conn.execute(
+                "SELECT timestamp, equity, realized_pnl, unrealized_pnl, total_pnl, pnl_ratio "
+                "FROM auto_pilot_pnl_snapshots WHERE session_id LIKE ? ORDER BY timestamp DESC LIMIT 2000",
+                (sess_prefix,)
+            ).fetchall()
+            if s_rows:
+                restored_snaps = [
+                    AutoPilotHistoryPoint(
+                        timestamp=int(r["timestamp"]),
+                        equity=round(float(r["equity"]), 2),
+                        realized_pnl=round(float(r["realized_pnl"]), 2),
+                        unrealized_pnl=round(float(r["unrealized_pnl"]), 2),
+                        total_pnl=round(float(r["total_pnl"]), 2),
+                        pnl_ratio=round(float(r["pnl_ratio"]), 4),
+                    )
+                    for r in reversed(s_rows)
+                ]
+                self.snapshots = restored_snaps
+                self.current_equity = restored_snaps[-1].equity
+                pk = self.start_equity
+                max_dd = 0.0
+                for pt in restored_snaps:
+                    if pt.equity > pk:
+                        pk = pt.equity
+                    elif pk > 0:
+                        dd = (pk - pt.equity) / pk * 100.0
+                        if dd > max_dd:
+                            max_dd = dd
+                self.peak_equity = pk
+                self.max_drawdown_pct = round(max_dd, 2)
+
+            conn.close()
+        except Exception as e:
+            logger.warning(f"恢复自动操盘历史状态异常: {e}")
 
     def apply_aggressiveness_preset(self, mode: str):
         """应用激进程度预设参数"""
@@ -185,11 +276,13 @@ class AutoPilotManager:
             True: AutoPilotEnvState(is_live_mode=True),
         }
 
-        # 默认模拟盘初始可以处于就绪状态
-        self._states[False].is_running = False
+        # 实盘重启后默认保持安全暂停状态；模拟盘保持数据库持久化的运行状态 (无缝续跑)
         self._states[True].is_running = False
 
-        logger.info("【自动操盘中枢】初始化完成，模拟盘与实盘双环境状态机已建立")
+        logger.info(
+            f"【自动操盘中枢】初始化完成，模拟盘状态(running={self._states[False].is_running}, "
+            f"session={self._states[False].session_id}, eq={self._states[False].current_equity:.2f}U)"
+        )
 
     @property
     def active_state(self) -> AutoPilotEnvState:
@@ -1148,11 +1241,32 @@ class AutoPilotManager:
                 else:
                     base_score += 5.0
 
-            # 3. 规避流动性异常或美股休市代币
-            is_tradfi = any(t in sym.upper() for t in ["NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "SPY", "QQQ"])
+            # 3. 规避流动性异常、达尔文淘汰标的或美股休市代币
+            is_tradfi = any(t in sym.upper() for t in ["NVDA", "AMD", "OPENAI", "SAMSUNG", "TSLA", "AAPL", "MSFT", "AMZN", "SPY", "QQQ"])
             if is_tradfi and datetime.utcnow().weekday() in (5, 6):
                 base_score -= 50.0
                 reasons.append("美股周末休市")
+
+            # 4. 结合自驱进化引擎 (AgentEvolutionManager) 真实历史战绩与达尔文隔离评估
+            try:
+                from okx_dog_ai.agent.evolution.evolution_manager import AgentEvolutionManager
+                evo_params = AgentEvolutionManager.get_instance().get_active_strategy_parameters(sym)
+                if evo_params.get("is_quarantined"):
+                    base_score = 0.0
+                    reasons.append(f"达尔文隔离({evo_params.get('quarantine_reason', '低胜率/高滑点')})")
+                else:
+                    sym_st = evo_params.get("symbol_stats") or {}
+                    if sym_st.get("trades", 0) >= 5:
+                        wr = float(sym_st.get("win_rate", 0.5))
+                        npnl = float(sym_st.get("net_pnl", 0.0))
+                        if npnl > 0 and wr >= 0.45:
+                            base_score += 15.0
+                            reasons.append(f"历史正收益优选({npnl:+.1f}U)")
+                        elif npnl < -30.0:
+                            base_score -= 20.0
+                            reasons.append(f"历史亏损降权({npnl:+.1f}U)")
+            except Exception:
+                pass
 
             final_score = max(0.0, min(100.0, base_score))
             scored_targets.append((sym, round(final_score, 1), "; ".join(reasons) or "中性观望"))
@@ -1329,9 +1443,9 @@ class AutoPilotManager:
                 # 1.2 两阶段阶梯止盈：阶段 1 (未减半状态，平仓 50% 锁定确定性利润 + 移损保本)
                 if state.trailing_stop_enabled and not has_tp_50:
                     drawdown_from_peak = peak_profit - profit_ratio
-                    callback_limit = max(0.004, peak_profit * state.trailing_profit_callback)
-                    is_trailing_hit = (peak_profit >= effective_tp_threshold) and (drawdown_from_peak >= callback_limit or (profit_ratio <= 0.005 and peak_profit >= 0.014))
-                    is_ai_close_hit = (action == SignalAction.CLOSE_POSITION and conf >= 0.75 and profit_ratio >= 0.012)
+                    callback_limit = max(0.005, peak_profit * state.trailing_profit_callback)
+                    is_trailing_hit = (peak_profit >= max(0.015, effective_tp_threshold)) and (drawdown_from_peak >= callback_limit and profit_ratio >= 0.008)
+                    is_ai_close_hit = (action == SignalAction.CLOSE_POSITION and conf >= 0.78 and profit_ratio >= 0.014)
 
                     if is_trailing_hit or is_ai_close_hit:
                         ct_val, _, _, min_sz = rest_client.get_instrument_spec(sym)
@@ -1413,8 +1527,7 @@ class AutoPilotManager:
 
                     is_stage2_ai_exit = (action == SignalAction.CLOSE_POSITION and conf >= 0.80 and profit_ratio >= max(0.024, 2.4 * atr_ratio))
                     is_tail_exit = (
-                        (peak_profit >= 0.018 and drawdown_from_peak >= wave_dd_limit)
-                        or (profit_ratio <= 0.0020)
+                        (peak_profit >= 0.022 and drawdown_from_peak >= wave_dd_limit and profit_ratio >= 0.010)
                         or tp2_hit
                         or is_stage2_ai_exit
                     )
@@ -1472,11 +1585,20 @@ class AutoPilotManager:
 
                 cur_layers = getattr(pos, "scale_layers", None) or state.position_scale_records.get(sym, 1)
 
-                # 1.5 强反向信号 -> 趋势反转平反开 (Directional Reversal，增加 10 分钟持仓保护期与 0.82 置信度门槛防震荡磨损)
+                # 提取自驱进化策略参数 (限制反向平反开频率、禁止浮亏死扛补仓、限制最大加仓层数)
+                evo_pos_params: Dict[str, Any] = {}
+                try:
+                    from okx_dog_ai.agent.evolution.evolution_manager import AgentEvolutionManager
+                    evo_pos_params = AgentEvolutionManager.get_instance().get_active_strategy_parameters(sym)
+                except Exception:
+                    pass
+
+                # 1.5 强反向信号 -> 趋势反转平反开 (Directional Reversal，30 分钟持仓保护期 + 0.86 高置信度门槛，且盈利单严禁直接反手)
                 last_entry_or_scale_ts = state.last_scale_timestamps.get(sym, 0)
                 holding_elapsed_ms = now_ms - last_entry_or_scale_ts
+                rev_min_conf = max(0.86, float(evo_pos_params.get("reversal_min_confidence", 0.86)))
                 is_opposite_signal = (is_long and action == SignalAction.SELL_SHORT) or ((not is_long) and action == SignalAction.BUY_LONG)
-                if state.auto_reversal_enabled and is_opposite_signal and conf >= 0.82 and plan and holding_elapsed_ms >= 600000:
+                if state.auto_reversal_enabled and is_opposite_signal and conf >= rev_min_conf and plan and holding_elapsed_ms >= 1800000 and profit_ratio <= -0.003:
                     try:
                         logger.info(f"🔄 【趋势反转触发】{sym} 当前持仓 {pos.pos_side.value} 遭遇强反向信号 ({action.value}, 置信度:{conf*100:.0f}%)，执行平仓并反手！")
                         if is_live:
@@ -1541,25 +1663,27 @@ class AutoPilotManager:
                     except Exception as rev_err:
                         logger.warning(f"反手开仓执行异常 {sym}: {rev_err}")
 
-                # 1.6 核心情景 C: 同向高置信度信号 -> 智能阶梯加仓 (Pyramiding / Pullback Scale-In)
-                # 严格约束：若当前已从最高点回撤超过 0.5%，说明行情见顶滞涨，禁止盲目加仓拉高均价！
+                # 1.6 核心情景 C: 同向高置信度信号 -> 智能顺势金字塔加仓 (Pyramiding Scale-In)
+                # 严格约束：若当前已从最高点回撤超过 0.5% 或受自驱进化层数限制，禁止盲目加仓拉高均价！
                 drawdown_from_peak = peak_profit - profit_ratio
                 is_same_direction = (is_long and action == SignalAction.BUY_LONG) or ((not is_long) and action == SignalAction.SELL_SHORT)
-                if is_same_direction and conf >= state.min_confidence and cur_layers < state.max_scale_layers and plan and drawdown_from_peak < 0.005:
+                eff_max_scale_layers = min(state.max_scale_layers, int(evo_pos_params.get("max_scale_layers", 2)))
+                disable_dca = bool(evo_pos_params.get("disable_pullback_dca", True))
+                if is_same_direction and conf >= max(state.min_confidence, 0.78) and cur_layers < eff_max_scale_layers and plan and drawdown_from_peak < 0.004:
                     last_scale_ts = state.last_scale_timestamps.get(sym, 0)
-                    min_interval = getattr(self, "min_scale_interval_ms", getattr(state, "min_scale_interval_ms", 30000))
-                    # 防频繁加仓间隔
+                    min_interval = getattr(self, "min_scale_interval_ms", getattr(state, "min_scale_interval_ms", 900000))
+                    # 防频繁加仓间隔 (至少间隔 15 分钟 = 1 根完整 15m K 线确认)
                     if (now_ms - last_scale_ts) >= min_interval:
                         should_scale = False
                         scale_reason = ""
 
                         # 判定加仓类型：
-                        # (1) 顺势金字塔加仓: 浮盈超 1.0% 且趋势延续
-                        if profit_ratio >= 0.01 and state.scale_in_strategy in ("PYRAMIDING", "SMART_HYBRID"):
+                        # (1) 顺势金字塔加仓: 浮盈超 1.2% 且趋势延续
+                        if profit_ratio >= 0.012 and state.scale_in_strategy in ("PYRAMIDING", "SMART_HYBRID"):
                             should_scale = True
                             scale_reason = f"顺势金字塔加仓 (浮盈 +{profit_ratio*100:.1f}%)"
-                        # (2) 回调均摊加仓: 浮亏在 -0.5% ~ -2.5% (未触及止损) 且遇到支撑
-                        elif -0.025 <= profit_ratio <= -0.005 and state.scale_in_strategy in ("PULLBACK_DCA", "SMART_HYBRID"):
+                        # (2) 回调均摊加仓: 仅当进化引擎未禁用 PULLBACK_DCA 时才允许
+                        elif (not disable_dca) and -0.020 <= profit_ratio <= -0.008 and state.scale_in_strategy == "PULLBACK_DCA":
                             should_scale = True
                             scale_reason = f"回调支撑均摊加仓 (回撤 {profit_ratio*100:.1f}%)"
 
@@ -1573,7 +1697,7 @@ class AutoPilotManager:
                                     initial_price=cur_px,
                                     leverage=float(pos.leverage or 3),
                                     initial_margin=max(10.0, float(pos.margin or 50.0)),
-                                    dca_margin_base=max(10.0, avail_funds * 0.02),
+                                    dca_margin_base=max(10.0, avail_funds * 0.01),
                                     max_dca_orders=2,
                                     price_deviation_percent=1.2,
                                     extra_margin=0.0
@@ -1595,21 +1719,29 @@ class AutoPilotManager:
                             try:
                                 eff_max_lev = risk_controller.get_effective_max_leverage() if risk_controller else 5
                                 lev = min(plan.suggested_leverage or 3, eff_max_lev)
-                                risk_budget = max(5.0, avail_funds * 0.016)
-                                sl_px = plan.stop_loss_price or (cur_px * 0.985 if is_long else cur_px * 1.015)
-                                stop_dist = max(abs(cur_px - sl_px), cur_px * 0.008)
-                                raw_coins = risk_budget / stop_dist
-                                raw_notional = raw_coins * cur_px
-                                max_order_cap = min(
-                                    risk_controller.rules.max_order_usdt if risk_controller.rules else 5000.0,
-                                    avail_funds * lev * 0.80
+                                # 统一通过 PositionSizer 计算递减式金字塔加仓头寸 (单次风险预算不超过总权益 0.6%)
+                                scale_size_res = position_sizer.calculate_adaptive_size(
+                                    symbol=sym,
+                                    equity=cur_eq,
+                                    entry_price=cur_px,
+                                    is_short=not is_long,
+                                    stop_loss_price=plan.stop_loss_price,
+                                    atr=atr_15m if atr_15m > 0 else cur_px * 0.01,
+                                    atr_multiplier=1.8,
+                                    risk_pct=0.006,
+                                    max_leverage=lev,
+                                    max_order_usdt=min(pos.notional_usd or 1500.0, risk_controller.rules.max_order_usdt if risk_controller.rules else 2000.0),
+                                    available_margin=avail_funds,
                                 )
-                                final_notional = min(raw_notional, max_order_cap)
-                                ct_val, _, _, min_sz = rest_client.get_instrument_spec(sym)
-                                min_coin_sz = max(0.0001, ct_val * min_sz)
-                                calc_coins = max(min_coin_sz, math.floor((final_notional / cur_px) * 10000) / 10000.0)
+                                calc_coins = min(scale_size_res.calculated_size, round(pos.pos * 0.6, 4) if pos.pos > 0.01 else scale_size_res.calculated_size)
 
-                                new_sl_px = max(entry_px, cur_px * 0.99) if is_long else min(entry_px, cur_px * 1.01)
+                                # 修正加仓后止损价：基于加权新均价下方/上方合理 ATR 缓冲，严禁将止损设在现价反方向导致秒平
+                                est_new_avg = ((entry_px * pos.pos) + (cur_px * calc_coins)) / max(pos.pos + calc_coins, 1e-6)
+                                if profit_ratio >= 0.012:
+                                    # 顺势浮盈加仓：将止损保护在新均价微幅保本线或现价 1.0% 防守位
+                                    new_sl_px = round(min(cur_px * 0.990, max(entry_px, est_new_avg * 0.995)), 2 if cur_px > 10 else 4) if is_long else round(max(cur_px * 1.010, min(entry_px, est_new_avg * 1.005)), 2 if cur_px > 10 else 4)
+                                else:
+                                    new_sl_px = scale_size_res.stop_loss_price
                                 tp_target = plan.take_profit_levels[-1].price if (plan and plan.take_profit_levels) else None
                                 if pos.tp_trigger_price and pos.tp_trigger_price > 0:
                                     if is_long:
@@ -1761,12 +1893,21 @@ class AutoPilotManager:
                         patrol_summaries.append(f"{target_symbol}(可用保证金不足)")
                         continue
 
-                    # 交易时段检查：美股代币周末休市过滤
-                    is_tradfi_equity = any(t in target_symbol.upper() for t in ["NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "SPY", "QQQ"])
+                    # 交易时段检查与自驱进化达尔文隔离检查
+                    is_tradfi_equity = any(t in target_symbol.upper() for t in ["NVDA", "AMD", "OPENAI", "SAMSUNG", "TSLA", "AAPL", "MSFT", "AMZN", "SPY", "QQQ"])
                     now_dt = datetime.utcnow()
                     if is_tradfi_equity and now_dt.weekday() in (5, 6):
                         patrol_summaries.append(f"{target_symbol}(美股周末休市)")
                         continue
+
+                    try:
+                        from okx_dog_ai.agent.evolution.evolution_manager import AgentEvolutionManager
+                        evo_entry_params = AgentEvolutionManager.get_instance().get_active_strategy_parameters(target_symbol)
+                        if evo_entry_params.get("is_quarantined"):
+                            patrol_summaries.append(f"{target_symbol}(达尔文风控隔离)")
+                            continue
+                    except Exception:
+                        pass
 
                     # 提取多周期指标与衍生品情绪
                     try:
@@ -1784,6 +1925,13 @@ class AutoPilotManager:
                             except Exception:
                                 pass
                         ref_px = (cur_tk.last_price if (cur_tk and cur_tk.last_price > 0) else 0.0) or paper_engine.last_price_map.get(target_symbol, 100.0)
+
+                        # 流动性与盘口点差硬拦截：买一卖一点差 > 0.25% 时严禁建仓
+                        if cur_tk and getattr(cur_tk, "ask_px", 0) and getattr(cur_tk, "bid_px", 0) and ref_px > 0:
+                            spread_ratio = (float(cur_tk.ask_px) - float(cur_tk.bid_px)) / ref_px
+                            if spread_ratio > 0.0025:
+                                patrol_summaries.append(f"{target_symbol}(盘口点差过大{spread_ratio*100:.2f}%跳过)")
+                                continue
 
                         agg_mode = getattr(state, "aggressiveness_mode", "BALANCED").upper()
                         decision = generate_quantitative_rule_decision(

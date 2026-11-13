@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+import json
 import logging
+import os
+import sqlite3
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -74,8 +77,105 @@ class PaperTradingEngine:
 
 
         self.trade_closed_callbacks = []
+        self._state_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "paper_runtime_state.json")
+        self.load_runtime_state()
 
-        logger.info(f"【模拟操盘沙盒】引擎初始化完成，初始虚拟资金: {self.initial_equity:.2f} USDT")
+        logger.info(
+            f"【模拟操盘沙盒】引擎初始化完成，初始虚拟资金: {self.initial_equity:.2f} USDT, "
+            f"当前可用现金: {self.cash:.2f} USDT, 活跃持仓数: {len(self.positions)}"
+        )
+
+    def save_runtime_state(self) -> None:
+        """将当前模拟盘现金、持仓与今日起始权益持久化至本地 JSON，防止服务重启导致净值重置"""
+        try:
+            os.makedirs(os.path.dirname(self._state_file_path), exist_ok=True)
+            bal = self.get_account_balance()
+            payload = {
+                "saved_at": int(time.time() * 1000),
+                "initial_equity": self.initial_equity,
+                "cash": round(self.cash, 4),
+                "today_start_equity": self.today_start_equity,
+                "balance": bal.model_dump() if hasattr(bal, "model_dump") else bal.dict(),
+                "positions": [
+                    p.model_dump() if hasattr(p, "model_dump") else p.dict()
+                    for p in self.positions.values()
+                ],
+                "last_price_map": self.last_price_map,
+            }
+            tmp_path = self._state_file_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._state_file_path)
+        except Exception as e:
+            logger.warning(f"保存模拟盘运行时状态异常: {e}")
+
+    def load_runtime_state(self) -> None:
+        """启动时自动恢复模拟盘资金、持仓及历史成交记录，保证净值曲线无缝衔接"""
+        try:
+            # 1. 从 SQLite 恢复历史已平仓记录以保证胜率与累计已实现盈亏连续
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "okx_dog.db")
+            if os.path.exists(db_path):
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT symbol, pos_side, entry_price, exit_price, size, leverage, realized_pnl, roi_pct, reason, timestamp "
+                    "FROM auto_pilot_trades ORDER BY id ASC"
+                ).fetchall()
+                conn.close()
+                if rows:
+                    self.closed_trades = [
+                        {
+                            "symbol": r["symbol"],
+                            "pos_side": r["pos_side"],
+                            "entry_price": float(r["entry_price"] or 0.0),
+                            "exit_price": float(r["exit_price"] or 0.0),
+                            "size": float(r["size"] or 0.0),
+                            "leverage": int(r["leverage"] or 3),
+                            "realized_pnl": float(r["realized_pnl"] or 0.0),
+                            "fee": 0.0,
+                            "roi_pct": float(r["roi_pct"] or 0.0),
+                            "reason": str(r["reason"] or ""),
+                            "timestamp": int(r["timestamp"] or 0),
+                        }
+                        for r in rows
+                    ]
+
+            # 2. 从 paper_runtime_state.json 恢复实时现金与持仓
+            if os.path.exists(self._state_file_path):
+                with open(self._state_file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.initial_equity = float(data.get("initial_equity", self.initial_equity))
+                if "cash" in data:
+                    self.cash = float(data["cash"])
+                elif isinstance(data.get("balance"), dict) and "available_margin_usdt" in data["balance"]:
+                    self.cash = float(data["balance"]["available_margin_usdt"])
+                self.today_start_equity = float(data.get("today_start_equity", self.initial_equity))
+
+                if isinstance(data.get("last_price_map"), dict):
+                    for k, v in data["last_price_map"].items():
+                        if v and float(v) > 0:
+                            self.last_price_map[k] = float(v)
+
+                pos_list = data.get("positions", [])
+                if isinstance(pos_list, list):
+                    self.positions.clear()
+                    for p_dict in pos_list:
+                        try:
+                            pos_obj = PositionModel(**p_dict)
+                            if pos_obj.pos > 0:
+                                side_str = pos_obj.pos_side.value if hasattr(pos_obj.pos_side, "value") else str(pos_obj.pos_side)
+                                pos_key = f"{pos_obj.symbol}:{side_str}"
+                                self.positions[pos_key] = pos_obj
+                                if pos_obj.mark_px and pos_obj.mark_px > 0:
+                                    self.last_price_map[pos_obj.symbol] = float(pos_obj.mark_px)
+                        except Exception as pe:
+                            logger.warning(f"恢复单笔模拟持仓失败: {pe}")
+                logger.info(
+                    f"【模拟操盘沙盒】已从持久化状态恢复: cash={self.cash:.2f} USDT, "
+                    f"持仓={len(self.positions)} 笔, 历史成交={len(self.closed_trades)} 笔"
+                )
+        except Exception as e:
+            logger.warning(f"恢复模拟盘运行时状态异常: {e}")
 
     def register_trade_closed_callback(self, cb):
         """注册平仓事件监听回调"""
@@ -89,6 +189,7 @@ class PaperTradingEngine:
         self.positions.clear()
         self.orders.clear()
         self.closed_trades.clear()
+        self.save_runtime_state()
         logger.info(f"【模拟操盘沙盒】账户已成功重置，新初始本金: {initial_equity:.2f} USDT")
         return self.get_account_info()
 
@@ -181,7 +282,7 @@ class PaperTradingEngine:
                         triggered_events.append(close_res)
                         continue
 
-            # 2. 检查止损 (Stop Loss) 触发 (包含移动保本触发)
+            # 2. 检查止损 (Stop Loss) 触发 (包含移动保本触发与测试网单 Tick 闪崩断层保护)
             if pos.sl_trigger_price and pos.sl_trigger_price > 0:
                 is_sl_hit = False
                 if is_long and price <= pos.sl_trigger_price:
@@ -190,7 +291,26 @@ class PaperTradingEngine:
                     is_sl_hit = True
 
                 if is_sl_hit:
-                    is_be = getattr(pos, "is_breakeven_locked", False)
+                    # 严格校验当前止损位是否真正处于保本/浮盈区间，防止加仓或止损下调后误标为保本
+                    true_be = (
+                        (is_long and pos.sl_trigger_price >= pos.avg_px * 0.999)
+                        or ((not is_long) and pos.sl_trigger_price <= pos.avg_px * 1.001)
+                    )
+                    is_be = bool(getattr(pos, "is_breakeven_locked", False) and true_be)
+
+                    # 防御 OKX 模拟盘低流动性合约单 Tick 20% 假插针断层：若单次跳空偏离止损触发价超过 2.5%，按止损价 + 0.15% 真实滑点结算
+                    gap_ratio = abs(price - pos.sl_trigger_price) / max(pos.sl_trigger_price, 1e-6)
+                    exec_close_px = price
+                    if gap_ratio > 0.025:
+                        exec_close_px = round(
+                            pos.sl_trigger_price * (0.9985 if is_long else 1.0015),
+                            2 if pos.avg_px > 10 else 4
+                        )
+                        logger.warning(
+                            f"🛡️【防假插针断层保护】{symbol} 止损触发时出现异常单Tick跳空 ({gap_ratio*100:.2f}%: "
+                            f"SL=${pos.sl_trigger_price} vs Tick=${price})，按含滑点保护价 ${exec_close_px} 撮合平仓"
+                        )
+
                     reason_str = (
                         f"触及移动保本价 ${pos.sl_trigger_price:.1f} (保本平仓)"
                         if is_be else
@@ -200,7 +320,7 @@ class PaperTradingEngine:
                     close_res = self.close_position(
                         symbol=symbol,
                         pos_side=pos.pos_side,
-                        price=price,
+                        price=exec_close_px,
                         reason=reason_str
                     )
                     triggered_events.append(close_res)
@@ -324,6 +444,15 @@ class PaperTradingEngine:
                 old_pos.tp_trigger_price = sanitized_tp
             if sanitized_sl:
                 old_pos.sl_trigger_price = sanitized_sl
+            # 加仓后重新校验当前止损位是否仍满足保本条件，若新均价已劣于止损线则解除保本锁定标记
+            if old_pos.sl_trigger_price and old_pos.sl_trigger_price > 0:
+                is_long_pos = (final_pos_side == PosSide.LONG)
+                old_pos.is_breakeven_locked = (
+                    (is_long_pos and old_pos.sl_trigger_price >= new_avg_px * 0.999)
+                    or ((not is_long_pos) and old_pos.sl_trigger_price <= new_avg_px * 1.001)
+                )
+            else:
+                old_pos.is_breakeven_locked = False
             old_pos.liq_px = None if is_spot_order else self._calculate_liq_price(new_avg_px, final_leverage, final_pos_side)
             old_pos.liquidation_price = old_pos.liq_px
         else:
@@ -364,8 +493,9 @@ class PaperTradingEngine:
             self.positions[pos_key] = new_pos
 
 
+        self.save_runtime_state()
         logger.info(
-            f"【模拟操盘】订单成交: {side.value} {size} BTC @ ${exec_price:.1f}, "
+            f"【模拟操盘】订单成交: {side.value} {size} {symbol} @ ${exec_price:.1f}, "
             f"杠杆 {leverage}x, 占用保证金 {required_margin:.2f} USDT"
         )
         return order_model
@@ -504,6 +634,7 @@ class PaperTradingEngine:
                 f"实现盈亏: {'+' if pnl >= 0 else ''}{pnl:.2f} USDT, 原因: {reason}"
             )
 
+        self.save_runtime_state()
         return {
             "success": True,
             "closed_count": len(targets),
@@ -551,8 +682,14 @@ class PaperTradingEngine:
                 if is_breakeven_locked is not None:
                     pos.is_breakeven_locked = is_breakeven_locked
                 elif stop_loss_price is not None:
-                    pos.is_breakeven_locked = True
+                    is_long_p = (pos.pos_side == PosSide.LONG)
+                    pos.is_breakeven_locked = (
+                        (is_long_p and stop_loss_price >= pos.avg_px * 0.999)
+                        or ((not is_long_p) and stop_loss_price <= pos.avg_px * 1.001)
+                    )
                 updated = True
+        if updated:
+            self.save_runtime_state()
         return updated
 
     def get_positions(self, inst_type: Optional[str] = None) -> List[PositionModel]:

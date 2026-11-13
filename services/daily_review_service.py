@@ -81,14 +81,28 @@ class DailyReviewService:
             if ai_dir not in sys.path:
                 sys.path.append(ai_dir)
             from daily_review_ai import DailyReviewAIEngine
+            from agent.evolution.evolution_manager import AgentEvolutionManager
 
             ai_prompt = DailyReviewAIEngine.build_review_prompt(target_date, stats, trades)
-            # 生产环境有 LLM 时调用 LLM，无 LLM 或离线时执行高保真规则模板生成
+            # 结合团队进化引擎执行数据驱动的深度归因诊断与战法提炼
+            evo_mgr = AgentEvolutionManager.get_instance()
+            diag_report = await evo_mgr.diagnose_and_evolve_team(recent_trades=trades)
             ai_parsed = DailyReviewAIEngine.parse_review_response("", stats)
-            summary_md = ai_parsed["summary_markdown"]
-            lessons = ai_parsed["lessons_learned"]
-            adjustments = ai_parsed["strategy_adjustments"]
+            summary_md = (
+                ai_parsed["summary_markdown"]
+                + f"\n\n### 🧬 自驱进化中枢诊断摘要 ({evo_mgr.active_epoch})\n"
+                + f"- **全局归因**: {diag_report.team_overall_summary}\n"
+                + f"- **市场体制**: `{diag_report.market_regime_detected}`\n"
+            )
+            evolved_lessons = []
+            for rd in diag_report.role_diagnoses:
+                for rl in rd.suggested_learned_rules:
+                    if rl and rl not in evolved_lessons:
+                        evolved_lessons.append(rl)
+            lessons = evolved_lessons[:5] if evolved_lessons else ai_parsed["lessons_learned"]
+            adjustments = dict(evo_mgr.active_tuning_params)
         except Exception as e:
+            logger.warning(f"复盘联动进化引擎回退: {e}")
             summary_md = f"# 每日量化复盘 ({target_date})\n- 盈亏: {realized_pnl} USDT\n- 胜率: {win_rate*100:.1f}%"
             lessons = ["在资金费率过热时严禁追多", "浮盈达到目标比例时及时移动保本"]
             adjustments = {"max_leverage": 3}

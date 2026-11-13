@@ -128,6 +128,11 @@ OKX-Dog 后端是基于 Python 异步架构构建的高并发量化交易与 7x2
     - 修复 `SinglePeriodIndicators` 的 `macd_hist` / `macd_histogram` 属性兼容，消除巡检循环中的 `AttributeError` 静默跳过问题；
     - 在多标的自动巡检（`MULTI_SYMBOL`）的持仓盯市与新标的首仓扫描阶段，自动对非主图订阅标的执行 OKX 实时 Ticker / 15m 最新收盘价按需刷新，杜绝回退到静态默认价格导致信号失真。
 
+23. **模拟盘状态无缝持久化、防假插针止损保护与自驱进化决策闭环 (`paper_trading.py` / `auto_pilot.py` / `services/ai_service.py`)**:
+    - **模拟盘与自动操盘状态跨重启无缝续跑 (`paper_runtime_state.json` & `_restore_from_sqlite_sync`)**：自动持久化并恢复模拟盘可用现金、活跃持仓、历史成交流水及 `auto_pilot_sessions` 收益曲线，服务重启不重置净值；
+    - **测试网单 Tick 断层滑点保护与真实保本校验**：在 `paper_trading.py` 中对单 Tick 跳空超过 $2.5\%$ 的异常插针实施止损滑点上限保护，并严格校验 `is_breakeven_locked` 与加仓后新均价的数学关系；
+    - **达尔文标的隔离、盘口点差硬拦截与顺势金字塔加仓修正**：接入 `AgentEvolutionManager.get_active_strategy_parameters()`，自动屏蔽低流动性合成合约与盘口点差 $>0.25\%$ 的毒性标的，禁用浮亏死扛补仓 (`PULLBACK_DCA`)，统一由 `PositionSizer` 控制顺势金字塔加仓头寸并修正加仓止损方向与反转冷静期。
+
 ## 快速启动与测试
 
 ```bash

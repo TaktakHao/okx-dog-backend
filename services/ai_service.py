@@ -93,28 +93,93 @@ def generate_quantitative_rule_decision(
     is_choppy_tangled = (ema_spread_1h < 0.0020 and 44.0 <= rsi_1h <= 56.0)
     is_squeezed = False if is_agg else ((bb_bandwidth < 0.015) or (atr_15m / max(current_price, 1e-6) < 0.0035) or is_choppy_tangled)
 
-    # 判定多空趋势与多周期共振状态 (要求 1h 均线结构、价格位置与动能协同)
-    if is_squeezed:
+    # ===== 接入自驱进化引擎 (AgentEvolutionManager & SoftmaxGatingNetwork) =====
+    evo_params: dict[str, Any] = {}
+    evo_mgr = None
+    try:
+        from okx_dog_ai.agent.evolution.evolution_manager import AgentEvolutionManager
+        evo_mgr = AgentEvolutionManager.get_instance()
+        evo_params = evo_mgr.get_active_strategy_parameters(symbol)
+    except Exception as e:
+        logger.debug(f"加载自驱进化策略参数跳过: {e}")
+
+    rsi_ceiling = float(evo_params.get("rsi_ceiling", 68.0))
+    rsi_floor = float(evo_params.get("rsi_floor", 32.0))
+    min_rr_ratio = float(evo_params.get("min_rr_ratio", 1.55))
+    sl_atr_mult = float(evo_params.get("sl_atr_multiplier", 1.35))
+    tp1_atr_mult = float(evo_params.get("tp1_atr_multiplier", 2.0))
+    tp2_atr_mult = float(evo_params.get("tp2_atr_multiplier", 3.4))
+    is_quarantined = bool(evo_params.get("is_quarantined", False))
+    quarantine_reason = str(evo_params.get("quarantine_reason", ""))
+    active_epoch = str(evo_params.get("active_epoch", "epoch_v1.0"))
+    gating_weights: dict[str, float] = evo_params.get("gating_weights", {}) or {}
+    learned_rules: list[str] = evo_params.get("learned_rules", []) or []
+
+    # 计算 6 位 AI 员工实时立场并缓存至进化中枢（供平仓时精准归因奖惩，彻底消除事后伪造立场）
+    bull_w = float(gating_weights.get("bull_specialist", 16.67)) / 100.0
+    bear_w = float(gating_weights.get("bear_critic", 16.67)) / 100.0
+    macro_w = float(gating_weights.get("macro_news", 16.67)) / 100.0
+    onchain_w = float(gating_weights.get("onchain_analyst", 16.67)) / 100.0
+    sniper_w = float(gating_weights.get("micro_sniper", 16.67)) / 100.0
+    arbiter_w = float(gating_weights.get("chief_arbiter", 16.67)) / 100.0
+
+    bull_stance = "BULLISH" if (ema20_1h >= ema50_1h and 50.0 <= rsi_1h <= rsi_ceiling) else ("BEARISH" if rsi_1h > 74.0 else "NEUTRAL")
+    bear_stance = "BEARISH" if (ema20_1h < ema50_1h and rsi_floor <= rsi_1h <= 50.0) else ("BEARISH" if (rsi_15m > rsi_ceiling or rsi_1h > rsi_ceiling or is_quarantined) else "NEUTRAL")
+    fr_val = derivatives.funding_rate if derivatives else 0.0
+    ls_val = (derivatives.long_short_ratio if (derivatives and derivatives.long_short_ratio) else 1.0)
+    onchain_stance = "BEARISH" if (fr_val > 0.0005 or ls_val > 2.2) else ("BULLISH" if (fr_val < -0.0003 or (0.8 <= ls_val <= 1.5 and ema20_1h > ema50_1h)) else "NEUTRAL")
+    sniper_stance = "BULLISH" if (current_price >= ema20_1h and rsi_15m <= rsi_ceiling and macd_hist_1h >= 0) else ("BEARISH" if (current_price < ema20_1h and rsi_15m >= rsi_floor and macd_hist_1h < 0) else "NEUTRAL")
+    macro_stance = "BULLISH" if ema20_4h >= ema50_4h else "BEARISH"
+
+    def _stance_val(st: str) -> float:
+        return 1.0 if st == "BULLISH" else (-1.0 if st == "BEARISH" else 0.0)
+
+    weighted_consensus = (
+        bull_w * _stance_val(bull_stance)
+        + bear_w * _stance_val(bear_stance)
+        + macro_w * _stance_val(macro_stance)
+        + onchain_w * _stance_val(onchain_stance)
+        + sniper_w * _stance_val(sniper_stance)
+    )
+    arbiter_stance = "BULLISH" if weighted_consensus >= 0.15 else ("BEARISH" if weighted_consensus <= -0.15 else "NEUTRAL")
+
+    if evo_mgr is not None:
+        evo_mgr.record_symbol_opinions(symbol, {
+            "bull_specialist": {"role_name": "冲锋多头分析师", "stance": bull_stance, "confidence": round(0.65 + abs(rsi_1h - 50.0) * 0.006, 2)},
+            "bear_critic": {"role_name": "铁血风控挑刺官", "stance": bear_stance, "confidence": round(0.75 if bear_stance == "BEARISH" else 0.55, 2)},
+            "macro_news": {"role_name": "全球资讯情报员", "stance": macro_stance, "confidence": 0.70},
+            "onchain_analyst": {"role_name": "链上主力侦察员", "stance": onchain_stance, "confidence": 0.72},
+            "micro_sniper": {"role_name": "微观盘口狙击手", "stance": sniper_stance, "confidence": 0.76},
+            "chief_arbiter": {"role_name": "首席风控仲裁官", "stance": arbiter_stance, "confidence": round(min(0.92, 0.65 + abs(weighted_consensus) * 0.3), 2)},
+        })
+
+    # 判定多空趋势与多周期共振状态 (受自驱进化 RSI 阈值与达尔文隔离保护约束)
+    if is_quarantined and not (position and getattr(position, "pos", 0) > 0):
+        is_bullish = False
+        is_bearish = False
+    elif is_squeezed:
         is_bullish = False
         is_bearish = False
     elif is_agg:
         is_bullish = (
-            50.0 <= rsi_15m <= 75.0 and 50.0 <= rsi_1h <= 75.0
+            50.0 <= rsi_15m <= rsi_ceiling and 50.0 <= rsi_1h <= rsi_ceiling
             and ((rsi_15m >= 52.0 and current_price >= ema20_1h and ema20_1h >= ema50_1h * 0.998) or (rsi_1h >= 56.0 and current_price >= ema20_1h))
+            and weighted_consensus > -0.05
         )
         is_bearish = (
-            25.0 <= rsi_15m <= 50.0 and 25.0 <= rsi_1h <= 50.0
+            rsi_floor <= rsi_15m <= 50.0 and rsi_floor <= rsi_1h <= 50.0
             and ((rsi_15m <= 48.0 and current_price <= ema20_1h and ema20_1h <= ema50_1h * 1.002) or (rsi_1h <= 44.0 and current_price <= ema20_1h))
+            and weighted_consensus < 0.05
         )
     else:
         is_bullish = (
-            (ema20_1h > ema50_1h and current_price >= ema20_1h * 0.998 and 51.0 <= rsi_1h <= 72.0 and macd_hist_1h >= -0.05 * atr_1h)
-            or (rsi_1h >= 58.0 and ema20_4h >= ema50_4h and current_price >= ema20_1h)
-        )
+            (ema20_1h > ema50_1h and current_price >= ema20_1h * 0.998 and 51.0 <= rsi_1h <= rsi_ceiling and macd_hist_1h >= -0.05 * atr_1h)
+            or (58.0 <= rsi_1h <= rsi_ceiling and ema20_4h >= ema50_4h and current_price >= ema20_1h)
+        ) and (rsi_15m <= rsi_ceiling + 2.0) and (weighted_consensus >= 0.05)
         is_bearish = (
-            (ema20_1h < ema50_1h and current_price <= ema20_1h * 1.002 and 28.0 <= rsi_1h <= 48.0 and macd_hist_1h <= 0.05 * atr_1h)
-            or (rsi_1h <= 40.0 and ema20_4h < ema50_4h and current_price <= ema20_1h)
-        )
+            (ema20_1h < ema50_1h and current_price <= ema20_1h * 1.002 and rsi_floor <= rsi_1h <= 48.0 and macd_hist_1h <= 0.05 * atr_1h)
+            or (rsi_floor <= rsi_1h <= 40.0 and ema20_4h < ema50_4h and current_price <= ema20_1h)
+        ) and (rsi_15m >= rsi_floor - 2.0) and (weighted_consensus <= -0.05)
 
     # 持仓感知 (Position-Aware) 两阶段动态离场研判：
     # 严格区分阶段1 (未减半，浮盈门槛 ≥ max(1.2%, 1.3*ATR)) 与阶段2 (已减半长尾波段，浮盈门槛 ≥ max(2.5%, 2.5*ATR))，杜绝 0.6% 蚊子肉秒平死循环！
@@ -261,7 +326,8 @@ def generate_quantitative_rule_decision(
         action = SignalAction.BUY_LONG
         rsi_bonus = min(0.08, max(0.0, (rsi_1h - 50.0) * 0.005))
         fr_bonus = 0.04 if (derivatives and derivatives.funding_rate >= 0) else 0.0
-        confidence = round(min(0.92, 0.76 + rsi_bonus + fr_bonus), 2)
+        consensus_bonus = min(0.08, max(-0.08, weighted_consensus * 0.12))
+        confidence = round(min(0.92, max(0.65, 0.76 + rsi_bonus + fr_bonus + consensus_bonus)), 2)
         urgency = SignalUrgency.MEDIUM
 
         support_1 = round(min(ema20_1h, current_price - 1.2 * atr_1h), prec)
@@ -271,11 +337,11 @@ def generate_quantitative_rule_decision(
 
         entry_low = round(max(support_1, current_price * 0.995), prec)
         entry_high = round(current_price * 1.002, prec)
-        stop_loss = round(current_price - 1.35 * atr_1h, prec)
+        stop_loss = round(current_price - sl_atr_mult * atr_1h, prec)
         
-        # 正期望值阶梯止盈：TP1 基于 2.0倍 ATR (净盈亏比 >= 1.5:1)，TP2 基于 3.4倍 ATR 博取长尾波段
-        tp_1 = round(max(entry_high * 1.014, entry_high + 2.0 * atr_1h), prec)
-        tp_2 = round(max(resistance_2, entry_high + 3.4 * atr_1h), prec)
+        # 正期望值阶梯止盈：结合自驱进化 TP 倍率与最低净盈亏比门槛
+        tp_1 = round(max(entry_high * 1.014, entry_high + max(tp1_atr_mult, sl_atr_mult * min_rr_ratio) * atr_1h), prec)
+        tp_2 = round(max(resistance_2, entry_high + tp2_atr_mult * atr_1h), prec)
         
         # 扣除摩擦后的真实净盈亏比
         net_reward = max(0.0, tp_1 - entry_high - friction_cost)
@@ -285,7 +351,7 @@ def generate_quantitative_rule_decision(
         tf_analysis = TimeframeAnalysis(
             tf_15m=TimeframeDetail(
                 trend=TimeframeTrend.BULLISH if rsi_15m >= 50 else TimeframeTrend.NEUTRAL_CHOPPY,
-                key_indicators_summary=f"15m 价格依托 EMA20({round(ema20_1h, prec)}) 整理，RSI={round(rsi_15m, 1)}",
+                key_indicators_summary=f"15m 价格依托 EMA20({round(ema20_1h, prec)}) 整理，RSI={round(rsi_15m, 1)} (进化上限 {rsi_ceiling})",
                 support_level=support_1,
                 resistance_level=resistance_1
             ),
@@ -308,15 +374,15 @@ def generate_quantitative_rule_decision(
                 resistance_level=resistance_2
             )
         )
-        reasoning_summary = f"1h与4h周期多头趋势共振良好，当前标的实时价 {current_price} USDT。建议在 {entry_low}~{entry_high} 区间分批做多，硬止损设于 {stop_loss}，理论盈亏比 {rr_ratio}:1。"
-        reasoning_details = f"多周期量化研判：标的 {symbol} 现价 {current_price} USDT 位于 1h EMA20({round(ema20_1h, prec)}) 之上，1h RSI({round(rsi_1h, 1)}) 处于健康多头区。波动率 ATR(14) 为 {round(atr_1h, prec)}。结合资金费率及全网持仓结构，建议顺势分批低吸建多。"
+        rule_hint = f" 遵循进化战法：{learned_rules[0]}" if learned_rules else ""
+        reasoning_summary = f"[{active_epoch}] 1h与4h周期多头共振且6角色加权共识({weighted_consensus:+.2f})通过，实时价 {current_price} USDT。建议在 {entry_low}~{entry_high} 做多，止损 {stop_loss}，净盈亏比 {rr_ratio}:1。"
+        reasoning_details = f"多周期量化与进化共识研判：标的 {symbol} 现价 {current_price} USDT 位于 1h EMA20({round(ema20_1h, prec)}) 之上，1h RSI({round(rsi_1h, 1)} <= {rsi_ceiling}) 处于健康多头区。ATR(14)={round(atr_1h, prec)}。{rule_hint}"
         thinking_process = (
             f"<think>\n"
-            f"1. 标的结构诊断：标的 {symbol} 当前实时标记价为 {current_price} USDT，多周期均线系统呈多头排列。\n"
-            f"2. 指标共振校验：1h 周期 EMA20({round(ema20_1h, prec)}) 位于 EMA50({round(ema50_1h, prec)}) 上方，1h RSI({round(rsi_1h, 1)}) 处于健康多头区；1h 真实波动区间 ATR 为 {round(atr_1h, prec)} USDT。\n"
-            f"3. 衍生品维度：资金费率 {derivatives.funding_rate * 100:.4f}%，未见极端偏离；持仓量 (OI) 结构保持稳健。\n"
-            f"4. 点位推算：建议入场区间 [{entry_low}, {entry_high}]，硬止损防御设于 {stop_loss}，第一阻力目标 {tp_1}，第二目标 {tp_2}，理论盈亏比计算为 {rr_ratio}:1。\n"
-            f"5. 风险与失效边界：若 15m 实体 K 线跌破 {stop_loss}，则多头结构被破坏，须执行止损离场。\n"
+            f"1. 标的结构与进化参数：标的 {symbol} 当前实时价 {current_price} USDT，当前生效进化纪元 {active_epoch} (RSI上限={rsi_ceiling}, 最低RR={min_rr_ratio})。\n"
+            f"2. 多角色门控共识：6位AI员工 Softmax 加权投票得分 {weighted_consensus:+.2f}，多头共识成立。\n"
+            f"3. 点位推算：建议入场区间 [{entry_low}, {entry_high}]，硬止损设于 {stop_loss}，第一目标 {tp_1}，第二目标 {tp_2}，扣除摩擦后净盈亏比 {rr_ratio}:1。\n"
+            f"4. 进化战法约束：{learned_rules[0] if learned_rules else '严格执行移动保本与趋势反转冷却'}\n"
             f"</think>"
         )
     elif is_bearish:
@@ -324,7 +390,8 @@ def generate_quantitative_rule_decision(
         action = SignalAction.SELL_SHORT
         rsi_bonus = min(0.08, max(0.0, (50.0 - rsi_1h) * 0.005))
         fr_bonus = 0.04 if (derivatives and derivatives.funding_rate < 0) else 0.0
-        confidence = round(min(0.92, 0.76 + rsi_bonus + fr_bonus), 2)
+        consensus_bonus = min(0.08, max(-0.08, (-weighted_consensus) * 0.12))
+        confidence = round(min(0.92, max(0.65, 0.76 + rsi_bonus + fr_bonus + consensus_bonus)), 2)
         urgency = SignalUrgency.MEDIUM
 
         resistance_1 = round(max(ema20_1h, current_price + 1.2 * atr_1h), prec)
@@ -334,11 +401,11 @@ def generate_quantitative_rule_decision(
 
         entry_high = round(min(resistance_1, current_price * 1.005), prec)
         entry_low = round(current_price * 0.998, prec)
-        stop_loss = round(current_price + 1.35 * atr_1h, prec)
+        stop_loss = round(current_price + sl_atr_mult * atr_1h, prec)
         
-        # 正期望值阶梯止盈：TP1 基于 2.0倍 ATR (净盈亏比 >= 1.5:1)，TP2 基于 3.4倍 ATR 博取长尾波段
-        tp_1 = round(min(entry_low * 0.986, entry_low - 2.0 * atr_1h), prec)
-        tp_2 = round(min(support_2, entry_low - 3.4 * atr_1h), prec)
+        # 正期望值阶梯止盈：结合自驱进化 TP 倍率与最低净盈亏比门槛
+        tp_1 = round(min(entry_low * 0.986, entry_low - max(tp1_atr_mult, sl_atr_mult * min_rr_ratio) * atr_1h), prec)
+        tp_2 = round(min(support_2, entry_low - tp2_atr_mult * atr_1h), prec)
         
         # 扣除摩擦后的真实净盈亏比
         net_reward = max(0.0, entry_low - tp_1 - friction_cost)
@@ -348,7 +415,7 @@ def generate_quantitative_rule_decision(
         tf_analysis = TimeframeAnalysis(
             tf_15m=TimeframeDetail(
                 trend=TimeframeTrend.BEARISH,
-                key_indicators_summary=f"15m 价格受阻于 EMA20({round(ema20_1h, prec)})，RSI={round(rsi_15m, 1)}",
+                key_indicators_summary=f"15m 价格受阻于 EMA20({round(ema20_1h, prec)})，RSI={round(rsi_15m, 1)} (进化下限 {rsi_floor})",
                 support_level=support_1,
                 resistance_level=resistance_1
             ),
@@ -371,15 +438,15 @@ def generate_quantitative_rule_decision(
                 resistance_level=resistance_2
             )
         )
-        reasoning_summary = f"1h均线呈空头排列，当前实时价 {current_price} USDT。建议在反弹承压区间 {entry_low}~{entry_high} 逢高做空，止损设于 {stop_loss}，理论盈亏比 {rr_ratio}:1。"
-        reasoning_details = f"多周期量化研判：标的 {symbol} 现价 {current_price} USDT 承压于 1h EMA20({round(ema20_1h, prec)})，1h RSI({round(rsi_1h, 1)}) 处于弱势区。建议在反弹阻力区间挂单做空，严格执行风控。"
+        rule_hint = f" 遵循进化战法：{learned_rules[0]}" if learned_rules else ""
+        reasoning_summary = f"[{active_epoch}] 1h均线空头排列且6角色加权共识({weighted_consensus:+.2f})通过，实时价 {current_price} USDT。建议在 {entry_low}~{entry_high} 逢高做空，止损 {stop_loss}，净盈亏比 {rr_ratio}:1。"
+        reasoning_details = f"多周期量化与进化共识研判：标的 {symbol} 现价 {current_price} USDT 承压于 1h EMA20({round(ema20_1h, prec)})，1h RSI({round(rsi_1h, 1)} >= {rsi_floor}) 处于弱势区。{rule_hint}"
         thinking_process = (
             f"<think>\n"
-            f"1. 标的结构诊断：标的 {symbol} 当前实时标记价为 {current_price} USDT，短期均线呈空头排列。\n"
-            f"2. 指标共振校验：1h 周期 EMA20({round(ema20_1h, prec)}) 处于 EMA50({round(ema50_1h, prec)}) 下方，1h RSI({round(rsi_1h, 1)}) 偏弱；1h ATR 真实波动为 {round(atr_1h, prec)} USDT。\n"
-            f"3. 衍生品维度：资金费率 {derivatives.funding_rate * 100:.4f}%。\n"
-            f"4. 点位推算：建议逢高做空入场区间 [{entry_low}, {entry_high}]，硬止损防御设于 {stop_loss}，第一止盈目标 {tp_1}，理论盈亏比计算为 {rr_ratio}:1。\n"
-            f"5. 风险防范：若价格放量突破 {stop_loss}，空头逻辑失效，必须无条件离场。\n"
+            f"1. 标的结构与进化参数：标的 {symbol} 当前实时价 {current_price} USDT，当前生效进化纪元 {active_epoch} (RSI下限={rsi_floor}, 最低RR={min_rr_ratio})。\n"
+            f"2. 多角色门控共识：6位AI员工 Softmax 加权投票得分 {weighted_consensus:+.2f}，空头共识成立。\n"
+            f"3. 点位推算：建议逢高做空区间 [{entry_low}, {entry_high}]，硬止损设于 {stop_loss}，第一目标 {tp_1}，扣除摩擦后净盈亏比 {rr_ratio}:1。\n"
+            f"4. 进化战法约束：{learned_rules[0] if learned_rules else '严禁浮亏补仓与超卖追空'}\n"
             f"</think>"
         )
     else:
@@ -406,13 +473,17 @@ def generate_quantitative_rule_decision(
             tf_4h=TimeframeDetail(trend=TimeframeTrend.NEUTRAL_CHOPPY, key_indicators_summary="4h 宽幅箱体震荡", support_level=support_2, resistance_level=resistance_2),
             tf_1d=TimeframeDetail(trend=TimeframeTrend.NEUTRAL_CHOPPY, key_indicators_summary="日线整理平台内运行", support_level=support_2, resistance_level=resistance_2)
         )
-        reasoning_summary = f"当前标的处于箱体震荡中，实时价 {current_price} USDT，均线缠绕无明显单边动能，建议空仓观望或在箱体边界高抛低吸。"
-        reasoning_details = f"标的 {symbol} 现价 {current_price} USDT 在布林带区间 [{support_1}, {resistance_1}] 内震荡，建议等待放量突破后再行顺势操作。"
+        if is_quarantined:
+            reasoning_summary = f"[{active_epoch} 达尔文风控隔离] {symbol} 已被自驱进化引擎熔断隔离 ({quarantine_reason})，禁止新开仓，强制空仓观望。"
+            reasoning_details = f"自驱进化诊断拦截：{symbol} 因 {quarantine_reason} 触发达尔文淘汰与毒性流动性隔离规则，当前信号强制锁定为 HOLD_WAIT。"
+        else:
+            reasoning_summary = f"[{active_epoch}] 当前标的处于箱体震荡或未达进化阈值(RSI={round(rsi_1h, 1)}, 共识={weighted_consensus:+.2f})，实时价 {current_price} USDT，建议空仓观望。"
+            reasoning_details = f"标的 {symbol} 现价 {current_price} USDT 在区间 [{support_1}, {resistance_1}] 内运行，进化过滤上限 RSI={rsi_ceiling}/下限={rsi_floor}，等待高确定性突破。"
         thinking_process = (
             f"<think>\n"
-            f"1. 盘面诊断：标的 {symbol} 当前实时价 {current_price} USDT，15m 与 1h 周期均线粘合，方向不明朗。\n"
-            f"2. 动能分析：RSI 位于 50 中轴附近，MACD 柱体微弱。\n"
-            f"3. 策略判定：震荡行情下不宜盲目追涨杀跌，建议 HOLD_WAIT 观望，等待突破箱体。\n"
+            f"1. 盘面与进化过滤：标的 {symbol} 实时价 {current_price} USDT，进化纪元 {active_epoch}。\n"
+            f"2. 拦截原因：{'触发达尔文标的隔离 (' + quarantine_reason + ')' if is_quarantined else f'1h RSI={round(rsi_1h, 1)} 或多角色加权共识({weighted_consensus:+.2f})未达开仓阈值'}。\n"
+            f"3. 策略判定：执行 HOLD_WAIT 观望，保护本金免受震荡磨损与差流动性滑点侵蚀。\n"
             f"</think>"
         )
 
