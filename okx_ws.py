@@ -428,15 +428,11 @@ class OKXWSManager:
     def __init__(self, is_live_mode: bool = False):
         self.is_live_mode = is_live_mode
 
-        # 选择对应端点
-        if is_live_mode:
-            self.public_url = settings.OKX_LIVE_WS_PUBLIC
-            self.private_url = settings.OKX_LIVE_WS_PRIVATE
-            self.business_url = self.public_url.replace("/ws/v5/public", "/ws/v5/business")
-        else:
-            self.public_url = settings.OKX_DEMO_WS_PUBLIC
-            self.private_url = settings.OKX_DEMO_WS_PRIVATE
-            self.business_url = self.public_url.replace("/ws/v5/public", "/ws/v5/business")
+        # 选择对应端点 (Stage 0 T0.5: 模拟盘公共行情默认接入 OKX 实盘公共流，杜绝 wspap 脏 tick)
+        use_live_public = is_live_mode or settings.USE_LIVE_PUBLIC_MARKET_DATA
+        self.public_url = settings.OKX_LIVE_WS_PUBLIC if use_live_public else settings.OKX_DEMO_WS_PUBLIC
+        self.business_url = self.public_url.replace("/ws/v5/public", "/ws/v5/business")
+        self.private_url = settings.OKX_LIVE_WS_PRIVATE if is_live_mode else settings.OKX_DEMO_WS_PRIVATE
 
         self.public_client = OKXWebSocketClient(
             ws_url=self.public_url,
@@ -700,6 +696,18 @@ class OKXWSManager:
                     arg=arg
                 )
                 await self.broadcast_to_subscribers(push_msg)
+
+        # 4. 实时资金费率频道 (funding-rate) -> 同步至模拟盘 8h 资金费率结算引擎
+        elif channel == "funding-rate":
+            for item in data_list:
+                try:
+                    sym = item.get("instId", inst_id)
+                    fr = float(item.get("fundingRate") or 0.0)
+                    if sym:
+                        from paper_trading import paper_engine
+                        paper_engine.update_funding_rate(sym, fr)
+                except Exception:
+                    pass
 
     async def _on_private_message(self, msg: Dict[str, Any]):
         """解析私有通道消息（订单、持仓、账户资产）并广播"""

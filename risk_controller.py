@@ -8,13 +8,14 @@ import asyncio
 import datetime
 import json
 import logging
+import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import settings
+from config import DEFAULT_DB_PATH, settings
 from database import get_db_session
 from models import (
     AuditSeverity,
@@ -79,7 +80,11 @@ class RiskController:
             max_open_positions=10,
             max_position_usdt=100000.0,
             fixed_risk_per_trade_percent=0.01,
-            enforce_post_only=True
+            enforce_post_only=True,
+            max_same_sector_same_direction_positions=2,
+            min_24h_volume_usdt_for_rotation=30000000.0,
+            anti_fomo_24h_change_pct_cap=18.0,
+            contrarian_extreme_percentile_guard=85.0,
         )
 
         # 内存实时风控状态机
@@ -105,22 +110,67 @@ class RiskController:
         # 异步锁
         self._lock = asyncio.Lock()
 
+    def _persist_state_sync(self) -> None:
+        """
+        Stage 0 (T0.4): 将当日累计亏损、UTC 重置日期与熔断锁定状态实时落盘至 SQLite risk_limits，
+        确保进程崩溃或重启后熔断状态与日亏统计绝对不丢失
+        """
+        try:
+            if not DEFAULT_DB_PATH.exists():
+                return
+            conn = sqlite3.connect(str(DEFAULT_DB_PATH), timeout=3.0)
+            try:
+                cur = conn.cursor()
+                cb_at_str = (
+                    datetime.datetime.fromtimestamp(self.circuit_break_at / 1000.0, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    if self.circuit_break_at
+                    else None
+                )
+                reset_at_str = f"{self.last_reset_date} 00:00:00"
+                cur.execute(
+                    """
+                    UPDATE risk_limits SET
+                        is_circuit_broken = ?,
+                        circuit_break_reason = ?,
+                        circuit_break_at = ?,
+                        daily_loss_current = ?,
+                        daily_loss_reset_at = ?,
+                        is_safe_mode = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = (SELECT id FROM risk_limits ORDER BY id DESC LIMIT 1)
+                    """,
+                    (
+                        1 if self.is_circuit_broken else 0,
+                        self.circuit_break_reason,
+                        cb_at_str,
+                        round(float(self.today_realized_loss), 4),
+                        reset_at_str,
+                        1 if self.is_safe_mode else 0,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug(f"风控熔断状态同步落盘跳过: {e}")
+
     def _check_day_rollover(self):
-        """每日 0 点重置当日统计"""
-        current_date = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        """每日 UTC 0 点重置当日统计并落盘"""
+        current_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         if current_date != self.last_reset_date:
-            logger.info(f"风控统计跨日切换: {self.last_reset_date} -> {current_date}，重置当日盈亏统计")
+            logger.info(f"风控统计跨日切换 (UTC): {self.last_reset_date} -> {current_date}，重置当日盈亏统计")
             self.today_realized_loss = 0.0
             self.today_unrealized_loss = 0.0
             self.consecutive_loss_count = 0
             self.loss_timestamps.clear()
             self.last_reset_date = current_date
-            # 如果非人工锁定的熔断，跨日可恢复
-            if self.risk_status == RiskStatus.CIRCUIT_BROKEN:
+            # 如果非人工锁定的 SAFE_MODE，跨日自动恢复单日亏损熔断
+            if self.risk_status == RiskStatus.CIRCUIT_BROKEN and not self.is_safe_mode:
                 self.risk_status = RiskStatus.NORMAL
                 self.is_circuit_broken = False
                 self.circuit_break_reason = None
                 self.circuit_break_at = None
+            self._persist_state_sync()
 
     def is_in_cooldown(self) -> Tuple[bool, int, Optional[str]]:
         """
@@ -214,6 +264,8 @@ class RiskController:
                     self.today_realized_loss,
                     f"当日累计亏损 {self.today_realized_loss:.2f} USDT 超过上限 {self.rules.max_daily_loss_usdt} USDT"
                 )
+            else:
+                self._persist_state_sync()
         else:
             # 盈利单可缓解连续止损压力
             if self.loss_timestamps:
@@ -303,7 +355,7 @@ class RiskController:
             return 0
 
     async def load_config_from_db(self):
-        """从 SQLite risk_limits 表加载最新风控规则"""
+        """从 SQLite risk_limits 表加载最新风控规则，并恢复当日亏损与熔断持久化状态"""
         async with get_db_session() as db:
             try:
                 res = await db.execute(text("SELECT * FROM risk_limits ORDER BY id DESC LIMIT 1"))
@@ -317,7 +369,34 @@ class RiskController:
                         max_open_positions=int(row.get("max_open_positions", self.rules.max_open_positions)),
                         max_position_usdt=float(row.get("max_position_usdt", self.rules.max_position_usdt))
                     )
-                    logger.info(f"风控规则已从数据库加载: {self.rules.model_dump()}")
+                    # Stage 0 (T0.4): 恢复持久化的当日累计亏损与熔断状态 (防止重启绕过熔断)
+                    saved_reset_raw = str(row.get("daily_loss_reset_at") or "")
+                    saved_date = saved_reset_raw[:10] if len(saved_reset_raw) >= 10 else ""
+                    today_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+                    self.is_safe_mode = bool(row.get("is_safe_mode", 0))
+                    if saved_date == today_utc:
+                        self.last_reset_date = saved_date
+                        self.today_realized_loss = max(0.0, float(row.get("daily_loss_current") or 0.0))
+                        self.is_circuit_broken = bool(row.get("is_circuit_broken", 0))
+                        self.circuit_break_reason = row.get("circuit_break_reason") or None
+                        if self.is_safe_mode:
+                            self.risk_status = RiskStatus.SAFE_MODE
+                        elif self.is_circuit_broken:
+                            self.risk_status = RiskStatus.CIRCUIT_BROKEN
+                        else:
+                            self.risk_status = RiskStatus.NORMAL
+                    else:
+                        # 数据库记录属于历史 UTC 日期，执行跨日自动重置并写回今日 UTC 日期
+                        self.last_reset_date = saved_date or "1970-01-01"
+                        self._check_day_rollover()
+                        if self.is_safe_mode:
+                            self.risk_status = RiskStatus.SAFE_MODE
+
+                    logger.info(
+                        f"风控规则与熔断状态已从数据库恢复: 规则={self.rules.model_dump()}, "
+                        f"当日已亏={self.today_realized_loss:.2f} USDT, 熔断={self.is_circuit_broken}, 安全模式={self.is_safe_mode}"
+                    )
             except Exception as e:
                 logger.warning(f"从数据库加载风控配置异常 (将使用默认规则): {e}")
 
@@ -641,6 +720,140 @@ class RiskController:
                             risk_status=self.risk_status
                         )
 
+        # ---------------------------------------------------------------------
+        # 规则 8 (v8.0): 板块同方向集中度硬上限 (防止满仓押注单一赛道同向回撤)
+        # ---------------------------------------------------------------------
+        if not is_reduce_only:
+            try:
+                from services.capital_flow_service import classify_symbol_sector, get_sector_display_name, SectorCategory
+                from state import capital_flow_service
+
+                target_sector = classify_symbol_sector(order.symbol)
+                order_pos_side = (
+                    order.pos_side.value if hasattr(order.pos_side, "value") else str(order.pos_side or "")
+                ).lower()
+                order_side_str = (
+                    order.side.value if hasattr(order.side, "value") else str(order.side or "")
+                ).lower()
+                target_is_short = (order_pos_side == "short") or (order_pos_side in ("", "net") and order_side_str == "sell")
+
+                # 8.1 美股映射代币做空开关硬校验
+                cf_cfg = capital_flow_service.config if capital_flow_service else None
+                if target_sector == SectorCategory.TRADFI and target_is_short and cf_cfg and not cf_cfg.allow_tradfi_short:
+                    reason = f"【TradFi 禁空护栏】美股映射标的 {order.symbol} 默认关闭做空权限（防止休市盘口真空轧空），可在资金流配置中开启。"
+                    await self.record_risk_event(
+                        event_type=RiskEventType.ORDER_REJECTED,
+                        rule_name="TRADFI_SHORT_DISABLED",
+                        limit_val="allow_tradfi_short=False",
+                        current_val=f"{order.symbol} SHORT",
+                        symbol=order.symbol,
+                        is_blocked=True,
+                        action_taken="REJECT_ORDER",
+                        severity=AuditSeverity.WARNING,
+                    )
+                    return RiskCheckResult(
+                        passed=False,
+                        rejected_rule="TRADFI_SHORT_DISABLED",
+                        message=reason,
+                        risk_status=self.risk_status,
+                    )
+
+                # 8.2 同板块同方向持仓数上限拦截（对已有该标的加仓不重复计数）
+                if current_positions:
+                    sec_cap = int(
+                        getattr(cf_cfg, "max_same_sector_same_direction", None)
+                        or getattr(self.rules, "max_same_sector_same_direction_positions", 2)
+                        or 2
+                    )
+                    same_sec_syms = set()
+                    for p in current_positions:
+                        if p.pos == 0:
+                            continue
+                        p_side_str = (p.pos_side.value if hasattr(p.pos_side, "value") else str(p.pos_side or "")).lower()
+                        p_is_short = "short" in p_side_str
+                        if p_is_short == target_is_short and classify_symbol_sector(p.symbol) == target_sector:
+                            same_sec_syms.add(p.symbol)
+
+                    if order.symbol not in same_sec_syms and len(same_sec_syms) >= sec_cap:
+                        dir_label = "空头" if target_is_short else "多头"
+                        sec_cn = get_sector_display_name(target_sector)
+                        reason = (
+                            f"【板块集中度上限拦截】板块 [{sec_cn}] 已持有 {len(same_sec_syms)} 个{dir_label}仓位 "
+                            f"({', '.join(sorted(same_sec_syms))})，达到上限 {sec_cap}，拒绝继续同向开仓 {order.symbol}！"
+                        )
+                        await self.record_risk_event(
+                            event_type=RiskEventType.POSITION_LIMIT_EXCEEDED,
+                            rule_name="MAX_SAME_SECTOR_SAME_DIRECTION",
+                            limit_val=f"{sec_cn} {dir_label} <= {sec_cap}",
+                            current_val=f"{len(same_sec_syms)} ({', '.join(sorted(same_sec_syms))})",
+                            symbol=order.symbol,
+                            is_blocked=True,
+                            action_taken="REJECT_ORDER",
+                            severity=AuditSeverity.WARNING,
+                        )
+                        return RiskCheckResult(
+                            passed=False,
+                            rejected_rule="MAX_SAME_SECTOR_SAME_DIRECTION",
+                            message=reason,
+                            risk_status=self.risk_status,
+                        )
+
+                # 8.3 反 FOMO / 防地板空 24h 极端涨跌幅硬拦截（仅针对新开首仓）
+                has_existing_sym_pos = any(p.symbol == order.symbol and p.pos != 0 for p in (current_positions or []))
+                if not has_existing_sym_pos:
+                    chg_cap = float(
+                        getattr(cf_cfg, "anti_fomo_change_24h_cap", None)
+                        or getattr(self.rules, "anti_fomo_24h_change_pct_cap", 18.0)
+                        or 18.0
+                    )
+                    chg_24h = None
+                    if current_ticker and getattr(current_ticker, "change_24h_pct", None) is not None:
+                        chg_24h = float(current_ticker.change_24h_pct)
+                    elif capital_flow_service:
+                        sym_flow = capital_flow_service.get_symbol_flow_sync(order.symbol)
+                        if sym_flow is not None:
+                            chg_24h = float(sym_flow.change_24h_pct)
+
+                    if chg_24h is not None:
+                        if (not target_is_short) and chg_24h > chg_cap:
+                            reason = f"【反FOMO追高拦截】{order.symbol} 24h 涨幅已达 {chg_24h:+.1f}% (上限 +{chg_cap:.0f}%)，禁止高位追多接盘！"
+                            await self.record_risk_event(
+                                event_type=RiskEventType.ORDER_REJECTED,
+                                rule_name="ANTI_FOMO_EXTREME_GUARD",
+                                limit_val=f"+{chg_cap:.1f}%",
+                                current_val=f"{chg_24h:+.1f}%",
+                                symbol=order.symbol,
+                                is_blocked=True,
+                                action_taken="REJECT_ORDER",
+                                severity=AuditSeverity.WARNING,
+                            )
+                            return RiskCheckResult(
+                                passed=False,
+                                rejected_rule="ANTI_FOMO_EXTREME_GUARD",
+                                message=reason,
+                                risk_status=self.risk_status,
+                            )
+                        if target_is_short and chg_24h < -chg_cap:
+                            reason = f"【防地板追空拦截】{order.symbol} 24h 跌幅已达 {chg_24h:+.1f}% (下限 -{chg_cap:.0f}%)，禁止低位追空防轧空反弹！"
+                            await self.record_risk_event(
+                                event_type=RiskEventType.ORDER_REJECTED,
+                                rule_name="ANTI_FLOOR_SHORT_GUARD",
+                                limit_val=f"-{chg_cap:.1f}%",
+                                current_val=f"{chg_24h:+.1f}%",
+                                symbol=order.symbol,
+                                is_blocked=True,
+                                action_taken="REJECT_ORDER",
+                                severity=AuditSeverity.WARNING,
+                            )
+                            return RiskCheckResult(
+                                passed=False,
+                                rejected_rule="ANTI_FLOOR_SHORT_GUARD",
+                                message=reason,
+                                risk_status=self.risk_status,
+                            )
+            except Exception as sec_risk_err:
+                logger.debug(f"资金流与板块风控校验异常降级跳过: {sec_risk_err}")
+
         # 全部硬风控检查通过
         return RiskCheckResult(
             passed=True,
@@ -677,20 +890,30 @@ class RiskController:
 
 
     def trigger_daily_loss_circuit_breaker(self, current_loss: float, reason: str):
-        """触发单日亏损熔断锁定"""
+        """触发单日亏损熔断锁定并立即持久化至 SQLite + 推送 Telegram 告警"""
         self.is_circuit_broken = True
         self.risk_status = RiskStatus.CIRCUIT_BROKEN
         self.circuit_break_reason = reason
         self.circuit_break_at = int(time.time() * 1000)
-        logger.critical(f"【硬风控熔断触发】当日累计亏损 {current_loss:.2f} USDT，系统已锁定只读模式！原因: {reason}")
+        self.today_realized_loss = max(self.today_realized_loss, float(current_loss))
+        self._persist_state_sync()
+        msg = f"🛑【硬风控熔断触发】当日累计亏损 {current_loss:.2f} USDT，系统已锁定禁止开新仓！原因: {reason}"
+        logger.critical(msg)
+        try:
+            loop = asyncio.get_running_loop()
+            from state import telegram_bot_service
+            loop.create_task(telegram_bot_service.send_message(msg))
+        except Exception:
+            pass
 
     async def reset_circuit_breaker(self, reason: str):
-        """手动解除熔断锁定"""
+        """手动解除熔断锁定并持久化清除状态"""
         self.is_circuit_broken = False
         self.is_safe_mode = False
         self.risk_status = RiskStatus.NORMAL
         self.circuit_break_reason = None
         self.circuit_break_at = None
+        self._persist_state_sync()
 
         logger.info(f"【硬风控熔断解除】原因: {reason}")
         await self.record_risk_event(

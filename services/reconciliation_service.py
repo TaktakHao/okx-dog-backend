@@ -16,7 +16,9 @@ OKX-Dog 个人量化智能交易系统 - 60秒常驻自动化对账中枢 (Recon
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
+
+from config import settings
 
 logger = logging.getLogger("okx_dog.reconciliation")
 
@@ -37,6 +39,9 @@ class ReconciliationService:
         self.total_drift_incidents: int = 0
         self.last_drifts: List[str] = []
         self.reconciliation_history: List[Dict[str, Any]] = []
+        # Stage 0 (T0.3): 记录交易所外部手动持仓，防止机器人误接管与误平仓
+        self.unmanaged_external_symbols: Set[str] = set()
+        self._external_alert_last_sent: Dict[str, float] = {}
 
         self._lock = asyncio.Lock()
 
@@ -67,22 +72,47 @@ class ReconciliationService:
 
                     # 2. 校验持仓一致性
                     # 2.1 检查远端持仓 -> 本地状态
+                    # 先清理已在远端归零的外部非托管标记
+                    self.unmanaged_external_symbols = {
+                        s for s in self.unmanaged_external_symbols if s in remote_pos_map
+                    }
                     for sym, r_pos in remote_pos_map.items():
                         local_scale = live_state.position_scale_records.get(sym, 0)
                         if local_scale <= 0:
-                            # 远端有持仓，本地未记录（用户在 App 手动开仓或外部介入）
-                            drift_msg = f"标的 {sym} 远端持有 {r_pos.pos_side.value.upper() if hasattr(r_pos.pos_side, 'value') else r_pos.pos_side} {r_pos.pos} 币，本地操盘账本未登记"
+                            # 远端有持仓，本地未记录（用户在 App 手动开仓或外部遗留仓位）
+                            pos_side_str = r_pos.pos_side.value.upper() if hasattr(r_pos.pos_side, "value") else str(r_pos.pos_side)
+                            drift_msg = f"标的 {sym} 远端持有 {pos_side_str} {r_pos.pos} 币，本地操盘账本未登记"
                             drifts.append(drift_msg)
-                            
-                            # 自动接管自愈
-                            live_state.position_scale_records[sym] = 1
-                            live_state.position_peaks[sym] = {
-                                "peak_price": r_pos.last_price or r_pos.avg_px or 0.0,
-                                "peak_profit_ratio": 0.0
-                            }
-                            heal_msg = f"本地已自动接管并登记标的 {sym} 外部持仓，纳入保本与移动止损巡检池"
-                            heal_actions.append(heal_msg)
-                            logger.warning(f"【对账中枢-自愈】{heal_msg}")
+
+                            if settings.AUTO_TAKEOVER_EXTERNAL_POSITIONS:
+                                # 仅在显式开启自动接管开关时才纳入机器人托管
+                                live_state.position_scale_records[sym] = 1
+                                live_state.position_peaks[sym] = {
+                                    "peak_price": getattr(r_pos, "last_price", None) or r_pos.mark_px or r_pos.avg_px or 0.0,
+                                    "peak_profit_ratio": 0.0
+                                }
+                                heal_msg = f"本地已按配置自动接管并登记标的 {sym} 外部持仓，纳入保本与移动止损巡检池"
+                                heal_actions.append(heal_msg)
+                                logger.warning(f"【对账中枢-自愈】{heal_msg}")
+                            else:
+                                # Stage 0 (T0.3) 安全红线：默认严禁静默接管外部手动持仓，只告警不干预
+                                self.unmanaged_external_symbols.add(sym)
+                                warn_msg = (
+                                    f"🛡️【防误接管隔离】检测到交易所外部手动持仓 {sym} ({pos_side_str} {r_pos.pos})，"
+                                    f"系统仅记录漂移并告警，绝不自动接管或操作该仓位"
+                                )
+                                heal_actions.append(warn_msg)
+                                logger.warning(f"【对账中枢-隔离告警】{warn_msg}")
+
+                                # 每标的每小时最多推送一次 TG 告警，避免 60 秒轮询刷屏
+                                now_sec = time.time()
+                                if (now_sec - self._external_alert_last_sent.get(sym, 0.0)) >= 3600.0:
+                                    self._external_alert_last_sent[sym] = now_sec
+                                    try:
+                                        from state import telegram_bot_service
+                                        asyncio.create_task(telegram_bot_service.send_message(warn_msg))
+                                    except Exception:
+                                        pass
 
                     # 2.2 检查本地状态 -> 远端持仓
                     current_local_symbols = list(live_state.position_scale_records.keys())

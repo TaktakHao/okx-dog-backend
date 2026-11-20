@@ -6,8 +6,9 @@ OKX-Dog 个人量化智能交易系统 - Antigravity CLI 驱动专用路由
 
 import time
 from typing import Any, Dict
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
+from models import ApiResponse
 from state import antigravity_bridge
 
 router = APIRouter(prefix="/api/v1/antigravity", tags=["Antigravity 本地驱动"])
@@ -23,6 +24,35 @@ async def antigravity_health():
         "cli_available": cli_ready,
         "timestamp": int(time.time()),
     }
+
+
+@router.get("/models", summary="动态读取本地 Antigravity CLI 可用模型列表")
+async def antigravity_models(refresh: bool = Query(False, description="是否强制刷新本地 CLI 模型列表缓存")):
+    cli_ready = bool(antigravity_bridge and antigravity_bridge.is_available())
+    models = []
+    source = "cli"
+    if antigravity_bridge and hasattr(antigravity_bridge, "list_models"):
+        models = await antigravity_bridge.list_models(force_refresh=refresh)
+
+    if not models:
+        source = "fallback"
+        models = [
+            {"id": "gemini-4-neon-high", "name": "Gemini 4 Neon (High)"},
+            {"id": "gemini-4-hydrogen-medium", "name": "Gemini 4 Hydrogen (Medium)"},
+            {"id": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash (Medium)"},
+        ]
+
+    return ApiResponse(
+        code=0,
+        msg="success",
+        data={
+            "models": models,
+            "source": source,
+            "cli_available": cli_ready,
+            "cli_path": getattr(antigravity_bridge, "cli_path", "unknown") if antigravity_bridge else "none",
+        },
+        timestamp=int(time.time() * 1000),
+    )
 
 
 @router.post("/generate", summary="Antigravity 原生结构化研判接口")

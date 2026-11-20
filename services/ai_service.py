@@ -47,12 +47,17 @@ def generate_quantitative_rule_decision(
     position: Optional[Any] = None,
     available_funds: Optional[float] = None,
     aggressiveness_mode: str = "BALANCED",
-    model_name: str = "quantitative-rule-v2"
+    model_name: str = "quantitative-rule-v3-flow",
+    capital_flow: Optional[Any] = None,
 ) -> AIAnalysisResponse:
     """
-    基于实时多周期指标矩阵 (15m/1h/4h/1d EMA/MACD/RSI/ATR/布林带) 与衍生品情绪，
-    结合当前实盘可用资金 (available_funds) 与持仓上下文，通过高保真量化规则算法动态推导结构化交易决策与思维链。
-    杜绝任何写死的假数据与历史老数据。
+    基于实时多周期指标矩阵 (15m/1h/4h/1d EMA/MACD/RSI/ATR/布林带)、真实衍生品资金流
+    (OI Delta / Taker Flow / 大户多空比) 与板块逆向百分位，通过多空完全对称的量化规则引擎
+    动态推导结构化交易决策与思维链。
+    v8.0 升级:
+    - 彻底消除指标缺失时的隐性多头默认幻觉 (异常直接 HOLD_WAIT)
+    - 引入反弹承压空 + 放量破位空双模式 (资金流出确认时放宽 RSI 下限至 22，不再错过主跌浪)
+    - 修正链上/衍生品投票逻辑，融入板块逆向极值百分位防追高/防地板空护栏
     """
     now_ms = int(time.time() * 1000)
     inds = multi_indicators.indicators or {}
@@ -69,29 +74,66 @@ def generate_quantitative_rule_decision(
     else:
         prec = 4
 
-    # 提取关键指标并保证数值真实
+    # 严格检测关键周期指标是否真实有效，严禁在数据缺失时用“多头排列假值”兜底！
+    has_valid_1h = bool(tf_1h and tf_1h.ema_20 and tf_1h.ema_20 > 0 and tf_1h.ema_50 and tf_1h.ema_50 > 0)
+    has_valid_15m = bool(tf_15m and tf_15m.rsi_14 is not None and tf_15m.rsi_14 > 0)
+    indicators_missing = not (has_valid_1h and has_valid_15m)
+
+    # 提取关键指标（缺失时统一采用中性值 current_price / RSI=50.0，杜绝多头偏见）
     atr_1h = (tf_1h.atr_14 if (tf_1h and tf_1h.atr_14 > 0) else current_price * 0.015)
     atr_15m = (tf_15m.atr_14 if (tf_15m and tf_15m.atr_14 > 0) else current_price * 0.008)
-    ema20_1h = (tf_1h.ema_20 if (tf_1h and tf_1h.ema_20 > 0) else current_price * 0.998)
-    ema50_1h = (tf_1h.ema_50 if (tf_1h and tf_1h.ema_50 > 0) else current_price * 0.995)
-    ema200_1h = (tf_1h.ema_200 if (tf_1h and tf_1h.ema_200 > 0) else current_price * 0.985)
-    rsi_1h = (tf_1h.rsi_14 if tf_1h else 55.0)
+    ema20_1h = (tf_1h.ema_20 if (tf_1h and tf_1h.ema_20 > 0) else current_price)
+    ema50_1h = (tf_1h.ema_50 if (tf_1h and tf_1h.ema_50 > 0) else current_price)
+    ema200_1h = (tf_1h.ema_200 if (tf_1h and tf_1h.ema_200 > 0) else current_price)
+    rsi_1h = (tf_1h.rsi_14 if (tf_1h and tf_1h.rsi_14 is not None) else 50.0)
 
-    ema20_4h = (tf_4h.ema_20 if (tf_4h and tf_4h.ema_20 > 0) else current_price * 0.992)
-    ema50_4h = (tf_4h.ema_50 if (tf_4h and tf_4h.ema_50 > 0) else current_price * 0.985)
-    rsi_4h = (tf_4h.rsi_14 if tf_4h else 53.0)
+    ema20_4h = (tf_4h.ema_20 if (tf_4h and tf_4h.ema_20 > 0) else ema20_1h)
+    ema50_4h = (tf_4h.ema_50 if (tf_4h and tf_4h.ema_50 > 0) else ema50_1h)
+    rsi_4h = (tf_4h.rsi_14 if (tf_4h and tf_4h.rsi_14 is not None) else 50.0)
 
-    rsi_15m = (tf_15m.rsi_14 if tf_15m else 52.0)
+    rsi_15m = (tf_15m.rsi_14 if (tf_15m and tf_15m.rsi_14 is not None) else 50.0)
     bb_up_15m = (tf_15m.bb_upper if (tf_15m and tf_15m.bb_upper > 0) else current_price * 1.012)
     bb_low_15m = (tf_15m.bb_lower if (tf_15m and tf_15m.bb_lower > 0) else current_price * 0.988)
     macd_hist_1h = (tf_1h.macd_hist if (tf_1h and getattr(tf_1h, "macd_hist", None) is not None) else 0.0)
+
+    # ===== 接入全市场资金流雷达快照与板块逆向百分位 =====
+    sym_flow = capital_flow
+    sec_flow = None
+    try:
+        from state import capital_flow_service
+        if capital_flow_service is not None:
+            if sym_flow is None:
+                sym_flow = capital_flow_service.get_symbol_flow_sync(symbol)
+            sec_flow = capital_flow_service.get_sector_flow_sync(symbol)
+    except Exception:
+        pass
+
+    sym_flow_score = float(getattr(sym_flow, "flow_score", 0.0) or 0.0) if sym_flow else 0.0
+    sym_pool_role = str(getattr(getattr(sym_flow, "pool_role", None), "value", getattr(sym_flow, "pool_role", "WATCH")) or "WATCH") if sym_flow else "WATCH"
+    oi_chg_1h = (
+        float(derivatives.oi_change_1h_pct)
+        if (derivatives and getattr(derivatives, "oi_change_1h_pct", None) is not None)
+        else (float(getattr(sym_flow, "oi_change_1h_pct", 0.0) or 0.0) if sym_flow else 0.0)
+    )
+    net_taker_ratio = (
+        float(derivatives.net_taker_ratio)
+        if (derivatives and getattr(derivatives, "net_taker_ratio", None) is not None)
+        else (float(getattr(sym_flow, "net_taker_ratio", 0.0) or 0.0) if sym_flow else 0.0)
+    )
+    sec_pct_24h = float(sec_flow.percentiles.pct_24h) if (sec_flow and sec_flow.percentiles) else 50.0
+    sec_pct_1h = float(sec_flow.percentiles.pct_1h) if (sec_flow and sec_flow.percentiles) else 50.0
+    sec_flow_score = float(sec_flow.flow_score) if sec_flow else 0.0
+
+    # 极值逆向护栏：极端过热禁追多 / 极端冰点禁追空
+    is_extreme_fomo = (sym_pool_role == "OVERHEATED_GUARD") or (sec_pct_24h <= 15.0 and sec_pct_1h <= 15.0)
+    is_extreme_ice = (sym_pool_role == "OVERSOLD_GUARD") or (sec_pct_24h >= 85.0 and sec_pct_1h >= 85.0)
 
     # 波动率挤压与均线纠缠窄幅震荡过滤 (防止震荡市频繁左右挨耳光)
     bb_bandwidth = (bb_up_15m - bb_low_15m) / max(current_price, 1e-6)
     ema_spread_1h = abs(ema20_1h - ema50_1h) / max(current_price, 1e-6)
     is_agg = (aggressiveness_mode.upper() == "AGGRESSIVE")
-    is_choppy_tangled = (ema_spread_1h < 0.0020 and 44.0 <= rsi_1h <= 56.0)
-    is_squeezed = False if is_agg else ((bb_bandwidth < 0.015) or (atr_15m / max(current_price, 1e-6) < 0.0035) or is_choppy_tangled)
+    is_choppy_tangled = (ema_spread_1h < 0.0020 and 45.0 <= rsi_1h <= 55.0 and abs(sym_flow_score) < 25.0)
+    is_squeezed = False if is_agg else ((bb_bandwidth < 0.012) or (atr_15m / max(current_price, 1e-6) < 0.0030) or is_choppy_tangled)
 
     # ===== 接入自驱进化引擎 (AgentEvolutionManager & SoftmaxGatingNetwork) =====
     evo_params: dict[str, Any] = {}
@@ -115,7 +157,7 @@ def generate_quantitative_rule_decision(
     gating_weights: dict[str, float] = evo_params.get("gating_weights", {}) or {}
     learned_rules: list[str] = evo_params.get("learned_rules", []) or []
 
-    # 计算 6 位 AI 员工实时立场并缓存至进化中枢（供平仓时精准归因奖惩，彻底消除事后伪造立场）
+    # 计算 6 位 AI 员工实时立场并缓存至进化中枢（对称多空逻辑 + 真实主力资金流因子）
     bull_w = float(gating_weights.get("bull_specialist", 16.67)) / 100.0
     bear_w = float(gating_weights.get("bear_critic", 16.67)) / 100.0
     macro_w = float(gating_weights.get("macro_news", 16.67)) / 100.0
@@ -123,13 +165,76 @@ def generate_quantitative_rule_decision(
     sniper_w = float(gating_weights.get("micro_sniper", 16.67)) / 100.0
     arbiter_w = float(gating_weights.get("chief_arbiter", 16.67)) / 100.0
 
-    bull_stance = "BULLISH" if (ema20_1h >= ema50_1h and 50.0 <= rsi_1h <= rsi_ceiling) else ("BEARISH" if rsi_1h > 74.0 else "NEUTRAL")
-    bear_stance = "BEARISH" if (ema20_1h < ema50_1h and rsi_floor <= rsi_1h <= 50.0) else ("BEARISH" if (rsi_15m > rsi_ceiling or rsi_1h > rsi_ceiling or is_quarantined) else "NEUTRAL")
+    # 真实资金流确认标志：价跌 + OI增/主动卖盘占优 = 主力主动做空；价涨 + OI增/主动买盘占优 = 主力主动做多
+    has_bear_flow_confirm = (
+        sym_flow_score <= -18.0
+        or net_taker_ratio <= -0.03
+        or (ema20_1h < ema50_1h and oi_chg_1h >= 0.3)
+        or (sec_flow_score <= -20.0 and current_price < ema20_1h)
+    )
+    has_bull_flow_confirm = (
+        sym_flow_score >= 18.0
+        or net_taker_ratio >= 0.03
+        or (ema20_1h > ema50_1h and oi_chg_1h >= 0.3)
+        or (sec_flow_score >= 20.0 and current_price > ema20_1h)
+    )
+
+    # 资金流出主跌浪期间自动放宽 RSI 下限至 22，防止被 rsi_floor=32 卡死错过顺势空单
+    eff_rsi_floor = min(rsi_floor, 22.0) if (has_bear_flow_confirm and not is_extreme_ice) else rsi_floor
+    eff_rsi_ceiling = max(rsi_ceiling, 76.0) if (has_bull_flow_confirm and not is_extreme_fomo) else rsi_ceiling
+
+    bull_stance = (
+        "BULLISH"
+        if (ema20_1h > ema50_1h and 50.0 <= rsi_1h <= eff_rsi_ceiling and not is_extreme_fomo)
+        else ("BEARISH" if (rsi_1h > 76.0 or (ema20_1h < ema50_1h and sym_flow_score <= -25.0)) else "NEUTRAL")
+    )
+    bear_stance = (
+        "BEARISH"
+        if (
+            (ema20_1h < ema50_1h and eff_rsi_floor <= rsi_1h <= 52.0 and not is_extreme_ice)
+            or rsi_15m > eff_rsi_ceiling
+            or rsi_1h > eff_rsi_ceiling
+            or is_quarantined
+        )
+        else "NEUTRAL"
+    )
     fr_val = derivatives.funding_rate if derivatives else 0.0
     ls_val = (derivatives.long_short_ratio if (derivatives and derivatives.long_short_ratio) else 1.0)
-    onchain_stance = "BEARISH" if (fr_val > 0.0005 or ls_val > 2.2) else ("BULLISH" if (fr_val < -0.0003 or (0.8 <= ls_val <= 1.5 and ema20_1h > ema50_1h)) else "NEUTRAL")
-    sniper_stance = "BULLISH" if (current_price >= ema20_1h and rsi_15m <= rsi_ceiling and macd_hist_1h >= 0) else ("BEARISH" if (current_price < ema20_1h and rsi_15m >= rsi_floor and macd_hist_1h < 0) else "NEUTRAL")
-    macro_stance = "BULLISH" if ema20_4h >= ema50_4h else "BEARISH"
+    top_ls_val = (derivatives.top_trader_long_short_ratio if (derivatives and derivatives.top_trader_long_short_ratio) else 1.0)
+
+    # 修正链上/主力侦察员投票：以真实资金流 (Taker Flow + OI Delta + 大户多空比) 为主，消除负费率盲目抄底 Bug！
+    if has_bear_flow_confirm and not is_extreme_ice:
+        onchain_stance = "BEARISH"
+    elif has_bull_flow_confirm and not is_extreme_fomo:
+        onchain_stance = "BULLISH"
+    elif fr_val > 0.0005 or ls_val > 2.2:
+        onchain_stance = "BEARISH"
+    elif fr_val < -0.0006 and oi_chg_1h < -1.0 and is_extreme_ice:
+        # 仅在极端负费率 + 空头平仓缩量 + 极端冰点时提示轧空反弹
+        onchain_stance = "BULLISH"
+    elif top_ls_val < 0.85 and ema20_1h < ema50_1h:
+        onchain_stance = "BEARISH"
+    elif top_ls_val > 1.25 and ema20_1h > ema50_1h:
+        onchain_stance = "BULLISH"
+    else:
+        onchain_stance = "NEUTRAL"
+
+    sniper_stance = (
+        "BULLISH"
+        if (current_price >= ema20_1h and rsi_15m <= eff_rsi_ceiling and macd_hist_1h >= 0)
+        else (
+            "BEARISH"
+            if (current_price <= ema20_1h and rsi_15m >= eff_rsi_floor and macd_hist_1h <= 0)
+            else "NEUTRAL"
+        )
+    )
+    # 宏观视角综合 4H 均线与板块资金流方向
+    if ema20_4h > ema50_4h and sec_flow_score >= -15.0:
+        macro_stance = "BULLISH"
+    elif ema20_4h < ema50_4h or sec_flow_score <= -20.0:
+        macro_stance = "BEARISH"
+    else:
+        macro_stance = "NEUTRAL"
 
     def _stance_val(st: str) -> float:
         return 1.0 if st == "BULLISH" else (-1.0 if st == "BEARISH" else 0.0)
@@ -147,14 +252,18 @@ def generate_quantitative_rule_decision(
         evo_mgr.record_symbol_opinions(symbol, {
             "bull_specialist": {"role_name": "冲锋多头分析师", "stance": bull_stance, "confidence": round(0.65 + abs(rsi_1h - 50.0) * 0.006, 2)},
             "bear_critic": {"role_name": "铁血风控挑刺官", "stance": bear_stance, "confidence": round(0.75 if bear_stance == "BEARISH" else 0.55, 2)},
-            "macro_news": {"role_name": "全球资讯情报员", "stance": macro_stance, "confidence": 0.70},
-            "onchain_analyst": {"role_name": "链上主力侦察员", "stance": onchain_stance, "confidence": 0.72},
+            "macro_news": {"role_name": "全球资讯情报员", "stance": macro_stance, "confidence": 0.72},
+            "onchain_analyst": {"role_name": "链上主力侦察员", "stance": onchain_stance, "confidence": round(0.80 if (has_bear_flow_confirm or has_bull_flow_confirm) else 0.68, 2)},
             "micro_sniper": {"role_name": "微观盘口狙击手", "stance": sniper_stance, "confidence": 0.76},
             "chief_arbiter": {"role_name": "首席风控仲裁官", "stance": arbiter_stance, "confidence": round(min(0.92, 0.65 + abs(weighted_consensus) * 0.3), 2)},
         })
 
-    # 判定多空趋势与多周期共振状态 (受自驱进化 RSI 阈值与达尔文隔离保护约束)
-    if is_quarantined and not (position and getattr(position, "pos", 0) > 0):
+    # 判定多空完全对称趋势与多周期共振状态 (受指标完整性、达尔文隔离与逆向极值护栏约束)
+    has_active_pos = bool(position and getattr(position, "pos", 0) > 0)
+    if indicators_missing and not has_active_pos:
+        is_bullish = False
+        is_bearish = False
+    elif is_quarantined and not has_active_pos:
         is_bullish = False
         is_bearish = False
     elif is_squeezed:
@@ -162,24 +271,52 @@ def generate_quantitative_rule_decision(
         is_bearish = False
     elif is_agg:
         is_bullish = (
-            50.0 <= rsi_15m <= rsi_ceiling and 50.0 <= rsi_1h <= rsi_ceiling
+            (not is_extreme_fomo)
+            and 50.0 <= rsi_15m <= eff_rsi_ceiling and 50.0 <= rsi_1h <= eff_rsi_ceiling
             and ((rsi_15m >= 52.0 and current_price >= ema20_1h and ema20_1h >= ema50_1h * 0.998) or (rsi_1h >= 56.0 and current_price >= ema20_1h))
             and weighted_consensus > -0.05
         )
         is_bearish = (
-            rsi_floor <= rsi_15m <= 50.0 and rsi_floor <= rsi_1h <= 50.0
-            and ((rsi_15m <= 48.0 and current_price <= ema20_1h and ema20_1h <= ema50_1h * 1.002) or (rsi_1h <= 44.0 and current_price <= ema20_1h))
+            (not is_extreme_ice)
+            and eff_rsi_floor <= rsi_15m <= 52.0 and eff_rsi_floor <= rsi_1h <= 52.0
+            and (
+                (rsi_15m <= 48.0 and current_price <= ema20_1h and ema20_1h <= ema50_1h * 1.002)
+                or (rsi_1h <= 45.0 and current_price <= ema20_1h)
+                or (has_bear_flow_confirm and current_price <= ema20_1h and ema20_4h < ema50_4h)
+            )
             and weighted_consensus < 0.05
         )
     else:
+        # 顺势做多 (回调企稳多 / 资金流入突破多)
         is_bullish = (
-            (ema20_1h > ema50_1h and current_price >= ema20_1h * 0.998 and 51.0 <= rsi_1h <= rsi_ceiling and macd_hist_1h >= -0.05 * atr_1h)
-            or (58.0 <= rsi_1h <= rsi_ceiling and ema20_4h >= ema50_4h and current_price >= ema20_1h)
-        ) and (rsi_15m <= rsi_ceiling + 2.0) and (weighted_consensus >= 0.05)
+            (not is_extreme_fomo)
+            and (
+                (ema20_1h > ema50_1h and current_price >= ema20_1h * 0.997 and 48.0 <= rsi_1h <= eff_rsi_ceiling and macd_hist_1h >= -0.05 * atr_1h)
+                or (56.0 <= rsi_1h <= eff_rsi_ceiling and ema20_4h >= ema50_4h and current_price >= ema20_1h)
+                or (has_bull_flow_confirm and ema20_1h > ema50_1h and ema20_4h >= ema50_4h and current_price >= ema20_1h and rsi_1h <= eff_rsi_ceiling)
+            )
+            and (rsi_15m <= eff_rsi_ceiling + 2.0)
+            and (weighted_consensus >= 0.05)
+        )
+        # 顺势做空 (模式1: 反弹承压空 | 模式2: 资金流出放量破位空)
+        is_bearish_pullback = (
+            ema20_1h < ema50_1h
+            and current_price <= ema20_1h * 1.003
+            and eff_rsi_floor <= rsi_1h <= 52.0
+            and macd_hist_1h <= 0.05 * atr_1h
+        )
+        is_bearish_breakdown = (
+            (
+                (eff_rsi_floor <= rsi_1h <= 44.0 and ema20_4h < ema50_4h and current_price <= ema20_1h)
+                or (has_bear_flow_confirm and ema20_1h < ema50_1h and current_price <= ema20_1h and eff_rsi_floor <= rsi_1h <= 50.0)
+            )
+        )
         is_bearish = (
-            (ema20_1h < ema50_1h and current_price <= ema20_1h * 1.002 and rsi_floor <= rsi_1h <= 48.0 and macd_hist_1h <= 0.05 * atr_1h)
-            or (rsi_floor <= rsi_1h <= 40.0 and ema20_4h < ema50_4h and current_price <= ema20_1h)
-        ) and (rsi_15m >= rsi_floor - 2.0) and (weighted_consensus <= -0.05)
+            (not is_extreme_ice)
+            and (is_bearish_pullback or is_bearish_breakdown)
+            and (rsi_15m >= eff_rsi_floor - 2.0)
+            and (weighted_consensus <= -0.05)
+        )
 
     # 持仓感知 (Position-Aware) 两阶段动态离场研判：
     # 严格区分阶段1 (未减半，浮盈门槛 ≥ max(1.2%, 1.3*ATR)) 与阶段2 (已减半长尾波段，浮盈门槛 ≥ max(2.5%, 2.5*ATR))，杜绝 0.6% 蚊子肉秒平死循环！
@@ -197,31 +334,31 @@ def generate_quantitative_rule_decision(
         rsi_ob_15m = 78.0 if has_stage1_tp else 72.0
         rsi_os_15m = 22.0 if has_stage1_tp else 28.0
 
-        # 多单主动止盈判定
+        # 多单主动止盈判定 (含板块极端过热提前落袋保护)
         if is_pos_long and pos_profit_ratio >= min_tp_ratio:
-            if rsi_15m >= rsi_ob_15m or (current_price >= bb_up_15m * 0.999 and rsi_15m >= (rsi_ob_15m - 3.0)) or rsi_1h >= 76.0:
+            if rsi_15m >= rsi_ob_15m or (current_price >= bb_up_15m * 0.999 and rsi_15m >= (rsi_ob_15m - 3.0)) or rsi_1h >= 76.0 or (is_extreme_fomo and pos_profit_ratio >= 0.015):
                 should_close_tp = True
                 stage_label = "阶段2长尾波段" if has_stage1_tp else "阶段1半仓锁定"
-                close_reason_summary = f"多单持仓顺势浮盈达 +{pos_profit_ratio*100:.2f}% ({stage_label})，15m RSI({round(rsi_15m, 1)}) 触及超买衰竭区，触发主动获利了结！"
-                close_reasoning_details = f"当前持有多头仓位 (开仓均价 ${position.avg_px})，现价 ${current_price}。15m RSI 达到 {round(rsi_15m, 1)}，盘面短线动能衰减，执行{stage_label}主动止盈。"
+                close_reason_summary = f"多单持仓顺势浮盈达 +{pos_profit_ratio*100:.2f}% ({stage_label})，15m RSI({round(rsi_15m, 1)}) 或资金流进入过热区，触发主动获利了结！"
+                close_reasoning_details = f"当前持有多头仓位 (开仓均价 ${position.avg_px})，现价 ${current_price}。15m RSI 达到 {round(rsi_15m, 1)}，逆向资金分位 {sec_pct_24h:.0f}%，执行{stage_label}主动止盈。"
                 close_thinking_process = (
                     f"<think>\n"
                     f"1. 持仓盯市：多单持仓现价 {current_price} USDT，持仓浮盈率达 +{pos_profit_ratio*100:.2f}% (达标门槛 +{min_tp_ratio*100:.2f}%)。\n"
-                    f"2. 动能研判：15m RSI 达到 {round(rsi_15m, 1)} 超买区，价格逼近布林线上轨 {round(bb_up_15m, prec)}。\n"
+                    f"2. 动能与资金流研判：15m RSI={round(rsi_15m, 1)}，板块逆向资金分位={sec_pct_24h:.0f}%。\n"
                     f"3. 策略决策：执行{stage_label}主动止盈 (CLOSE_POSITION)，保障正数学期望值。\n"
                     f"</think>"
                 )
-        # 空单主动止盈判定
+        # 空单主动止盈判定 (含板块极端冰点防轧空主动落袋)
         elif (not is_pos_long) and pos_profit_ratio >= min_tp_ratio:
-            if rsi_15m <= rsi_os_15m or (current_price <= bb_low_15m * 1.001 and rsi_15m <= (rsi_os_15m + 3.0)) or rsi_1h <= 24.0:
+            if rsi_15m <= rsi_os_15m or (current_price <= bb_low_15m * 1.001 and rsi_15m <= (rsi_os_15m + 3.0)) or rsi_1h <= 24.0 or (is_extreme_ice and pos_profit_ratio >= 0.015):
                 should_close_tp = True
                 stage_label = "阶段2长尾波段" if has_stage1_tp else "阶段1半仓锁定"
-                close_reason_summary = f"空单持仓顺势浮盈达 +{pos_profit_ratio*100:.2f}% ({stage_label})，15m RSI({round(rsi_15m, 1)}) 探底超卖衰竭区，触发主动获利平仓！"
-                close_reasoning_details = f"当前持有空头仓位 (开仓均价 ${position.avg_px})，现价 ${current_price}。15m RSI 降至 {round(rsi_15m, 1)} 超卖区，执行{stage_label}主动止盈离场。"
+                close_reason_summary = f"空单持仓顺势浮盈达 +{pos_profit_ratio*100:.2f}% ({stage_label})，15m RSI({round(rsi_15m, 1)}) 或资金流触及极端冰点({sec_pct_24h:.0f}%)，触发主动获利平仓防轧空！"
+                close_reasoning_details = f"当前持有空头仓位 (开仓均价 ${position.avg_px})，现价 ${current_price}。15m RSI 降至 {round(rsi_15m, 1)}，逆向资金分位 {sec_pct_24h:.0f}%，执行{stage_label}主动止盈离场。"
                 close_thinking_process = (
                     f"<think>\n"
                     f"1. 持仓盯市：空单持仓现价 {current_price} USDT，持仓浮盈率达 +{pos_profit_ratio*100:.2f}% (达标门槛 +{min_tp_ratio*100:.2f}%)。\n"
-                    f"2. 动能研判：15m RSI 降至 {round(rsi_15m, 1)} 超卖区，触及布林下轨 {round(bb_low_15m, prec)}。\n"
+                    f"2. 动能与资金流研判：15m RSI={round(rsi_15m, 1)}，板块逆向资金分位={sec_pct_24h:.0f}% (极端冰点={is_extreme_ice})。\n"
                     f"3. 策略决策：规避空头轧空反弹，执行{stage_label}主动平仓离场 (CLOSE_POSITION)。\n"
                     f"</think>"
                 )
@@ -325,9 +462,10 @@ def generate_quantitative_rule_decision(
         regime = MarketRegime.TRENDING_UP
         action = SignalAction.BUY_LONG
         rsi_bonus = min(0.08, max(0.0, (rsi_1h - 50.0) * 0.005))
-        fr_bonus = 0.04 if (derivatives and derivatives.funding_rate >= 0) else 0.0
+        fr_bonus = 0.03 if (derivatives and derivatives.funding_rate >= 0) else 0.0
+        flow_bonus = min(0.08, max(0.0, sym_flow_score / 400.0)) + (0.03 if has_bull_flow_confirm else 0.0)
         consensus_bonus = min(0.08, max(-0.08, weighted_consensus * 0.12))
-        confidence = round(min(0.92, max(0.65, 0.76 + rsi_bonus + fr_bonus + consensus_bonus)), 2)
+        confidence = round(min(0.94, max(0.65, 0.74 + rsi_bonus + fr_bonus + flow_bonus + consensus_bonus)), 2)
         urgency = SignalUrgency.MEDIUM
 
         support_1 = round(min(ema20_1h, current_price - 1.2 * atr_1h), prec)
@@ -389,10 +527,11 @@ def generate_quantitative_rule_decision(
         regime = MarketRegime.TRENDING_DOWN
         action = SignalAction.SELL_SHORT
         rsi_bonus = min(0.08, max(0.0, (50.0 - rsi_1h) * 0.005))
-        fr_bonus = 0.04 if (derivatives and derivatives.funding_rate < 0) else 0.0
+        fr_bonus = 0.03 if (derivatives and derivatives.funding_rate <= 0) else 0.0
+        flow_bonus = min(0.08, max(0.0, (-sym_flow_score) / 400.0)) + (0.04 if has_bear_flow_confirm else 0.0)
         consensus_bonus = min(0.08, max(-0.08, (-weighted_consensus) * 0.12))
-        confidence = round(min(0.92, max(0.65, 0.76 + rsi_bonus + fr_bonus + consensus_bonus)), 2)
-        urgency = SignalUrgency.MEDIUM
+        confidence = round(min(0.94, max(0.65, 0.74 + rsi_bonus + fr_bonus + flow_bonus + consensus_bonus)), 2)
+        urgency = SignalUrgency.HIGH if has_bear_flow_confirm else SignalUrgency.MEDIUM
 
         resistance_1 = round(max(ema20_1h, current_price + 1.2 * atr_1h), prec)
         resistance_2 = round(max(ema50_1h, current_price + 2.5 * atr_1h), prec)
@@ -473,12 +612,21 @@ def generate_quantitative_rule_decision(
             tf_4h=TimeframeDetail(trend=TimeframeTrend.NEUTRAL_CHOPPY, key_indicators_summary="4h 宽幅箱体震荡", support_level=support_2, resistance_level=resistance_2),
             tf_1d=TimeframeDetail(trend=TimeframeTrend.NEUTRAL_CHOPPY, key_indicators_summary="日线整理平台内运行", support_level=support_2, resistance_level=resistance_2)
         )
-        if is_quarantined:
+        if indicators_missing:
+            reasoning_summary = f"[{active_epoch} 行情数据缺失保护] {symbol} 多周期技术指标暂未就绪，严格禁止盲目开仓，维持 HOLD_WAIT。"
+            reasoning_details = f"数据完整性拦截：{symbol} 缺少有效 15m/1h EMA 与 RSI 计算值，已阻断隐性多头默认值幻觉。"
+        elif is_extreme_ice:
+            reasoning_summary = f"[{active_epoch} 极端冰点逆向护栏] {symbol} 所属板块逆向资金分位达 {sec_pct_24h:.0f}%，禁止低位追空防轧空，维持观望。"
+            reasoning_details = f"多周期资金流逆向护栏生效：{symbol} 资金得分 {sym_flow_score:+.1f}，板块逆向分位 {sec_pct_24h:.0f}% 进入极端冰点。"
+        elif is_extreme_fomo:
+            reasoning_summary = f"[{active_epoch} 反FOMO过热护栏] {symbol} 所属板块逆向资金分位仅 {sec_pct_24h:.0f}%，资金过热禁止追高，维持观望。"
+            reasoning_details = f"反 FOMO 护栏生效：{symbol} 资金得分 {sym_flow_score:+.1f}，板块逆向分位 {sec_pct_24h:.0f}% 进入极端过热区。"
+        elif is_quarantined:
             reasoning_summary = f"[{active_epoch} 达尔文风控隔离] {symbol} 已被自驱进化引擎熔断隔离 ({quarantine_reason})，禁止新开仓，强制空仓观望。"
             reasoning_details = f"自驱进化诊断拦截：{symbol} 因 {quarantine_reason} 触发达尔文淘汰与毒性流动性隔离规则，当前信号强制锁定为 HOLD_WAIT。"
         else:
-            reasoning_summary = f"[{active_epoch}] 当前标的处于箱体震荡或未达进化阈值(RSI={round(rsi_1h, 1)}, 共识={weighted_consensus:+.2f})，实时价 {current_price} USDT，建议空仓观望。"
-            reasoning_details = f"标的 {symbol} 现价 {current_price} USDT 在区间 [{support_1}, {resistance_1}] 内运行，进化过滤上限 RSI={rsi_ceiling}/下限={rsi_floor}，等待高确定性突破。"
+            reasoning_summary = f"[{active_epoch}] 当前标的处于箱体震荡或未达进化阈值(RSI={round(rsi_1h, 1)}, 资金分={sym_flow_score:+.0f}, 共识={weighted_consensus:+.2f})，实时价 {current_price} USDT，建议空仓观望。"
+            reasoning_details = f"标的 {symbol} 现价 {current_price} USDT 在区间 [{support_1}, {resistance_1}] 内运行，进化过滤上限 RSI={eff_rsi_ceiling}/下限={eff_rsi_floor}，等待高确定性突破。"
         thinking_process = (
             f"<think>\n"
             f"1. 盘面与进化过滤：标的 {symbol} 实时价 {current_price} USDT，进化纪元 {active_epoch}。\n"

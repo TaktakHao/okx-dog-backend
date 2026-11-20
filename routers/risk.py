@@ -4,14 +4,16 @@ OKX-Dog 个人量化智能交易系统 - 硬风控中枢与紧急熔断路由
 处理风控状态查询、风控规则参数热更新、熔断手动解除、Panic Button 紧急全平以及风控审计日志分页查询
 """
 
+import hmac
 import json
 import time
 from typing import Any, Dict, List
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import models
+from config import settings
 from database import get_db
 from models import (
     ApiResponse,
@@ -80,8 +82,22 @@ async def reset_circuit_breaker(
     req: ResetCircuitBreakerRequest,
     db: AsyncSession = Depends(get_db)
 ):
-    """交易员核对行情后输入主密码手动解除熔断锁定"""
+    """交易员核对行情后输入主密码二次确认，方可手动解除熔断锁定"""
     now_ms = int(time.time() * 1000)
+    # Stage 0 (T0.4): 严格校验主密码，杜绝当日误触或无授权随意解除熔断
+    if not hmac.compare_digest(str(req.master_password or ""), str(settings.MASTER_PASSWORD)):
+        await risk_controller.record_risk_event(
+            event_type=RiskEventType.ORDER_REJECTED,
+            rule_name="CIRCUIT_BREAKER_RESET_AUTH_FAILED",
+            limit_val="VALID_MASTER_PASSWORD",
+            current_val="INVALID_PASSWORD",
+            is_blocked=True,
+            action_taken="DENY_UNLOCK",
+            severity=models.AuditSeverity.WARNING,
+            details={"reason_attempt": req.reason},
+        )
+        raise HTTPException(status_code=403, detail="主密码校验失败，拒绝解除硬风控熔断锁定！")
+
     await risk_controller.reset_circuit_breaker(reason=req.reason)
     status_data = await risk_controller.get_status()
     return ApiResponse(code=0, msg="熔断锁定已解除，系统恢复正常交易状态", data=status_data, timestamp=now_ms)

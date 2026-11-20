@@ -45,11 +45,16 @@ async def get_paper_account():
 
 @router.post("/api/v1/paper/reset", response_model=ApiResponse[PaperAccountInfo], summary="重置模拟操盘账户与初始资金")
 async def reset_paper_account(req: PaperResetRequest):
-    """重置模拟账户初始虚拟资金，并清空所有模拟持仓与委托挂单"""
+    """重置模拟账户初始虚拟资金，清空所有模拟持仓与委托挂单，并联动重置影子盘基准与风控状态"""
     now_ms = int(time.time() * 1000)
     info = paper_engine.reset_account(req.initial_equity_usdt)
 
-    # 广播持仓与资产清空事件
+    # 联动重置风控单日盈亏统计与自动操盘基准，消除旧模拟亏损残留导致的保本底线秒停
+    if not (rest_client.is_live_mode and bool(rest_client.api_key)):
+        risk_controller.reset_for_mode_switch()
+    ap_status = await auto_pilot_manager.sync_after_paper_reset(req.initial_equity_usdt)
+
+    # 广播持仓、资产与自动操盘重置事件
     await ws_manager.broadcast_to_subscribers(WSPushPayload[List[PositionModel]](
         channel="positions",
         event=WSServerEvent.SNAPSHOT,
@@ -60,6 +65,12 @@ async def reset_paper_account(req: PaperResetRequest):
         channel="account",
         event=WSServerEvent.UPDATE,
         data=paper_engine.get_account_balance(),
+        timestamp=now_ms
+    ))
+    await ws_manager.broadcast_to_subscribers(WSPushPayload[AutoPilotStatusModel](
+        channel="auto_pilot",
+        event=WSServerEvent.UPDATE,
+        data=ap_status,
         timestamp=now_ms
     ))
 

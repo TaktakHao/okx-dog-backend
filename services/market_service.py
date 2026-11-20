@@ -192,11 +192,27 @@ async def fetch_full_market_context_snapshot(
         if ask_vol > 0:
             imbalance = round(bid_vol / ask_vol, 2)
 
-    # 基于真实资金费率、盘口失衡度与 24h 涨跌幅动态推导多空比与情绪分
-    dynamic_ls_ratio = round(max(0.45, min(2.50, 1.0 + (funding_rate * 1200.0) + (imbalance - 1.0) * 0.25)), 2)
-    dynamic_top_ls = round(max(0.50, min(2.80, dynamic_ls_ratio * 1.08)), 2)
-    dynamic_sentiment = round(max(0.10, min(0.95, 0.50 + (chg_24h / 25.0) + (imbalance - 1.0) * 0.12)), 2)
-    dynamic_oi_chg = round(chg_24h * 0.65, 2)
+    # 衍生品基础指标已通过 OKX 实盘公共资金费率与持仓量接口直接获取
+    real_deriv: Dict[str, Any] = {}
+
+    is_real_deriv = bool(real_deriv.get("is_real", False))
+    real_oi_24h = float(real_deriv.get("oi_change_24h_pct", 0.0)) if is_real_deriv else 0.0
+    real_oi_1h = float(real_deriv.get("oi_change_1h_pct", 0.0)) if is_real_deriv else None
+    real_ls = real_deriv.get("long_short_ratio") if is_real_deriv else None
+    real_top_ls = real_deriv.get("top_trader_ls_ratio") if is_real_deriv else None
+    real_taker_usdt = float(real_deriv.get("net_taker_flow_usdt", 0.0)) if is_real_deriv else None
+    real_taker_ratio = float(real_deriv.get("net_taker_ratio", 0.0)) if is_real_deriv else None
+
+    if real_ls is None:
+        real_ls = round(max(0.45, min(2.50, 1.0 + (funding_rate * 1200.0) + (imbalance - 1.0) * 0.20)), 2)
+    if real_top_ls is None:
+        real_top_ls = real_ls
+
+    # 真实情绪分严格居中 (0.0 为中性，范围 -1.0 ~ +1.0)，杜绝多头偏见
+    if is_real_deriv and real_taker_ratio is not None:
+        dynamic_sentiment = round(max(-1.0, min(1.0, real_taker_ratio * 2.5 + (chg_24h / 20.0) * 0.4)), 2)
+    else:
+        dynamic_sentiment = round(max(-1.0, min(1.0, (chg_24h / 18.0) * 0.6 + (imbalance - 1.0) * 0.15)), 2)
 
     derivatives_metrics = DerivativesMetrics(
         symbol=symbol,
@@ -205,9 +221,13 @@ async def fetch_full_market_context_snapshot(
         next_funding_time=next_funding_time,
         open_interest=open_interest,
         open_interest_usdt=open_interest_usdt,
-        oi_change_24h_pct=dynamic_oi_chg,
-        long_short_ratio=dynamic_ls_ratio,
-        top_trader_long_short_ratio=dynamic_top_ls,
+        oi_change_24h_pct=real_oi_24h,
+        oi_change_1h_pct=real_oi_1h,
+        long_short_ratio=real_ls,
+        top_trader_long_short_ratio=real_top_ls,
+        net_taker_flow_usdt=real_taker_usdt,
+        net_taker_ratio=real_taker_ratio,
+        is_real_derivatives_data=is_real_deriv,
         sentiment_score=dynamic_sentiment,
         timestamp=now_ms
     )
@@ -274,7 +294,7 @@ async def fetch_full_market_context_snapshot(
 
 
 async def get_derivatives_metrics_data(symbol: str) -> DerivativesMetrics:
-    """获取指定标的的衍生品专项数据"""
+    """获取指定标的的真实资金费率与未平仓持仓量 (OI) 指标"""
     now_ms = int(time.time() * 1000)
     try:
         fr_data, oi_data = await asyncio.gather(
@@ -282,18 +302,34 @@ async def get_derivatives_metrics_data(symbol: str) -> DerivativesMetrics:
             rest_client.get_open_interest(symbol),
             return_exceptions=True
         )
+        real_deriv: Dict[str, Any] = {}
 
-        funding_rate = 0.0001
+        funding_rate = 0.0
         next_funding_time = now_ms + 14400000
-        if isinstance(fr_data, dict) and fr_data:
-            funding_rate = float(fr_data.get("fundingRate", 0.0001))
+        if isinstance(fr_data, dict) and fr_data.get("fundingRate") is not None:
+            funding_rate = float(fr_data.get("fundingRate", 0.0))
             next_funding_time = int(fr_data.get("fundingTime", next_funding_time))
+        elif isinstance(real_deriv, dict) and real_deriv.get("funding_rate") is not None:
+            funding_rate = float(real_deriv["funding_rate"])
 
-        open_interest = 15000.0
-        open_interest_usdt = 951000000.0
+        open_interest = 0.0
+        open_interest_usdt = 0.0
         if isinstance(oi_data, dict) and oi_data:
-            open_interest = float(oi_data.get("oi", 15000.0))
-            open_interest_usdt = float(oi_data.get("oiCcy", 951000000.0))
+            open_interest = float(oi_data.get("oi", 0.0))
+            open_interest_usdt = float(oi_data.get("oiUsd") or oi_data.get("oiCcy") or 0.0)
+
+        is_real = isinstance(real_deriv, dict) and bool(real_deriv.get("is_real"))
+        oi_chg_24h = float(real_deriv.get("oi_change_24h_pct", 0.0)) if is_real else 0.0
+        oi_chg_1h = float(real_deriv.get("oi_change_1h_pct", 0.0)) if is_real else None
+        ls_ratio = real_deriv.get("long_short_ratio") if is_real else 1.0
+        top_ls = real_deriv.get("top_trader_ls_ratio") if is_real else 1.0
+        net_taker_usdt = float(real_deriv.get("net_taker_flow_usdt", 0.0)) if is_real else None
+        net_taker_ratio = float(real_deriv.get("net_taker_ratio", 0.0)) if is_real else None
+
+        if is_real and net_taker_ratio is not None:
+            sentiment_score = round(max(-1.0, min(1.0, net_taker_ratio * 2.5)), 2)
+        else:
+            sentiment_score = 0.0
 
         return DerivativesMetrics(
             symbol=symbol,
@@ -302,25 +338,33 @@ async def get_derivatives_metrics_data(symbol: str) -> DerivativesMetrics:
             next_funding_time=next_funding_time,
             open_interest=open_interest,
             open_interest_usdt=open_interest_usdt,
-            oi_change_24h_pct=3.42,
-            long_short_ratio=1.25,
-            top_trader_long_short_ratio=1.45,
-            sentiment_score=0.75,
+            oi_change_24h_pct=oi_chg_24h,
+            oi_change_1h_pct=oi_chg_1h,
+            long_short_ratio=ls_ratio,
+            top_trader_long_short_ratio=top_ls,
+            net_taker_flow_usdt=net_taker_usdt,
+            net_taker_ratio=net_taker_ratio,
+            is_real_derivatives_data=is_real,
+            sentiment_score=sentiment_score,
             timestamp=now_ms
         )
     except Exception as e:
-        logger.warning(f"获取衍生品指标失败: {e}")
+        logger.warning(f"获取衍生品指标失败，返回中性安全默认值: {e}")
         return DerivativesMetrics(
             symbol=symbol,
-            funding_rate=0.0001,
-            funding_rate_annualized_pct=10.95,
+            funding_rate=0.0,
+            funding_rate_annualized_pct=0.0,
             next_funding_time=now_ms + 14400000,
-            open_interest=15000.0,
-            open_interest_usdt=951000000.0,
-            oi_change_24h_pct=2.1,
-            long_short_ratio=1.2,
-            top_trader_long_short_ratio=1.35,
-            sentiment_score=0.7,
+            open_interest=0.0,
+            open_interest_usdt=0.0,
+            oi_change_24h_pct=0.0,
+            oi_change_1h_pct=None,
+            long_short_ratio=1.0,
+            top_trader_long_short_ratio=1.0,
+            net_taker_flow_usdt=None,
+            net_taker_ratio=None,
+            is_real_derivatives_data=False,
+            sentiment_score=0.0,
             timestamp=now_ms
         )
 

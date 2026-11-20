@@ -56,10 +56,12 @@ from services.backtest_engine import BacktestEngine
 from services.news_service import NewsService
 from services.knowledge_base_service import KnowledgeBaseService
 from services.daily_review_service import DailyReviewService
-from services.consensus_service import ConsensusService
 from services.telegram_bot import TelegramBotService
 from services.reconciliation_service import ReconciliationService
 from services.execution_engine import SmartExecutionEngine
+from services.portfolio_allocator import PortfolioAllocator
+from services.funding_carry_service import FundingCarryService
+from services.dual_engine_driver import DualEngineShadowDriver
 
 try:
     if okx_dog_ai and hasattr(okx_dog_ai, "antigravity_bridge"):
@@ -74,13 +76,12 @@ except (ImportError, PermissionError, Exception):
 # 日志记录器
 logger = logging.getLogger("okx_dog.gateway")
 
-# v3.0 核心服务单例
+# 核心量化与离线投研服务单例
 data_lake_service = DataLakeService(rest_client=rest_client)
 backtest_engine = BacktestEngine(data_lake=data_lake_service)
 news_service = NewsService()
 knowledge_base_service = KnowledgeBaseService()
 daily_review_service = DailyReviewService(kb_service=knowledge_base_service)
-consensus_service = ConsensusService(kb_service=knowledge_base_service, news_service=news_service)
 telegram_bot_service = TelegramBotService()
 reconciliation_service = ReconciliationService(
     rest_client=rest_client,
@@ -91,6 +92,26 @@ reconciliation_service = ReconciliationService(
 smart_execution_engine = SmartExecutionEngine(
     rest_client=rest_client,
     risk_controller=risk_controller
+)
+portfolio_allocator = PortfolioAllocator(
+    trend_weight=0.60,
+    carry_weight=0.30,
+    buffer_weight=0.10,
+    trend_4h_subweight=0.50,
+    trend_1d_subweight=0.50,
+)
+funding_carry_service = FundingCarryService(
+    rest_client=rest_client,
+    execution_engine=smart_execution_engine,
+    data_lake=data_lake_service,
+    portfolio_allocator=portfolio_allocator,
+)
+dual_engine_driver = DualEngineShadowDriver(
+    rest_client=rest_client,
+    paper_engine=paper_engine,
+    risk_controller=risk_controller,
+    portfolio_allocator=portfolio_allocator,
+    funding_carry_service=funding_carry_service,
 )
 from services.position_sizer import position_sizer
 
@@ -108,10 +129,12 @@ __all__ = [
     "news_service",
     "knowledge_base_service",
     "daily_review_service",
-    "consensus_service",
     "telegram_bot_service",
     "reconciliation_service",
     "smart_execution_engine",
+    "portfolio_allocator",
+    "funding_carry_service",
+    "dual_engine_driver",
     "position_sizer",
     "BACKEND_DIR",
     "ROOT_DIR",

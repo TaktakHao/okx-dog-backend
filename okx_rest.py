@@ -223,7 +223,13 @@ class OKXRestClient:
             "Content-Type": "application/json"
         }
 
-        # 模拟盘必须包含 x-simulated-trading 标头
+        # Stage 0: 当开启实盘公共行情开关时，公共行情/市场统计接口统一访问 OKX 实盘公共端点
+        # 不附带 x-simulated-trading 也不附带私有密钥，彻底消除模拟盘脏 tick 与过期 API Key 导致的公共行情报错
+        is_public_endpoint = self._categorize_endpoint(request_path) == "public"
+        if is_public_endpoint and settings.USE_LIVE_PUBLIC_MARKET_DATA:
+            return headers
+
+        # 模拟盘私有与下单请求必须包含 x-simulated-trading 标头
         if not self.is_live_mode:
             headers["x-simulated-trading"] = "1"
 
@@ -245,7 +251,7 @@ class OKXRestClient:
 
     def _categorize_endpoint(self, path: str) -> str:
         """根据请求路径分类以进行针对性限流"""
-        if "/api/v5/market/" in path or "/api/v5/public/" in path:
+        if "/api/v5/market/" in path or "/api/v5/public/" in path or "/api/v5/rubik/" in path:
             return "public"
         elif "/api/v5/trade/" in path:
             return "trade"
@@ -426,6 +432,56 @@ class OKXRestClient:
         candles.sort(key=lambda x: x.timestamp)
         return candles
 
+    async def get_kline_history(
+        self,
+        symbol: str,
+        bar: str = "4H",
+        limit: int = 100,
+        after: Optional[str] = None,
+        before: Optional[str] = None
+    ) -> List[KlineCandle]:
+        """
+        获取深历史 K 线数据 (支持跨多年全量回溯)
+        GET /api/v5/market/history-candles
+        :param bar: 周期 (15m, 1H, 4H, 1Dutc 等)
+        :param limit: 单页条数 (OKX history-candles 最大 100)
+        :param after: 请求早于该毫秒时间戳的更旧数据
+        :param before: 请求晚于该毫秒时间戳的更新数据
+        :return: 按时间戳升序排列的 KlineCandle 列表 (candles[0] 为本页最旧一根)
+        """
+        bar_map = {
+            "1h": "1H",
+            "4h": "4H",
+            "1d": "1Dutc",
+            "1D": "1Dutc",
+        }
+        bar_norm = bar_map.get(bar, bar)
+        params: Dict[str, Any] = {
+            "instId": symbol,
+            "bar": bar_norm,
+            "limit": str(min(max(1, limit), 100)),
+        }
+        if after:
+            params["after"] = str(after)
+        if before:
+            params["before"] = str(before)
+
+        raw_list = await self._request("GET", "/api/v5/market/history-candles", params=params)
+        candles: List[KlineCandle] = []
+        for k in raw_list:
+            candles.append(KlineCandle(
+                timestamp=int(k[0]),
+                open=float(k[1]),
+                high=float(k[2]),
+                low=float(k[3]),
+                close=float(k[4]),
+                volume=float(k[5]),
+                vol_currency=float(k[6]) if len(k) > 6 else None,
+                is_closed=bool(int(k[8])) if len(k) > 8 else True
+            ))
+        candles.sort(key=lambda x: x.timestamp)
+        return candles
+
     async def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
         """
         获取订单簿深度盘口
@@ -486,11 +542,139 @@ class OKXRestClient:
         data = await self._request("GET", "/api/v5/public/funding-rate-history", params=params)
         return data or []
 
+    async def get_funding_rate_history_range(
+        self,
+        symbol: str,
+        start_ts_ms: int,
+        max_pages: int = 45
+    ) -> Dict[int, float]:
+        """
+        分页拉取指定起始时间以来的全量真实 8 小时历史资金费率
+        :return: {funding_time_ms: funding_rate} 字典
+        """
+        funding_map: Dict[int, float] = {}
+        cursor_after: Optional[str] = None
+
+        for _ in range(max_pages):
+            batch = await self.get_funding_rate_history(symbol=symbol, limit=100, after=cursor_after)
+            if not batch:
+                break
+
+            oldest_ts: Optional[int] = None
+            for item in batch:
+                f_ts = int(item.get("fundingTime") or 0)
+                f_rate = float(item.get("realizedRate") or item.get("fundingRate") or 0.0)
+                if f_ts > 0:
+                    funding_map[f_ts] = f_rate
+                    if oldest_ts is None or f_ts < oldest_ts:
+                        oldest_ts = f_ts
+
+            if oldest_ts is None or oldest_ts <= start_ts_ms or len(batch) < 100:
+                break
+
+            cursor_after = str(oldest_ts)
+            await asyncio.sleep(0.06)
+
+        return funding_map
+
     async def get_open_interest(self, symbol: str, inst_type: str = "SWAP") -> Dict[str, Any]:
         """获取合约全网持仓量 GET /api/v5/public/open-interest"""
         params = {"instType": inst_type, "instId": symbol}
         data = await self._request("GET", "/api/v5/public/open-interest", params=params)
         return data[0] if data else {}
+
+    async def get_all_tickers(self, inst_type: str = "SWAP") -> List[Dict[str, Any]]:
+        """
+        获取全市场指定产品类型的所有最新 Ticker 快照（单次轻量请求覆盖全网 150+ 永续合约）
+        GET /api/v5/market/tickers
+        """
+        data = await self._request("GET", "/api/v5/market/tickers", params={"instType": inst_type})
+        return data or []
+
+    async def get_all_open_interest(self, inst_type: str = "SWAP") -> List[Dict[str, Any]]:
+        """
+        批量获取全市场合约当前全网持仓量 (OI)
+        GET /api/v5/public/open-interest
+        """
+        data = await self._request("GET", "/api/v5/public/open-interest", params={"instType": inst_type})
+        return data or []
+
+    @staticmethod
+    def _extract_base_ccy(symbol: str) -> str:
+        """从标的代码提取基础币种，如 TAO-USDT-SWAP -> TAO"""
+        return symbol.strip().upper().split("-")[0]
+
+    async def get_open_interest_volume(
+        self,
+        symbol_or_ccy: str,
+        period: str = "1H"
+    ) -> List[List[str]]:
+        """
+        获取 OKX 真实合约持仓量与交易量历史序列（用于计算真实 OI Delta）
+        GET /api/v5/rubik/stat/contracts/open-interest-volume
+        返回元素格式: [ts, oi_usd, vol_usd] (按时间倒序)
+        """
+        ccy = self._extract_base_ccy(symbol_or_ccy)
+        data = await self._request(
+            "GET",
+            "/api/v5/rubik/stat/contracts/open-interest-volume",
+            params={"ccy": ccy, "period": period}
+        )
+        return data or []
+
+    async def get_taker_volume(
+        self,
+        symbol_or_ccy: str,
+        inst_type: str = "CONTRACTS",
+        period: str = "1H"
+    ) -> List[List[str]]:
+        """
+        获取 OKX 真实主动买入/卖出成交量（Taker Buy vs Taker Sell / CVD 核心数据源）
+        GET /api/v5/rubik/stat/taker-volume
+        返回元素格式: [ts, sellVol, buyVol] (按时间倒序)
+        """
+        ccy = self._extract_base_ccy(symbol_or_ccy)
+        data = await self._request(
+            "GET",
+            "/api/v5/rubik/stat/taker-volume",
+            params={"ccy": ccy, "instType": inst_type, "period": period}
+        )
+        return data or []
+
+    async def get_long_short_account_ratio(
+        self,
+        symbol_or_ccy: str,
+        period: str = "1H"
+    ) -> List[List[str]]:
+        """
+        获取 OKX 真实合约多空持仓人数比
+        GET /api/v5/rubik/stat/contracts/long-short-account-ratio
+        返回元素格式: [ts, ratio] (按时间倒序)
+        """
+        ccy = self._extract_base_ccy(symbol_or_ccy)
+        data = await self._request(
+            "GET",
+            "/api/v5/rubik/stat/contracts/long-short-account-ratio",
+            params={"ccy": ccy, "period": period}
+        )
+        return data or []
+
+    async def get_top_trader_long_short_ratio(
+        self,
+        symbol: str,
+        period: str = "1H"
+    ) -> List[List[str]]:
+        """
+        获取 OKX 真实精英大户合约多空持仓比
+        GET /api/v5/rubik/stat/contracts/long-short-account-ratio-contract-top-trader
+        返回元素格式: [ts, ratio] (按时间倒序)
+        """
+        data = await self._request(
+            "GET",
+            "/api/v5/rubik/stat/contracts/long-short-account-ratio-contract-top-trader",
+            params={"instId": symbol, "period": period}
+        )
+        return data or []
 
     # =========================================================================
     # 2. 账户与资产接口 (Account & Balance APIs)
@@ -991,13 +1175,19 @@ class OKXRestClient:
         try:
             res = await self._request("POST", "/api/v5/trade/order", json_data=body)
         except OKXApiException as okx_err:
+            # Stage 0 (T0.1) 安全红线：附带硬止损校验失败时严禁降级提交裸单，直接拒单并推送紧急告警
             if "attachAlgoOrds" in body and body["attachAlgoOrds"]:
-                logger.warning(f"附带 TP/SL 校验未通过 ({okx_err})，正在降级为提交主委托以保障即时成交...")
-                body_no_algo = dict(body)
-                del body_no_algo["attachAlgoOrds"]
-                res = await self._request("POST", "/api/v5/trade/order", json_data=body_no_algo)
-            else:
-                raise
+                alert_msg = (
+                    f"🚨【安全阻断-禁止无止损裸单】标的 {symbol} 附带 TP/SL 委托校验未通过 ({okx_err})，"
+                    f"系统已强制拒绝本次开仓，杜绝产生交易所侧无止损裸仓！"
+                )
+                logger.critical(alert_msg)
+                try:
+                    from state import telegram_bot_service
+                    asyncio.create_task(telegram_bot_service.send_message(alert_msg))
+                except Exception:
+                    pass
+            raise
 
         if not res:
             raise OKXApiException("500", "OKX 订单提交未返回数据")
@@ -1255,7 +1445,86 @@ class OKXRestClient:
             body["slTriggerPxType"] = "mark"
 
         res = await self._request("POST", "/api/v5/trade/order-algo", json_data=body)
-        return res[0] if res else {}
+        item = res[0] if res else {}
+        s_code = str(item.get("sCode", "0"))
+        if s_code != "0":
+            raise OKXApiException(s_code, f"止盈止损策略单挂载失败: {item.get('sMsg', '未知错误')}", data=item)
+        return item
+
+    async def replace_position_stop_loss_safely(
+        self,
+        symbol: str,
+        pos_side: Union[PosSide, str],
+        sz: float,
+        sl_trigger_price: float,
+        tp_trigger_price: Optional[float] = None,
+        trade_mode: str = "cross",
+        max_retries: int = 2
+    ) -> Dict[str, Any]:
+        """
+        Stage 0 (T0.2) 零裸仓窗口安全改损协议 (Mount-Before-Cancel)：
+        1. 先快照当前标的已有的条件止损单 algoId 列表；
+        2. 优先向交易所挂载新的止损策略单并校验回执 (sCode == '0' 且返回 algoId)，失败最多重试 max_retries 次；
+        3. 仅在新止损确认生效后，才撤销旧的条件止损单，彻底消除“先撤单再挂单”导致的裸仓真空期；
+        4. 若挂载失败，保留旧止损单完好无损，提升至 ERROR 日志并推送 Telegram 紧急告警。
+        """
+        old_algos: List[Dict[str, str]] = []
+        inst_type = "SWAP" if "SWAP" in symbol else ("SPOT" if "-" in symbol else "SWAP")
+        for ord_tp in ("conditional", "oco", "trigger"):
+            try:
+                pending = await self.get_pending_algo_orders(symbol=symbol, inst_type=inst_type, ord_type=ord_tp)
+                for a in pending:
+                    if a.get("instId") == symbol and a.get("algoId"):
+                        old_algos.append({"instId": a["instId"], "algoId": a["algoId"]})
+            except Exception as q_err:
+                logger.warning(f"[安全改损] 查询旧条件单 ({ord_tp}) 异常 {symbol}: {q_err}")
+
+        new_algo_res: Optional[Dict[str, Any]] = None
+        last_err: Optional[Exception] = None
+        for attempt in range(1, max_retries + 2):
+            try:
+                res = await self.place_tpsl_algo_order(
+                    symbol=symbol,
+                    pos_side=pos_side,
+                    sz=sz,
+                    tp_trigger_price=tp_trigger_price,
+                    sl_trigger_price=sl_trigger_price,
+                    trade_mode=trade_mode,
+                )
+                if res and res.get("algoId"):
+                    new_algo_res = res
+                    break
+                raise OKXApiException("500", f"新止损单未返回有效 algoId: {res}")
+            except Exception as e:
+                last_err = e
+                logger.error(f"[安全改损] {symbol} 新止损单挂载第 {attempt} 次失败 (SL=${sl_trigger_price}): {e}")
+                if attempt <= max_retries:
+                    await asyncio.sleep(0.5 * attempt)
+
+        if not new_algo_res:
+            alert_msg = (
+                f"🚨【安全改损失败-已保留旧止损】标的 {symbol} 尝试挂载新止损价 `${sl_trigger_price}` 连续失败: {last_err}。"
+                f"系统已取消撤销旧条件单以避免裸仓，请立即人工检查交易所止损状态！"
+            )
+            logger.error(alert_msg)
+            try:
+                from state import telegram_bot_service
+                asyncio.create_task(telegram_bot_service.send_message(alert_msg))
+            except Exception:
+                pass
+            raise OKXApiException("SL_REPLACE_FAILED", str(last_err or "新止损单挂载失败"))
+
+        # 新止损已确认生效，再安全撤销旧止损条件单
+        new_algo_id = new_algo_res.get("algoId")
+        to_cancel = [a for a in old_algos if a.get("algoId") != new_algo_id]
+        if to_cancel:
+            try:
+                await self.cancel_batch_algo_orders(to_cancel)
+                logger.info(f"[安全改损] {symbol} 新止损 ({new_algo_id}) 已生效，成功清理 {len(to_cancel)} 笔旧条件单")
+            except Exception as cxl_err:
+                logger.warning(f"[安全改损] {symbol} 新止损已生效，但清理旧条件单出现轻微异常 (不影响防护): {cxl_err}")
+
+        return new_algo_res
 
     async def close_position(
         self,

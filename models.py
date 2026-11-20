@@ -389,6 +389,10 @@ class RiskRulesConfig(BaseModel):
     default_take_profit_pct: Optional[float] = Field(None, description="默认附带止盈百分比")
     fixed_risk_per_trade_percent: float = Field(0.01, gt=0.0, le=0.1, description="单笔最大风险暴露比例 (默认 1% 净值，7000 USDT 本金对应 70 USDT)")
     enforce_post_only: bool = Field(True, description="开仓委托是否强制 Post-Only 只做 Maker 消除 Taker 滑点与费率磨损")
+    max_same_sector_same_direction_positions: int = Field(2, ge=1, le=10, description="单一板块内允许同时持有的最大同方向仓位数")
+    min_24h_volume_usdt_for_rotation: float = Field(30000000.0, ge=0.0, description="全市场动态资金流轮动标的最低 24h 成交额门槛 (USDT)")
+    anti_fomo_24h_change_pct_cap: float = Field(18.0, ge=5.0, le=100.0, description="反 FOMO / 防地板空 24h 单边涨跌幅上限 (%)")
+    contrarian_extreme_percentile_guard: float = Field(85.0, ge=60.0, le=99.0, description="多周期逆向资金流极端百分位护栏 (%)")
 
 
 
@@ -614,6 +618,10 @@ class DerivativesMetrics(BaseModel):
     open_interest_change_24h_pct: Optional[float] = Field(None, description="别名兼容")
     long_short_ratio: Optional[float] = Field(None, description="多空持仓人数比")
     top_trader_long_short_ratio: Optional[float] = Field(None, description="大户多空持仓比")
+    oi_change_1h_pct: Optional[float] = Field(None, description="真实 1 小时 OI 变动百分比 (%)")
+    net_taker_flow_usdt: Optional[float] = Field(None, description="真实主动买卖净额 Taker Buy - Sell (USDT)")
+    net_taker_ratio: Optional[float] = Field(None, description="真实主动买卖净流比率 (-1.0 ~ +1.0)")
+    is_real_derivatives_data: bool = Field(False, description="是否来源于 OKX 真实衍生品统计接口")
     sentiment_score: Optional[float] = Field(0.0, description="情绪量化得分 (-1.0 ~ +1.0)")
     timestamp: Optional[int] = Field(None, description="指标生成时间戳 (ms)")
 
@@ -1654,8 +1662,8 @@ class HistoricalKlineRecord(BaseModel):
 class DataLakeSyncRequest(BaseModel):
     """数据湖同步拉取历史K线请求"""
     symbol: str = Field(..., description="交易标的代码")
-    timeframes: List[str] = Field(default=["15m", "1h", "4h", "1d"], description="拉取周期列表")
-    days_back: int = Field(default=30, ge=1, le=1000, description="同步历史天数")
+    timeframes: List[str] = Field(default=["4h", "1d"], description="拉取周期列表")
+    days_back: int = Field(default=1095, ge=1, le=2000, description="同步历史天数")
 
 
 class DataLakeStatusItem(BaseModel):
@@ -1675,10 +1683,10 @@ class DataLakeStatusResponse(BaseModel):
 
 class BacktestRunRequest(BaseModel):
     """回测沙盒单次运行请求"""
-    strategy_name: str = Field(default="EMA_BREAKOUT", description="回测策略名称")
+    strategy_name: str = Field(default="KELTNER_TREND", description="回测策略名称")
     symbol: str = Field(default="BTC-USDT-SWAP", description="标的代码")
-    timeframe: str = Field(default="1h", description="回测主周期")
-    days_back: int = Field(default=60, ge=3, le=1000, description="回测回溯天数")
+    timeframe: str = Field(default="4h", description="回测主周期")
+    days_back: int = Field(default=1095, ge=3, le=2000, description="回测回溯天数")
     initial_balance: float = Field(default=10000.0, ge=100.0, description="回测初始本金(USDT)")
     leverage: int = Field(default=3, ge=1, le=20, description="杠杆倍数")
     taker_fee_rate: float = Field(default=0.0005, description="Taker 手续费率 (默认 0.05%)")
@@ -1745,7 +1753,7 @@ class GridSearchRequest(BaseModel):
     strategy_name: str = Field(default="EMA_BREAKOUT", description="策略名")
     symbol: str = Field(default="BTC-USDT-SWAP", description="标的代码")
     timeframe: str = Field(default="1h", description="周期")
-    days_back: int = Field(default=60, ge=7, le=365, description="优化回溯天数")
+    days_back: int = Field(default=1095, ge=7, le=2000, description="优化回溯天数")
     atr_multipliers: List[float] = Field(default=[1.5, 2.0, 2.5, 3.0], description="ATR止损乘数网格")
     breakeven_ratios: List[float] = Field(default=[0.3, 0.5, 0.7], description="保本触发比例网格")
     leverages: List[int] = Field(default=[2, 3, 5], description="杠杆网格")
@@ -1961,6 +1969,235 @@ class StrategyPlateauScore(BaseModel):
     fee_to_gross_ratio: float = Field(..., description="手续费占毛利润比例 (要求 < 0.40)")
     friction_stress_pnl: float = Field(..., description="双边 40bps 滑点摩擦压力测试后的净期望 (USDT)")
     neighbor_stability_score: float = Field(..., description="邻域 +/-20% 参数平原稳定性得分 (0-100)")
+
+
+# =============================================================================
+# 16. v8.0 全市场资金流雷达、板块轮动与极值包络带契约模型 (SSOT 对齐)
+# =============================================================================
+
+class SectorCategory(str, Enum):
+    """加密永续合约赛道板块标准分类"""
+    MAJOR = "MAJOR"
+    L1_L2 = "L1_L2"
+    AI_DEPIN = "AI_DEPIN"
+    MEME = "MEME"
+    DEFI = "DEFI"
+    RWA = "RWA"
+    GAMEFI_NFT = "GAMEFI_NFT"
+    TRADFI = "TRADFI"
+    OTHER = "OTHER"
+
+
+class RotationFocusMode(str, Enum):
+    """AutoPilot 标的巡检模式"""
+    SINGLE_SYMBOL = "SINGLE_SYMBOL"
+    MULTI_SYMBOL_POOL = "MULTI_SYMBOL_POOL"
+    DYNAMIC_CAPITAL_FLOW = "DYNAMIC_CAPITAL_FLOW"
+
+
+class PoolRole(str, Enum):
+    """标的在动态资金流轮动池中的角色标签"""
+    LONG_ALPHA = "LONG_ALPHA"
+    SHORT_BETA = "SHORT_BETA"
+    PINNED = "PINNED"
+    OVERHEATED_GUARD = "OVERHEATED_GUARD"
+    OVERSOLD_GUARD = "OVERSOLD_GUARD"
+    WATCH = "WATCH"
+
+
+class ContrarianPercentileMatrix(BaseModel):
+    """多周期资金流逆向百分位矩阵（数值越高代表资金流出越极端）"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    pct_1h: float = Field(50.0, ge=0.0, le=100.0, description="近1小时逆向资金流百分位")
+    pct_24h: float = Field(50.0, ge=0.0, le=100.0, description="近24小时逆向资金流百分位")
+    pct_7d: float = Field(50.0, ge=0.0, le=100.0, description="近7日均线逆向百分位")
+    pct_20d: float = Field(50.0, ge=0.0, le=100.0, description="近20日均线逆向百分位")
+    regime_hint: str = Field("NEUTRAL", description="EXTREME_INFLOW_FOMO / HEALTHY_INFLOW / NEUTRAL / HEALTHY_OUTFLOW / EXTREME_OUTFLOW_ICE")
+
+
+class DataSourceDiagnostics(BaseModel):
+    """全市场资金流数据源链路诊断信息"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    status: str = Field("OK", description="OK / DEGRADED / OFFLINE_CACHE")
+    channel: str = Field("okx-live", description="数据通道标识")
+    scanned_symbols: int = Field(0, description="本轮扫描 OKX 活跃永续总数")
+    qualified_symbols: int = Field(0, description="通过流动性与点差门槛的合格标的数")
+    derivatives_enriched: int = Field(0, description="成功补全真实 OI Delta 与 Taker Flow 的标的数")
+    latency_ms: int = Field(0, description="本轮全市场扫描总耗时 (毫秒)")
+    updated_at: int = Field(0, description="最近一次扫描完成时间戳 (ms)")
+    error_message: Optional[str] = Field(None, description="降级或错误信息")
+
+
+class SymbolFlowSnapshot(BaseModel):
+    """单标的实时资金流与相对强弱快照"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: str = Field(..., description="标的代码，如 TAO-USDT-SWAP")
+    sector: SectorCategory = Field(SectorCategory.OTHER, description="所属赛道板块")
+    last_price: float = Field(0.0, description="最新价格")
+    change_24h_pct: float = Field(0.0, description="24h 涨跌幅 (%)")
+    rs_alpha_vs_btc_pct: float = Field(0.0, description="相对 BTC 24h 超额涨跌幅 Alpha (%)")
+    vol_usdt_24h: float = Field(0.0, description="24h 成交额 (USDT)")
+    vol_share_pct: float = Field(0.0, description="实时成交额占合格全市场比例 (%)")
+    intraday_intensity_pct: float = Field(50.0, description="UTC 同小时切片量能强度分位 (0-100)")
+    shift_ratio: float = Field(1.0, description="资金注意力迁移比 = 实时成交占比 / 基准占比")
+    oi_usdt: float = Field(0.0, description="当前持仓量名义价值 (USDT)")
+    oi_change_1h_pct: float = Field(0.0, description="真实 1h 持仓量变化率 (%)")
+    net_taker_flow_usdt: float = Field(0.0, description="真实主动买卖净额 Taker Buy - Sell (USDT)")
+    net_taker_ratio: float = Field(0.0, description="主动买卖净流比率 (-1 ~ +1)")
+    top_trader_ls_ratio: Optional[float] = Field(None, description="OKX 大户多空持仓比")
+    funding_rate: Optional[float] = Field(None, description="当前资金费率")
+    spread_pct: Optional[float] = Field(None, description="盘口买卖一档点差 (%)")
+    flow_score: float = Field(0.0, ge=-100.0, le=100.0, description="综合资金流得分 (-100 ~ +100)")
+    local_regime: str = Field("RANGING", description="TRENDING_UP / TRENDING_DOWN / RANGING / VOLATILE_BREAKOUT")
+    pool_role: PoolRole = Field(PoolRole.WATCH, description="动态轮动池角色")
+    reason: str = Field("", description="系统归因简评")
+
+
+class SectorFlowSnapshot(BaseModel):
+    """板块聚合资金流快照（含存量 OI 占比 vs 实时成交额占比错位）"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    sector: SectorCategory = Field(..., description="板块枚举")
+    sector_name: str = Field(..., description="板块中文名")
+    symbol_count: int = Field(0, description="板块内合格标的数")
+    avg_change_24h_pct: float = Field(0.0, description="板块加权 24h 涨跌幅 (%)")
+    rs_alpha_vs_btc_pct: float = Field(0.0, description="板块相对 BTC 超额强弱 (%)")
+    total_vol_usdt_24h: float = Field(0.0, description="板块 24h 总成交额 (USDT)")
+    vol_share_pct: float = Field(0.0, description="板块实时成交额占比 (%)")
+    total_oi_usdt: float = Field(0.0, description="板块存量总持仓量 (USDT)")
+    oi_share_pct: float = Field(0.0, description="板块存量 OI 占比 (%)")
+    attention_shift_ratio: float = Field(1.0, description="资金迁移错位系数 (实时成交占比 / 存量或历史基线占比)")
+    net_taker_flow_usdt: float = Field(0.0, description="板块累计主动买卖净额 (USDT)")
+    avg_oi_change_1h_pct: float = Field(0.0, description="板块平均 1h OI 变化率 (%)")
+    flow_score: float = Field(0.0, ge=-100.0, le=100.0, description="板块综合资金流得分 (-100 ~ +100)")
+    percentiles: ContrarianPercentileMatrix = Field(default_factory=ContrarianPercentileMatrix, description="多周期逆向百分位矩阵")
+    leader_symbol: str = Field("", description="板块领涨/最强资金流入标的")
+    laggard_symbol: str = Field("", description="板块领跌/最强资金流出标的")
+
+
+class DynamicRotationPools(BaseModel):
+    """AutoPilot 动态资金流轮动三池 + 极值拦截池"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    long_alpha_pool: List[SymbolFlowSnapshot] = Field(default_factory=list, description="强势资金流入做多池")
+    short_beta_pool: List[SymbolFlowSnapshot] = Field(default_factory=list, description="弱势资金流出做空池")
+    pinned_pool: List[SymbolFlowSnapshot] = Field(default_factory=list, description="用户置顶关注池")
+    blocked_guard_pool: List[SymbolFlowSnapshot] = Field(default_factory=list, description="触发过热/冰点护栏拦截的标的")
+
+
+class CapitalFlowConfig(BaseModel):
+    """全市场资金流雷达与轮动风控配置"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    min_24h_volume_usdt: float = Field(30000000.0, ge=0.0, description="轮动标的最低 24h 成交额门槛 (USDT)")
+    max_spread_pct: float = Field(0.15, gt=0.0, le=2.0, description="最大允许盘口点差 (%)")
+    long_pool_size: int = Field(4, ge=1, le=10, description="动态做多池最大标的数")
+    short_pool_size: int = Field(4, ge=1, le=10, description="动态做空池最大标的数")
+    max_same_sector_same_direction: int = Field(2, ge=1, le=6, description="同板块同方向最大持仓数")
+    allow_tradfi_short: bool = Field(False, description="是否允许做空美股映射代币 (TradFi)")
+    anti_fomo_change_24h_cap: float = Field(18.0, ge=5.0, le=80.0, description="反 FOMO / 防地板空 24h 涨跌幅阈值 (%)")
+    contrarian_extreme_pct: float = Field(85.0, ge=65.0, le=99.0, description="逆向极端百分位护栏 (%)")
+    excluded_sectors: List[SectorCategory] = Field(default_factory=list, description="排除不参与轮动的板块")
+    blacklist_symbols: List[str] = Field(default_factory=list, description="黑名单标的")
+
+
+class CapitalFlowRadarOverview(BaseModel):
+    """全市场资金流雷达总览响应 (对齐 contracts/schemas/capital_flow.json)"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    timestamp: int = Field(..., description="快照时间戳 (ms)")
+    btc_price: float = Field(0.0, description="BTC 基准锚最新价")
+    btc_change_24h_pct: float = Field(0.0, description="BTC 24h 涨跌幅 (%)")
+    market_breadth_up_pct: float = Field(50.0, description="全网合格永续合约上涨家数占比 (%)")
+    macro_regime: str = Field("RANGING", description="宏观大盘体制")
+    total_vol_usdt_24h: float = Field(0.0, description="全市场合格永续 24h 累计成交额 (USDT)")
+    vol_vs_20d_avg_pct: float = Field(100.0, description="当前成交额占近20日日均进度 (%)")
+    intraday_intensity_pct: float = Field(50.0, description="UTC 同小时实时成交强度分位 (0-100)")
+    intraday_beat_days: int = Field(10, description="高于近20日同小时实时的天数 (0-20)")
+    total_net_taker_flow_usdt: float = Field(0.0, description="全市场/核心标的净主动资金流 (USDT)")
+    market_percentiles: ContrarianPercentileMatrix = Field(default_factory=ContrarianPercentileMatrix)
+    sectors: List[SectorFlowSnapshot] = Field(default_factory=list)
+    top_symbols: List[SymbolFlowSnapshot] = Field(default_factory=list)
+    rotation_pools: DynamicRotationPools = Field(default_factory=DynamicRotationPools)
+    diagnostics: DataSourceDiagnostics = Field(default_factory=DataSourceDiagnostics)
+    config: CapitalFlowConfig = Field(default_factory=CapitalFlowConfig)
+
+
+class IntradayIntensityPoint(BaseModel):
+    """UTC 同小时日内成交强度曲线点"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    ts: int
+    label: str
+    btc_price: float
+    current_vol_usdt: float
+    avg_20d_vol_usdt: float
+    intensity_pct: float
+
+
+class NetFlowEnvelopePoint(BaseModel):
+    """24h 滚动累计净资金流与近 20 日极值包络带点"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    ts: int
+    label: str
+    btc_price: float
+    cum_net_flow_usdt: float
+    avg_20d_cum_flow_usdt: float
+    max_20d_inflow_usdt: float
+    max_20d_outflow_usdt: float
+    percentile: float
+
+
+class HistoryFlowPoint(BaseModel):
+    """历史日线级净资金流回溯与热力均线点"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    date: str
+    btc_close: float
+    inflow_usdt: float
+    outflow_usdt: float
+    net_flow_usdt: float
+    ma_net_flow_usdt: float
+    vol_usdt: float
+    percentile: float
+
+
+class CapitalFlowSeriesResponse(BaseModel):
+    """基准锚定双图时序响应"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    scope: str = Field("ALL", description="ALL 或板块枚举")
+    ma_window: int = Field(20, description="历史净流入均线窗口: 10 / 20 / 60")
+    intraday_intensity: List[IntradayIntensityPoint] = Field(default_factory=list)
+    net_flow_envelope: List[NetFlowEnvelopePoint] = Field(default_factory=list)
+    history_series: List[HistoryFlowPoint] = Field(default_factory=list)
+
+
+class ExtremeFlowEvent(BaseModel):
+    """历史极端资金流事件条目"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    rank: int
+    date: str
+    net_flow_usdt: float
+    vol_usdt: float
+    btc_close: float
+    top_sector: str
+    is_recent: bool = Field(False, description="是否近14日内发生的极端资金事件")
+
+
+class ExtremeFlowLeaderboardResponse(BaseModel):
+    """历史净流入 Top10 / 净流出 Top10 极端对照表"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    scope: str = Field("ALL")
+    top_inflows: List[ExtremeFlowEvent] = Field(default_factory=list)
+    top_outflows: List[ExtremeFlowEvent] = Field(default_factory=list)
+
 
 
 

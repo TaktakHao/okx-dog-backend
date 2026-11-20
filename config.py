@@ -6,7 +6,7 @@ OKX-Dog 个人量化智能交易系统 - 全局配置模块
 
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Tuple
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 try:
@@ -56,11 +56,44 @@ class SystemSettings(BaseSettings):
     OKX_DEMO_WS_PUBLIC: str = "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
     OKX_DEMO_WS_PRIVATE: str = "wss://wspap.okx.com:8443/ws/v5/private?brokerId=9999"
 
-    # 硬风控默认阈值 (充足宽裕度，支持灵活量化交易)
-    DEFAULT_MAX_ORDER_USDT: float = 50000.0       # 单笔最大下单金额上限 (50,000 USDT)
-    DEFAULT_MAX_DAILY_LOSS_USDT: float = 10000.0   # 单日最大亏损熔断阈值 (10,000 USDT)
-    DEFAULT_MAX_LEVERAGE: int = 20                # 最大允许杠杆限制 (20x)
-    DEFAULT_MAX_SLIPPAGE_PCT: float = 2.0         # 允许最大滑点百分比 (2.0%)
+    # Stage 0 安全底座与高精度影子盘/模拟盘开关
+    USE_LIVE_PUBLIC_MARKET_DATA: bool = True         # 模拟盘公共行情统一走 OKX 实盘公共接口，杜绝 demo 脏 tick
+    AUTO_BOOT_LIVE_MODE: bool = False                # 禁止服务启动时自动进入实盘模式，防止误触现有手动仓位
+    AUTO_TAKEOVER_EXTERNAL_POSITIONS: bool = False   # 禁止对账中枢默认静默接管交易所外部手动持仓
+    EVOLUTION_AUTO_MUTATE_ENABLED: bool = False      # 冻结线上自驱进化自动改参与规则写入，杜绝样本内过拟合
+    USE_DUAL_ENGINE_AUTOPILOT: bool = True           # 默认由 Gate 2 验真通过的冻结双引擎 (4H凯尔特纳+1D双均线+期现套利) 接管自动操盘
+
+    # 硬风控默认阈值 ($10k 进取趋势型基线: 单日 3% 熔断 + 总回撤 18% 全局停机)
+    DEFAULT_MAX_ORDER_USDT: float = 3000.0           # 单笔最大下单金额上限 (3,000 USDT)
+    DEFAULT_MAX_DAILY_LOSS_USDT: float = 300.0       # 单日最大亏损熔断阈值 (300 USDT / 3%)
+    DEFAULT_MAX_LEVERAGE: int = 5                    # 最大允许杠杆限制 (5x)
+    DEFAULT_MAX_SLIPPAGE_PCT: float = 0.5            # 允许最大滑点百分比 (0.5%)
+    DEFAULT_EQUITY_FLOOR_RATIO: float = 0.82         # 全局权益保护底线比例 (0.82 => 回撤 18% 强制停机)
+
+    # 模拟盘真实撮合校准参数
+    PAPER_DEFAULT_SLIPPAGE_BPS: float = 2.0          # 市价单默认单边滑点 (2 bps = 0.02%)
+    PAPER_DEFAULT_FUNDING_RATE_8H: float = 0.0001    # 无实时费率推送时的 8h 默认资金费率 (0.01%)
+
+    # 核心交易标的池 (Top 5 高流动性主流加密永续) 与永久禁开仓合成合约前缀
+    CORE_TRADING_UNIVERSE: Tuple[str, ...] = (
+        "BTC-USDT-SWAP",
+        "ETH-USDT-SWAP",
+        "SOL-USDT-SWAP",
+        "BNB-USDT-SWAP",
+        "DOGE-USDT-SWAP",
+    )
+    BLOCKED_SYNTHETIC_PREFIXES: Tuple[str, ...] = (
+        "AMD-",
+        "NVDA-",
+        "OPENAI-",
+        "TSLA-",
+        "AAPL-",
+        "MSFT-",
+        "GOOG-",
+        "AMZN-",
+        "META-",
+        "SAMSUNG-",
+    )
 
 
     # 大模型默认配置 (默认使用本地 Antigravity CLI 驱动)

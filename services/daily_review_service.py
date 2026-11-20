@@ -72,40 +72,25 @@ class DailyReviewService:
                 "worst_trade_pnl": round(worst_trade_pnl, 2)
             }
 
-        # 2. 生成结构化 Markdown 与避坑教训
+        # 2. 生成离线结构化 Markdown 复盘报告与风控教训 (仅只读复盘，严禁修改线上冻结参数)
         try:
-            # 尝试导入 AI 引擎
             import sys
             from pathlib import Path
             ai_dir = str(Path(__file__).parent.parent.parent / "okx-dog-ai")
             if ai_dir not in sys.path:
                 sys.path.append(ai_dir)
             from daily_review_ai import DailyReviewAIEngine
-            from agent.evolution.evolution_manager import AgentEvolutionManager
 
-            ai_prompt = DailyReviewAIEngine.build_review_prompt(target_date, stats, trades)
-            # 结合团队进化引擎执行数据驱动的深度归因诊断与战法提炼
-            evo_mgr = AgentEvolutionManager.get_instance()
-            diag_report = await evo_mgr.diagnose_and_evolve_team(recent_trades=trades)
+            DailyReviewAIEngine.build_review_prompt(target_date, stats, trades)
             ai_parsed = DailyReviewAIEngine.parse_review_response("", stats)
-            summary_md = (
-                ai_parsed["summary_markdown"]
-                + f"\n\n### 🧬 自驱进化中枢诊断摘要 ({evo_mgr.active_epoch})\n"
-                + f"- **全局归因**: {diag_report.team_overall_summary}\n"
-                + f"- **市场体制**: `{diag_report.market_regime_detected}`\n"
-            )
-            evolved_lessons = []
-            for rd in diag_report.role_diagnoses:
-                for rl in rd.suggested_learned_rules:
-                    if rl and rl not in evolved_lessons:
-                        evolved_lessons.append(rl)
-            lessons = evolved_lessons[:5] if evolved_lessons else ai_parsed["lessons_learned"]
-            adjustments = dict(evo_mgr.active_tuning_params)
+            summary_md = ai_parsed["summary_markdown"]
+            lessons = ai_parsed["lessons_learned"]
+            adjustments = {"note": "双引擎策略参数已冻结，线上不自动调参"}
         except Exception as e:
-            logger.warning(f"复盘联动进化引擎回退: {e}")
+            logger.warning(f"离线复盘生成回退: {e}")
             summary_md = f"# 每日量化复盘 ({target_date})\n- 盈亏: {realized_pnl} USDT\n- 胜率: {win_rate*100:.1f}%"
-            lessons = ["在资金费率过热时严禁追多", "浮盈达到目标比例时及时移动保本"]
-            adjustments = {"max_leverage": 3}
+            lessons = ["保持双引擎 4H/1D 冻结参数纪律，避免人为情绪干预", "关注资金费率与 18% 回撤停机底线"]
+            adjustments = {"note": "双引擎策略参数已冻结"}
 
         # 3. 将教训沉淀至知识库
         for lesson in lessons:
@@ -148,16 +133,7 @@ class DailyReviewService:
                 "strategy_adjustments": json.dumps(adjustments, ensure_ascii=False)
             })
 
-        logger.info(f"[{target_date}] 每日盘后复盘报告已成功落库与沉淀经验")
-
-        # 5. 自动触发 AI 员工团队自驱反思与战法进化
-        try:
-            from agent.evolution.evolution_manager import AgentEvolutionManager
-            manager = AgentEvolutionManager.get_instance()
-            asyncio.create_task(manager.diagnose_and_evolve_team(recent_trades=trades))
-            logger.info("🤖 已自动在后台启动 AI 员工团队大模型自驱诊断与进化任务！")
-        except Exception as evo_err:
-            logger.warning(f"触发 AI 员工团队自驱进化异常: {evo_err}")
+        logger.info(f"[{target_date}] 每日盘后离线复盘报告已成功落库")
 
         return DailyReviewDetail(
             review_date=target_date,

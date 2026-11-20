@@ -25,6 +25,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Set
 
 from sqlalchemy import text
+from config import settings
 from database import get_db_session
 from models import (
     AutoPilotConfigUpdateRequest,
@@ -62,17 +63,11 @@ class AutoPilotEnvState:
         self.max_drawdown_pct: float = 0.0
 
         self.symbol: str = "BTC-USDT-SWAP"
-        self.focus_symbols: List[str] = [
-            "BTC-USDT-SWAP",
-            "ETH-USDT-SWAP",
-            "SOL-USDT-SWAP",
-            "XAU-USDT-SWAP",
-            "ONDO-USDT-SWAP",
-            "DOGE-USDT-SWAP",
-        ]
+        # Stage 0 (T0.6): 默认标的池严格收敛为 Top 5 高流动性主流加密永续，永久剔除代币化美股/合成合约
+        self.focus_symbols: List[str] = list(settings.CORE_TRADING_UNIVERSE)
         self.symbols: List[str] = list(self.focus_symbols)
-        self.focus_mode: str = "MULTI_SYMBOL_POOL"  # SINGLE_SYMBOL | MULTI_SYMBOL_POOL
-        self.market_regime: str = "TRENDING_UP"  # TRENDING_UP | TRENDING_DOWN | RANGING | VOLATILE_BREAKOUT
+        self.focus_mode: str = "MULTI_SYMBOL_POOL"  # SINGLE_SYMBOL | MULTI_SYMBOL_POOL | DYNAMIC_CAPITAL_FLOW
+        self.market_regime: str = "RANGING"  # 动态刷新: TRENDING_UP | TRENDING_DOWN | RANGING | VOLATILE_BREAKOUT
         self.aggressiveness_mode: str = "BALANCED"  # CONSERVATIVE | BALANCED | AGGRESSIVE
         self.max_scale_layers: int = 2          # 最大加仓层数 (经自驱进化收敛为最多2层顺势金字塔)
         self.scale_in_strategy: str = "PYRAMIDING"  # PYRAMIDING | PULLBACK_DCA | SMART_HYBRID
@@ -89,8 +84,15 @@ class AutoPilotEnvState:
         self.auto_leverage_enabled: bool = True
         self.post_only_preferred: bool = True       # 优先被动挂单 (POST_ONLY/Maker) 节省 60% 手续费
         self.stop_loss_cooldown_minutes: int = 30   # 止损后 30 分钟防洗盘追单冷静期
-        self.stop_loss_equity_floor: Optional[float] = None  # 最低保留本金底线 (USDT)
-        self.max_loss_limit_usdt: Optional[float] = None     # 最大允许亏损额 (USDT)
+        # Stage 0 (T0.4): 默认启用全局 18% 最大回撤停机底线 ($10,000 -> $8,200)
+        self.stop_loss_equity_floor: Optional[float] = (
+            round(self.start_equity * settings.DEFAULT_EQUITY_FLOOR_RATIO, 2)
+            if self.start_equity > 0 else None
+        )
+        self.max_loss_limit_usdt: Optional[float] = (
+            round(self.start_equity - self.stop_loss_equity_floor, 2)
+            if (self.stop_loss_equity_floor is not None and self.start_equity > 0) else None
+        )
         self.order_timeout_seconds: int = 180  # 挂单超时清理 (秒)
 
         # 巡检与加仓状态
@@ -151,12 +153,20 @@ class AutoPilotEnvState:
                 self.start_equity = float(sess_row["start_equity"] or 10000.0)
                 self.current_equity = float(sess_row["current_equity"] or self.start_equity)
 
-            # 恢复平仓流水 (保留全部历史战绩用于胜率与盈亏比统计)
-            t_rows = conn.execute(
-                "SELECT id, order_id, symbol, pos_side, entry_price, exit_price, size, leverage, realized_pnl, roi_pct, reason, timestamp "
-                "FROM auto_pilot_trades WHERE session_id LIKE ? ORDER BY timestamp DESC LIMIT 500",
-                (sess_prefix,)
-            ).fetchall()
+            # 仅恢复当前最新会话的平仓流水与净值采样点，确保重置模拟盘后重启不会回滚旧亏损历史
+            target_session_id = self.session_id if sess_row else None
+            if target_session_id:
+                t_rows = conn.execute(
+                    "SELECT id, order_id, symbol, pos_side, entry_price, exit_price, size, leverage, realized_pnl, roi_pct, reason, timestamp "
+                    "FROM auto_pilot_trades WHERE session_id = ? ORDER BY timestamp DESC LIMIT 500",
+                    (target_session_id,)
+                ).fetchall()
+            else:
+                t_rows = conn.execute(
+                    "SELECT id, order_id, symbol, pos_side, entry_price, exit_price, size, leverage, realized_pnl, roi_pct, reason, timestamp "
+                    "FROM auto_pilot_trades WHERE session_id LIKE ? ORDER BY timestamp DESC LIMIT 500",
+                    (sess_prefix,)
+                ).fetchall()
             if t_rows:
                 self.trades = [
                     AutoPilotTradeRecord(
@@ -169,18 +179,24 @@ class AutoPilotEnvState:
                         leverage=int(tr["leverage"] or 3),
                         realized_pnl=float(tr["realized_pnl"] or 0.0),
                         roi_pct=float(tr["roi_pct"] or 0.0),
-                        reason=str(tr["reason"] or "AI策略自动平仓"),
+                        reason=str(tr["reason"] or "双引擎自动平仓"),
                         timestamp=int(tr["timestamp"] or 0),
                     )
                     for tr in t_rows
                 ]
 
-            # 恢复最近 2000 个时序净值采样点并重算峰值与最大回撤
-            s_rows = conn.execute(
-                "SELECT timestamp, equity, realized_pnl, unrealized_pnl, total_pnl, pnl_ratio "
-                "FROM auto_pilot_pnl_snapshots WHERE session_id LIKE ? ORDER BY timestamp DESC LIMIT 2000",
-                (sess_prefix,)
-            ).fetchall()
+            if target_session_id:
+                s_rows = conn.execute(
+                    "SELECT timestamp, equity, realized_pnl, unrealized_pnl, total_pnl, pnl_ratio "
+                    "FROM auto_pilot_pnl_snapshots WHERE session_id = ? ORDER BY timestamp DESC LIMIT 2000",
+                    (target_session_id,)
+                ).fetchall()
+            else:
+                s_rows = conn.execute(
+                    "SELECT timestamp, equity, realized_pnl, unrealized_pnl, total_pnl, pnl_ratio "
+                    "FROM auto_pilot_pnl_snapshots WHERE session_id LIKE ? ORDER BY timestamp DESC LIMIT 2000",
+                    (sess_prefix,)
+                ).fetchall()
             if s_rows:
                 restored_snaps = [
                     AutoPilotHistoryPoint(
@@ -559,13 +575,26 @@ class AutoPilotManager:
                 state.apply_aggressiveness_preset(aggressiveness_mode)
             state.symbol = symbol
 
-            # 资金保护底线设定
+            # 资金保护底线设定 (Stage 0 T0.4: 默认按 18% 回撤即 82% 权益设定全局硬停机底线，并防止旧亏损基线导致刚启动即秒停)
+            effective_floor_base = (
+                min(state.start_equity, initial_equity)
+                if (state.start_equity > 0 and initial_equity > 0)
+                else (initial_equity if initial_equity > 0 else state.start_equity)
+            )
             if stop_loss_equity_floor is not None and stop_loss_equity_floor > 0:
-                state.stop_loss_equity_floor = min(state.start_equity, stop_loss_equity_floor)
-                state.max_loss_limit_usdt = max(0.0, state.start_equity - state.stop_loss_equity_floor)
+                if initial_equity > 0 and stop_loss_equity_floor >= initial_equity:
+                    # 防止前端携带旧历史高点底线导致启动瞬间即触发自动停机
+                    state.stop_loss_equity_floor = round(initial_equity * settings.DEFAULT_EQUITY_FLOOR_RATIO, 2)
+                    state.max_loss_limit_usdt = round(initial_equity - state.stop_loss_equity_floor, 2)
+                else:
+                    state.stop_loss_equity_floor = min(state.start_equity, stop_loss_equity_floor) if state.start_equity > 0 else stop_loss_equity_floor
+                    state.max_loss_limit_usdt = max(0.0, (initial_equity or state.start_equity) - state.stop_loss_equity_floor)
             elif max_loss_limit_usdt is not None and max_loss_limit_usdt > 0:
                 state.max_loss_limit_usdt = max_loss_limit_usdt
-                state.stop_loss_equity_floor = max(0.0, state.start_equity - max_loss_limit_usdt)
+                state.stop_loss_equity_floor = max(0.0, effective_floor_base - max_loss_limit_usdt)
+            elif effective_floor_base > 0:
+                state.stop_loss_equity_floor = round(effective_floor_base * settings.DEFAULT_EQUITY_FLOOR_RATIO, 2)
+                state.max_loss_limit_usdt = round(effective_floor_base - state.stop_loss_equity_floor, 2)
             else:
                 state.stop_loss_equity_floor = None
                 state.max_loss_limit_usdt = None
@@ -612,16 +641,24 @@ class AutoPilotManager:
             except Exception as ws_sub_err:
                 logger.debug(f"自动操盘订阅标的行情异常: {ws_sub_err}")
 
-            # 异步写入数据库
+            # 异步写入或恢复数据库会话状态 (UPSERT 防止恢复已有 session_id 时触发 UNIQUE 冲突)
             try:
                 async with get_db_session() as session:
                     await session.execute(
                         text(
                             """
-                            INSERT INTO auto_pilot_sessions 
-                            (session_id, is_live_mode, is_running, start_time, start_equity, current_equity, 
+                            INSERT INTO auto_pilot_sessions
+                            (session_id, is_live_mode, is_running, start_time, start_equity, current_equity,
                              symbol, min_confidence, auto_leverage)
                             VALUES (:sess, :live, 1, :st, :seq, :ceq, :sym, :conf, :lev)
+                            ON CONFLICT(session_id) DO UPDATE SET
+                                is_running = 1,
+                                stop_time = NULL,
+                                current_equity = :ceq,
+                                symbol = :sym,
+                                min_confidence = :conf,
+                                auto_leverage = :lev,
+                                updated_at = CURRENT_TIMESTAMP
                             """
                         ),
                         {
@@ -650,6 +687,7 @@ class AutoPilotManager:
         self,
         current_equity: Optional[float] = None,
         is_live_mode: Optional[bool] = None,
+        stop_reason: Optional[str] = None,
     ) -> AutoPilotStatusModel:
         """暂停 / 停止自动操盘"""
         async with self._lock:
@@ -661,7 +699,7 @@ class AutoPilotManager:
             state.stop_time = now_ms
             if current_equity is not None:
                 state.current_equity = current_equity
-            state.last_patrol_log = f"【{'实盘' if effective_is_live else '模拟'}】自动操盘已手动暂停"
+            state.last_patrol_log = stop_reason or f"【{'实盘' if effective_is_live else '模拟'}】自动操盘已手动暂停"
 
             try:
                 async with get_db_session() as session:
@@ -1071,12 +1109,12 @@ class AutoPilotManager:
                             """
                             SELECT timestamp, equity, realized_pnl, unrealized_pnl, total_pnl, pnl_ratio
                             FROM auto_pilot_pnl_snapshots
-                            WHERE session_id LIKE :prefix
+                            WHERE session_id = :sid
                             ORDER BY timestamp DESC
                             LIMIT :lim
                             """
                         ),
-                        {"prefix": sess_prefix, "lim": max(100, min(5000, limit))},
+                        {"sid": state.session_id, "lim": max(100, min(5000, limit))},
                     )
                     rows = res.mappings().all()
                     if rows and len(rows) > len(state.snapshots):
@@ -1100,12 +1138,12 @@ class AutoPilotManager:
                                 SELECT order_id, symbol, pos_side, entry_price, exit_price,
                                        size, leverage, realized_pnl, roi_pct, reason, timestamp
                                 FROM auto_pilot_trades
-                                WHERE session_id LIKE :prefix
+                                WHERE session_id = :sid
                                 ORDER BY timestamp DESC
                                 LIMIT 200
                                 """
                             ),
-                            {"prefix": sess_prefix},
+                            {"sid": state.session_id},
                         )
                         t_rows = t_res.mappings().all()
                         if t_rows:
@@ -1135,6 +1173,60 @@ class AutoPilotManager:
             trades=list(state.trades[:200]),
         )
 
+    async def sync_after_paper_reset(self, initial_equity: float) -> AutoPilotStatusModel:
+        """
+        模拟盘账户重置本金时联动清理自动操盘旧历史会话与收益曲线，
+        重置 start_equity / 18% 保本底线并持久化全新干净会话（保持暂停态，等待用户启动）
+        """
+        async with self._lock:
+            state = self._states[False]
+            state.reset_for_start(initial_equity=initial_equity)
+            state.is_running = False
+            state.focus_mode = "MULTI_SYMBOL_POOL"
+            state.focus_symbols = list(settings.CORE_TRADING_UNIVERSE)
+            state.symbols = list(settings.CORE_TRADING_UNIVERSE)
+            state.stop_loss_equity_floor = round(state.start_equity * settings.DEFAULT_EQUITY_FLOOR_RATIO, 2)
+            state.max_loss_limit_usdt = round(state.start_equity - state.stop_loss_equity_floor, 2)
+            state.last_patrol_log = (
+                f"✨ 模拟影子盘已重置为干净基线 (${state.start_equity:.2f} USDT，18% 停机底线 ${state.stop_loss_equity_floor:.2f})，等待启动"
+            )
+
+            # 写入全新会话记录到 SQLite，防止重启后回滚到旧亏损会话
+            try:
+                async with get_db_session() as session:
+                    await session.execute(
+                        text(
+                            """
+                            INSERT INTO auto_pilot_sessions
+                            (session_id, is_live_mode, is_running, start_time, start_equity, current_equity,
+                             symbol, min_confidence, auto_leverage)
+                            VALUES (:sess, 0, 0, :st, :seq, :ceq, :sym, :conf, :lev)
+                            """
+                        ),
+                        {
+                            "sess": state.session_id,
+                            "st": state.start_time,
+                            "seq": state.start_equity,
+                            "ceq": state.current_equity,
+                            "sym": state.symbol,
+                            "conf": state.min_confidence,
+                            "lev": 1 if state.auto_leverage_enabled else 0,
+                        },
+                    )
+            except Exception as e:
+                logger.warning(f"【自动操盘中枢】重置模拟盘后写入新会话失败: {e}")
+
+            # 清理双引擎驱动器持仓峰值缓存，确保影子盘状态彻底干净
+            try:
+                from state import dual_engine_driver
+                dual_engine_driver._trailing_peaks.clear()
+                dual_engine_driver._warmed_up.clear()
+                dual_engine_driver._last_closed_ts.clear()
+            except Exception:
+                pass
+
+            return self.get_status(current_equity=state.start_equity, unrealized_pnl=0.0, is_live_mode=False)
+
     async def reset_stats(
         self,
         current_equity: float,
@@ -1157,8 +1249,8 @@ class AutoPilotManager:
             breakeven_trigger_ratio=state.breakeven_trigger_ratio,
             min_confidence=state.min_confidence,
             auto_leverage_enabled=state.auto_leverage_enabled,
-            stop_loss_equity_floor=state.stop_loss_equity_floor,
-            max_loss_limit_usdt=state.max_loss_limit_usdt,
+            stop_loss_equity_floor=round(current_equity * settings.DEFAULT_EQUITY_FLOOR_RATIO, 2),
+            max_loss_limit_usdt=round(current_equity * (1.0 - settings.DEFAULT_EQUITY_FLOOR_RATIO), 2),
             force_reset=True,
         )
 
@@ -1200,43 +1292,66 @@ class AutoPilotManager:
                 last_px = paper_engine.last_price_map.get(sym, 100.0) if paper_engine else 100.0
                 chg_24h = 0.0
 
-            # 2. 市场体制契合度深度尽调
-            if regime == "TRENDING_UP":
+            # 2. 市场体制契合度与全市场资金流多空对称尽调 (支持单币种独立 local_regime，打破牛市一刀切)
+            sym_flow = None
+            try:
+                from state import capital_flow_service
+                if capital_flow_service is not None:
+                    sym_flow = capital_flow_service.get_symbol_flow_sync(sym)
+            except Exception:
+                sym_flow = None
+
+            eff_regime = (sym_flow.local_regime if (sym_flow and getattr(sym_flow, "local_regime", None)) else regime).upper()
+
+            if sym_flow is not None:
+                # 资金流雷达直接赋能：强势流入做多池与弱势流出做空池同享高优先级，实现真正双边对称轮动
+                role_val = sym_flow.pool_role.value if hasattr(sym_flow.pool_role, "value") else str(sym_flow.pool_role)
+                if role_val == "LONG_ALPHA":
+                    base_score += min(30.0, 12.0 + abs(sym_flow.flow_score) * 0.25)
+                    reasons.append(f"资金净流入Alpha({sym_flow.flow_score:+.0f}分,RS{sym_flow.rs_alpha_vs_btc_pct:+.1f}%)")
+                elif role_val == "SHORT_BETA":
+                    base_score += min(30.0, 12.0 + abs(sym_flow.flow_score) * 0.25)
+                    reasons.append(f"资金净流出Beta空头({sym_flow.flow_score:+.0f}分,RS{sym_flow.rs_alpha_vs_btc_pct:+.1f}%)")
+                elif role_val in ("OVERHEATED_GUARD", "OVERSOLD_GUARD"):
+                    base_score -= 35.0
+                    reasons.append(f"极值护栏降权({role_val})")
+
+            if eff_regime == "TRENDING_UP":
                 # 单边多头体制: 优选突破顺势动量最强 (+1.5% ~ +12%)
                 if 1.5 <= chg_24h <= 12.0:
-                    base_score += 25.0
+                    base_score += 20.0
                     reasons.append(f"多头领涨顺势突破(+{chg_24h:.1f}%)")
                 elif chg_24h > 12.0:
-                    base_score += 10.0
+                    base_score += 5.0
                     reasons.append(f"超买逼空谨慎(+{chg_24h:.1f}%)")
                 elif chg_24h < -1.0:
-                    base_score -= 20.0
-                    reasons.append(f"逆势阴跌弱势({chg_24h:.1f}%)")
+                    base_score -= 12.0
+                    reasons.append(f"逆势弱势({chg_24h:.1f}%)")
                 else:
                     base_score += 5.0
-            elif regime == "TRENDING_DOWN":
-                # 单边空头体制: 优选破位领跌 (-1.5% ~ -15%)
+            elif eff_regime == "TRENDING_DOWN":
+                # 单边空头体制: 优选破位领跌 (-1.5% ~ -15%) 用于顺势做空
                 if -15.0 <= chg_24h <= -1.5:
-                    base_score += 25.0
+                    base_score += 22.0
                     reasons.append(f"空头顺势破位领跌({chg_24h:.1f}%)")
                 elif chg_24h > 2.0:
-                    base_score -= 20.0
+                    base_score -= 15.0
                     reasons.append(f"逆势抗跌({chg_24h:.1f}%)")
                 else:
                     base_score += 5.0
-            elif regime == "RANGING":
+            elif eff_regime == "RANGING":
                 # 箱体震荡体制: 优选振幅收敛稳定 (±2.5% 以内)
                 if abs(chg_24h) <= 2.5:
-                    base_score += 25.0
+                    base_score += 18.0
                     reasons.append(f"箱体窄幅整理(±{abs(chg_24h):.1f}%)")
                 elif abs(chg_24h) > 6.0:
-                    base_score -= 25.0
+                    base_score -= 15.0
                     reasons.append(f"震荡市异常宽幅异动({chg_24h:.1f}%)")
                 else:
-                    base_score += 10.0
+                    base_score += 8.0
             else:  # VOLATILE_BREAKOUT
                 if abs(chg_24h) >= 4.0:
-                    base_score += 25.0
+                    base_score += 22.0
                     reasons.append(f"剧烈放量异动突破({chg_24h:.1f}%)")
                 else:
                     base_score += 5.0
@@ -1305,9 +1420,16 @@ class AutoPilotManager:
             from services.ai_service import generate_quantitative_rule_decision
             from services.market_service import get_multi_period_indicators_data, get_derivatives_metrics_data
 
-            # 0. 检查系统硬风控状态
-            if risk_controller.risk_status.value == "PANIC_LOCKED":
-                state.last_patrol_log = "⚠️ 硬风控处于 PANIC_LOCKED 熔断锁定状态，跳过自动操盘巡检"
+            # 0. 检查系统硬风控状态 (Stage 0 T0.4: 覆盖 CIRCUIT_BROKEN / SAFE_MODE / PANIC_LOCKED 全量熔断态)
+            if (
+                risk_controller.is_circuit_broken
+                or risk_controller.is_safe_mode
+                or risk_controller.risk_status.value in ("CIRCUIT_BROKEN", "SAFE_MODE", "PANIC_LOCKED")
+            ):
+                state.last_patrol_log = (
+                    f"🛑 硬风控处于 {risk_controller.risk_status.value} 熔断锁定状态"
+                    f"({risk_controller.circuit_break_reason or '已禁止开平仓'})，跳过自动操盘巡检"
+                )
                 return
 
             is_live = state.is_live_mode
@@ -1338,8 +1460,8 @@ class AutoPilotManager:
                         f"(${state.stop_loss_equity_floor:.2f} USDT)！已自动停止 7x24h 自动操盘！"
                     )
                     logger.warning(log_floor)
-                    state.last_patrol_log = f"🛑 触及本金底线 (${state.stop_loss_equity_floor:.2f} USDT) 自动停止操盘"
-                    await self.stop(current_equity=cur_eq, is_live_mode=is_live)
+                    floor_reason = f"🛑 触及本金底线 (${state.stop_loss_equity_floor:.2f} USDT) 自动停止操盘"
+                    await self.stop(current_equity=cur_eq, is_live_mode=is_live, stop_reason=floor_reason)
                     try:
                         from models import WSPushPayload, WSServerEvent
                         await ws_manager.broadcast_to_subscribers(WSPushPayload[AutoPilotStatusModel](
@@ -1352,6 +1474,43 @@ class AutoPilotManager:
                         pass
                     return
 
+            # Stage 3A: 当开启冻结双引擎模式且非旧资金流轮动模式时，由 Gate 2 验真双引擎驱动器接管巡检
+            if settings.USE_DUAL_ENGINE_AUTOPILOT and state.focus_mode != "DYNAMIC_CAPITAL_FLOW":
+                try:
+                    from state import dual_engine_driver
+                    driver_init_eq = (
+                        round(state.stop_loss_equity_floor / settings.DEFAULT_EQUITY_FLOOR_RATIO, 2)
+                        if (state.stop_loss_equity_floor and state.stop_loss_equity_floor > 0)
+                        else (state.start_equity if state.start_equity > 0 else cur_eq)
+                    )
+                    summary_text = await dual_engine_driver.run_patrol_step(
+                        is_live=is_live,
+                        symbols=list(state.focus_symbols or settings.CORE_TRADING_UNIVERSE),
+                        initial_equity=driver_init_eq,
+                    )
+                    state.last_patrol_log = summary_text
+                    return
+                except Exception as de_err:
+                    logger.warning(f"双引擎影子盘巡检异常: {de_err}")
+                    state.last_patrol_log = f"⚠️ 双引擎影子盘巡检异常: {de_err}"
+                    return
+
+            # 1.5 动态刷新全市场宏观体制 (彻底消除历史写死 TRENDING_UP 缺陷)
+            radar_overview = None
+            try:
+                from state import capital_flow_service
+                if capital_flow_service is not None:
+                    radar_overview = capital_flow_service.get_latest_overview_sync()
+                    if radar_overview is None:
+                        radar_overview = await asyncio.wait_for(
+                            capital_flow_service.scan_market_capital_flow(pinned_symbols=state.focus_symbols),
+                            timeout=8.0
+                        )
+                    if radar_overview and getattr(radar_overview, "macro_regime", None):
+                        state.market_regime = radar_overview.macro_regime
+            except Exception as rf_err:
+                logger.debug(f"巡检同步全市场资金流雷达跳过: {rf_err}")
+
             # 2. 构建持仓字典与持仓标的集合
             held_pos_map: Dict[str, Any] = {}
             for pos in positions:
@@ -1363,7 +1522,21 @@ class AutoPilotManager:
             # =========================================================================
             # 阶段 1: 针对已有持仓标的进行深度巡检 (移动保本 / 动态加仓 / 趋势反转反手)
             # =========================================================================
+            unmanaged_external: Set[str] = set()
+            if is_live and not settings.AUTO_TAKEOVER_EXTERNAL_POSITIONS:
+                try:
+                    from state import reconciliation_service
+                    unmanaged_external = set(getattr(reconciliation_service, "unmanaged_external_symbols", set()) or set())
+                except Exception:
+                    unmanaged_external = set()
+
             for sym, pos in list(held_pos_map.items()):
+                # Stage 0 (T0.3) 双重保护：实盘外部手动持仓严禁被自动操盘干预
+                if is_live and not settings.AUTO_TAKEOVER_EXTERNAL_POSITIONS and (
+                    sym in unmanaged_external or state.position_scale_records.get(sym, 0) <= 0
+                ):
+                    patrol_summaries.append(f"🛡️{sym}(外部手动仓位隔离跳过)")
+                    continue
                 pos_id = pos.pos_id or f"{sym}_{pos.pos_side}"
                 entry_px = pos.avg_px
                 cur_tk = ws_manager.latest_tickers.get(sym)
@@ -1457,11 +1630,14 @@ class AutoPilotManager:
                         )
                         logger.info(f"【自动操盘-阶梯止盈50%】{sym} {reason_tp50}, 平仓币数: {half_sz}")
                         try:
+                            be_friction_buf = entry_px * 0.0015
+                            be_sl_target = float(rest_client._format_order_px(sym, entry_px + be_friction_buf if is_long else entry_px - be_friction_buf))
+                            rem_sz = max(min_coin_sz, round(pos.pos - half_sz, 5))
+
                             if is_live:
-                                try:
-                                    await rest_client.cancel_all_orders(symbol=sym)
-                                except Exception:
-                                    pass
+                                # Stage 0 (T0.2) 零裸仓窗口协议：
+                                # 1) 严禁先全撤旧止损！先直接提交 50% reduce_only 市价减半；
+                                # 2) 紧接着调用先挂后撤安全改损 (Mount-Before-Cancel)，确认新保本止损生效后再清理旧条件单。
                                 await rest_client.place_order(
                                     symbol=sym,
                                     side=OrderSide.SELL if is_long else OrderSide.BUY,
@@ -1470,31 +1646,15 @@ class AutoPilotManager:
                                     sz=half_sz,
                                     reduce_only=True
                                 )
+                                await rest_client.replace_position_stop_loss_safely(
+                                    symbol=sym,
+                                    pos_side=pos.pos_side,
+                                    sz=rem_sz,
+                                    sl_trigger_price=be_sl_target,
+                                )
                             else:
                                 paper_engine.cancel_all_orders(symbol=sym)
                                 paper_engine.close_position(symbol=sym, pos_side=pos.pos_side, price=cur_px, size=half_sz, reason=reason_tp50)
-
-                            # 状态迁移：标记 50% 阶梯已触发，强制移损至「均价+摩擦覆盖缓冲」(True Breakeven Locked)
-                            pos.tp_triggered_50 = True
-                            pos.is_breakeven_locked = True
-                            be_friction_buf = entry_px * 0.0015
-                            be_sl_target = float(rest_client._format_order_px(sym, entry_px + be_friction_buf if is_long else entry_px - be_friction_buf))
-                            pos.sl_trigger_price = be_sl_target
-                            pos.tp_trigger_price = None
-                            state._breakeven_applied_positions.add(pos_id)
-
-                            if is_live:
-                                try:
-                                    rem_sz = max(min_coin_sz, round(pos.pos - half_sz, 5))
-                                    await rest_client.place_tpsl_algo_order(
-                                        symbol=sym,
-                                        pos_side=pos.pos_side,
-                                        sz=rem_sz,
-                                        sl_trigger_price=be_sl_target
-                                    )
-                                except Exception as algo_e:
-                                    logger.debug(f"实盘阶段1移损保本条件单挂载提示: {algo_e}")
-                            else:
                                 paper_engine.update_position_stops(
                                     symbol=sym,
                                     pos_side=pos.pos_side,
@@ -1503,6 +1663,13 @@ class AutoPilotManager:
                                     clear_take_profit=True,
                                     is_breakeven_locked=True
                                 )
+
+                            # 仅在交易所/沙盒确认止损更新成功后，再迁移内存状态标记
+                            pos.tp_triggered_50 = True
+                            pos.is_breakeven_locked = True
+                            pos.sl_trigger_price = be_sl_target
+                            pos.tp_trigger_price = None
+                            state._breakeven_applied_positions.add(pos_id)
 
                             # 保持峰值并记录 tp_stage1_done = True，交由阶段2宽幅 ATR 吊灯止盈跟踪剩余 50% 仓位
                             state.position_peaks[sym] = {
@@ -1513,7 +1680,7 @@ class AutoPilotManager:
                             patrol_summaries.append(f"🎯{sym}阶梯止盈50%(+{profit_ratio*100:.1f}%)")
                             continue
                         except Exception as tp_err:
-                            logger.warning(f"阶段1阶梯止盈异常 {sym}: {tp_err}")
+                            logger.error(f"【自动操盘-阶梯止盈异常】{sym} 阶段1减仓或安全改损失败: {tp_err}")
 
                 # 1.3 两阶段阶梯止盈：阶段 2 (已完成50%减半，剩余50%长尾波段博取 - ATR 吊灯宽幅容忍度或触及TP2出清)
                 elif state.trailing_stop_enabled and has_tp_50:
@@ -1569,19 +1736,33 @@ class AutoPilotManager:
                         except Exception as tail_err:
                             logger.warning(f"阶段2波段出清异常 {sym}: {tail_err}")
 
-                # 1.4 常规移动保本锁定 (浮盈超 1.0% 且尚未触发过保本)
+                # 1.4 常规移动保本锁定 (浮盈超 1.0% 且尚未触发过保本; Stage 0 T0.2: 实盘同步通过先挂后撤安全改损上移交易所止损)
                 if state.trailing_stop_enabled and pos_id not in state._breakeven_applied_positions:
                     if profit_ratio >= 0.010:
-                        state._breakeven_applied_positions.add(pos_id)
-                        pos.is_breakeven_locked = True
                         be_friction_buf = entry_px * 0.0015
                         be_sl_target = float(rest_client._format_order_px(sym, entry_px + be_friction_buf if is_long else entry_px - be_friction_buf))
-                        pos.sl_trigger_price = be_sl_target
-                        if not is_live:
-                            paper_engine.update_position_stops(symbol=sym, stop_loss_price=be_sl_target)
-                        log_msg = f"🛡️ 【移动保本触发】{sym} 浮盈达 {profit_ratio*100:+.2f}%，止损线已移至超额保本价 ${be_sl_target} (覆盖手续费摩擦)"
-                        logger.info(log_msg)
-                        patrol_summaries.append(f"{sym}超额保本锁定")
+                        sl_sync_ok = True
+                        if is_live:
+                            try:
+                                await rest_client.replace_position_stop_loss_safely(
+                                    symbol=sym,
+                                    pos_side=pos.pos_side,
+                                    sz=pos.pos,
+                                    sl_trigger_price=be_sl_target,
+                                )
+                            except Exception as be_err:
+                                sl_sync_ok = False
+                                logger.error(f"【移动保本失败】{sym} 实盘交易所侧安全改损失败，暂不标记保本锁定: {be_err}")
+                        else:
+                            paper_engine.update_position_stops(symbol=sym, stop_loss_price=be_sl_target, is_breakeven_locked=True)
+
+                        if sl_sync_ok:
+                            state._breakeven_applied_positions.add(pos_id)
+                            pos.is_breakeven_locked = True
+                            pos.sl_trigger_price = be_sl_target
+                            log_msg = f"🛡️ 【移动保本触发】{sym} 浮盈达 {profit_ratio*100:+.2f}%，止损线已移至超额保本价 ${be_sl_target} (覆盖手续费摩擦)"
+                            logger.info(log_msg)
+                            patrol_summaries.append(f"{sym}超额保本锁定")
 
                 cur_layers = getattr(pos, "scale_layers", None) or state.position_scale_records.get(sym, 1)
 
@@ -1593,14 +1774,30 @@ class AutoPilotManager:
                 except Exception:
                     pass
 
-                # 1.5 强反向信号 -> 趋势反转平反开 (Directional Reversal，30 分钟持仓保护期 + 0.86 高置信度门槛，且盈利单严禁直接反手)
+                # 1.5 强反向信号 -> 趋势反转平反开 (Directional Reversal，15分钟保护期 + 资金流共振加速反手 + 强制前置硬风控)
                 last_entry_or_scale_ts = state.last_scale_timestamps.get(sym, 0)
                 holding_elapsed_ms = now_ms - last_entry_or_scale_ts
-                rev_min_conf = max(0.86, float(evo_pos_params.get("reversal_min_confidence", 0.86)))
+                base_rev_conf = max(0.84, float(evo_pos_params.get("reversal_min_confidence", 0.84)))
                 is_opposite_signal = (is_long and action == SignalAction.SELL_SHORT) or ((not is_long) and action == SignalAction.BUY_LONG)
-                if state.auto_reversal_enabled and is_opposite_signal and conf >= rev_min_conf and plan and holding_elapsed_ms >= 1800000 and profit_ratio <= -0.003:
+
+                # 若全市场资金流确认与当前持仓强逆向背离（如持多单但资金分 <= -25），将反手阈值优化至 0.80，告别死扛亏损！
+                rev_flow_confirmed = False
+                try:
+                    from state import capital_flow_service
+                    pos_flow = capital_flow_service.get_symbol_flow_sync(sym) if capital_flow_service else None
+                    if pos_flow is not None:
+                        if is_long and pos_flow.flow_score <= -25.0:
+                            rev_flow_confirmed = True
+                        elif (not is_long) and pos_flow.flow_score >= 25.0:
+                            rev_flow_confirmed = True
+                except Exception:
+                    pass
+
+                rev_min_conf = 0.80 if rev_flow_confirmed else base_rev_conf
+                min_hold_ms = 900000 if rev_flow_confirmed else 1500000
+                if state.auto_reversal_enabled and is_opposite_signal and conf >= rev_min_conf and plan and holding_elapsed_ms >= min_hold_ms and profit_ratio <= -0.003:
                     try:
-                        logger.info(f"🔄 【趋势反转触发】{sym} 当前持仓 {pos.pos_side.value} 遭遇强反向信号 ({action.value}, 置信度:{conf*100:.0f}%)，执行平仓并反手！")
+                        logger.info(f"🔄 【趋势反转触发】{sym} 当前持仓 {pos.pos_side.value} 遭遇强反向信号 ({action.value}, 置信度:{conf*100:.0f}%, 资金流共振:{rev_flow_confirmed})，执行平仓并反手！")
                         if is_live:
                             try:
                                 await rest_client.cancel_all_orders(symbol=sym)
@@ -1646,11 +1843,19 @@ class AutoPilotManager:
                             side=new_side,
                             pos_side=new_pos_side,
                             order_type=OrderType.MARKET,
+                            price=cur_px,
                             size=calc_coins,
                             leverage=lev,
                             tp_trigger_price=tp_target,
                             sl_trigger_price=sl_px,
                         )
+                        # 反手开仓前同样强制通过硬风控拦截层
+                        remaining_positions = [p for p in positions if p.symbol != sym]
+                        rev_risk_check = await risk_controller.check_order(rev_order_req, cur_tk, remaining_positions)
+                        if not rev_risk_check.passed:
+                            patrol_summaries.append(f"🔄{sym}已平旧仓(反手风控拦截:{rev_risk_check.rejected_rule})")
+                            continue
+
                         if is_live:
                             await rest_client.place_order(symbol=sym, side=new_side, pos_side=new_pos_side, order_type=OrderType.MARKET, sz=calc_coins, leverage=lev, tp_trigger_price=tp_target, sl_trigger_price=sl_px)
                         else:
@@ -1843,13 +2048,41 @@ class AutoPilotManager:
                                 logger.warning(f"加仓执行异常 {sym}: {scale_err}")
 
             # =========================================================================
-            # 阶段 2: 未持仓标的巡检开仓 (New Entry Scan)
+            # 阶段 2: 未持仓标的巡检开仓 (New Entry Scan - 支持全市场资金流动态三池轮动)
             # =========================================================================
-            scan_pool = [state.symbol] if state.focus_mode == "SINGLE_SYMBOL" else (state.focus_symbols or state.symbols)
+            dynamic_pool_roles: Dict[str, str] = {}
+            if state.focus_mode == "SINGLE_SYMBOL":
+                scan_pool = [state.symbol]
+            elif state.focus_mode == "DYNAMIC_CAPITAL_FLOW" and radar_overview is not None:
+                # 组装三池：做多 Alpha 池 + 做空 Beta 池 + 用户置顶池（去重保序）
+                merged_pool: List[str] = []
+                for item in radar_overview.rotation_pools.long_alpha_pool:
+                    if item.symbol not in merged_pool:
+                        merged_pool.append(item.symbol)
+                        dynamic_pool_roles[item.symbol] = "LONG_ALPHA"
+                for item in radar_overview.rotation_pools.short_beta_pool:
+                    if item.symbol not in merged_pool:
+                        merged_pool.append(item.symbol)
+                        dynamic_pool_roles[item.symbol] = "SHORT_BETA"
+                for sym_pin in (state.focus_symbols or state.symbols):
+                    if sym_pin not in merged_pool:
+                        merged_pool.append(sym_pin)
+                        dynamic_pool_roles[sym_pin] = "PINNED"
+                scan_pool = merged_pool or (state.focus_symbols or state.symbols)
+                # 自动将动态新发现标的订阅至 WebSocket 行情流（静默防重复）
+                for dyn_sym in scan_pool:
+                    if dyn_sym not in ws_manager.latest_tickers:
+                        try:
+                            asyncio.create_task(ws_manager.subscribe_market_symbol(dyn_sym))
+                        except Exception:
+                            pass
+            else:
+                scan_pool = state.focus_symbols or state.symbols
+
             unheld_targets = [s for s in scan_pool if s not in held_pos_map]
 
             # 资深投资研究员 (agency-investment-researcher) 资产尽调与体制动态优选排序
-            current_regime = getattr(state, "market_regime", "TRENDING_UP")
+            current_regime = getattr(state, "market_regime", "RANGING")
             try:
                 ranked_research = await self.rank_investment_targets_by_research(
                     unheld_targets,
@@ -1893,18 +2126,17 @@ class AutoPilotManager:
                         patrol_summaries.append(f"{target_symbol}(可用保证金不足)")
                         continue
 
-                    # 交易时段检查与自驱进化达尔文隔离检查
-                    is_tradfi_equity = any(t in target_symbol.upper() for t in ["NVDA", "AMD", "OPENAI", "SAMSUNG", "TSLA", "AAPL", "MSFT", "AMZN", "SPY", "QQQ"])
-                    now_dt = datetime.utcnow()
-                    if is_tradfi_equity and now_dt.weekday() in (5, 6):
-                        patrol_summaries.append(f"{target_symbol}(美股周末休市)")
+                    # Stage 0 (T0.6): 永久拦截代币化美股与非主流合成合约开新仓，杜绝盘后/财报跳空爆损
+                    sym_upper = target_symbol.upper()
+                    if any(sym_upper.startswith(p) for p in settings.BLOCKED_SYNTHETIC_PREFIXES):
+                        patrol_summaries.append(f"{target_symbol}(永久禁开仓合成合约)")
                         continue
 
                     try:
                         from okx_dog_ai.agent.evolution.evolution_manager import AgentEvolutionManager
                         evo_entry_params = AgentEvolutionManager.get_instance().get_active_strategy_parameters(target_symbol)
                         if evo_entry_params.get("is_quarantined"):
-                            patrol_summaries.append(f"{target_symbol}(达尔文风控隔离)")
+                            patrol_summaries.append(f"{target_symbol}(风控隔离)")
                             continue
                     except Exception:
                         pass
@@ -1927,13 +2159,23 @@ class AutoPilotManager:
                         ref_px = (cur_tk.last_price if (cur_tk and cur_tk.last_price > 0) else 0.0) or paper_engine.last_price_map.get(target_symbol, 100.0)
 
                         # 流动性与盘口点差硬拦截：买一卖一点差 > 0.25% 时严禁建仓
-                        if cur_tk and getattr(cur_tk, "ask_px", 0) and getattr(cur_tk, "bid_px", 0) and ref_px > 0:
-                            spread_ratio = (float(cur_tk.ask_px) - float(cur_tk.bid_px)) / ref_px
+                        ask_px_val = getattr(cur_tk, "ask_price", None) or getattr(cur_tk, "ask_px", None) or 0.0
+                        bid_px_val = getattr(cur_tk, "bid_price", None) or getattr(cur_tk, "bid_px", None) or 0.0
+                        if cur_tk and ask_px_val > 0 and bid_px_val > 0 and ref_px > 0:
+                            spread_ratio = (float(ask_px_val) - float(bid_px_val)) / ref_px
                             if spread_ratio > 0.0025:
                                 patrol_summaries.append(f"{target_symbol}(盘口点差过大{spread_ratio*100:.2f}%跳过)")
                                 continue
 
                         agg_mode = getattr(state, "aggressiveness_mode", "BALANCED").upper()
+                        target_flow_snap = None
+                        try:
+                            from state import capital_flow_service
+                            if capital_flow_service is not None:
+                                target_flow_snap = capital_flow_service.get_symbol_flow_sync(target_symbol)
+                        except Exception:
+                            pass
+
                         decision = generate_quantitative_rule_decision(
                             symbol=target_symbol,
                             current_price=ref_px,
@@ -1941,6 +2183,7 @@ class AutoPilotManager:
                             derivatives=deriv,
                             risk_limits=risk_controller.rules,
                             aggressiveness_mode=agg_mode,
+                            capital_flow=target_flow_snap,
                         )
                     except Exception as eval_err:
                         logger.warning(f"标的 {target_symbol} 决策推导跳过: {eval_err}")
@@ -1951,6 +2194,16 @@ class AutoPilotManager:
                     plan = decision.trade_plan
                     conf = sig.confidence if sig else 0.0
                     action = sig.action if sig else SignalAction.HOLD_WAIT
+
+                    # 动态轮动模式方向一致性护栏：失血做空池严禁逆势抄底，强势流入池严禁摸顶做空
+                    pool_role_tag = dynamic_pool_roles.get(target_symbol)
+                    if state.focus_mode == "DYNAMIC_CAPITAL_FLOW":
+                        if pool_role_tag == "SHORT_BETA" and action == SignalAction.BUY_LONG:
+                            patrol_summaries.append(f"{target_symbol}(失血空头池禁抄底)")
+                            continue
+                        if pool_role_tag == "LONG_ALPHA" and action == SignalAction.SELL_SHORT:
+                            patrol_summaries.append(f"{target_symbol}(强势流入池禁摸顶空)")
+                            continue
 
                     # 判定是否满足自动开仓门槛
                     if action in (SignalAction.BUY_LONG, SignalAction.SELL_SHORT) and conf >= state.min_confidence and plan:

@@ -14,6 +14,7 @@ OKX-Dog 个人量化智能交易系统 - 历史时序数据湖与行情归档引
 from __future__ import annotations
 
 import asyncio
+import bisect
 import json
 import logging
 import time
@@ -22,7 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import text
-from config import BASE_DIR
+from config import BASE_DIR, settings
 from database import get_db_session
 from models import (
     DataLakeStatusItem,
@@ -106,49 +107,76 @@ class DataLakeService:
         days_back: int = 30
     ) -> Dict[str, Any]:
         """
-        全自动拉取指定标的的历史 K 线，并接入真实历史资金费率与持仓量 (OI)
+        全自动拉取指定标的的真实历史 K 线，并按时间戳二分精准对齐全量真实 8h 资金费率与全网 OI
+        支持 SWAP (永续合约) 与 SPOT (现货) 双市场落盘
         """
         now_ms = int(time.time() * 1000)
         start_target_ms = now_ms - (days_back * 24 * 60 * 60 * 1000)
         total_inserted = 0
         details: Dict[str, int] = {}
+        is_swap = "SWAP" in symbol.upper()
 
         logger.info(f"⚡ 开始同步标的 {symbol} 真实时序数据 (回溯 {days_back} 天, 周期: {timeframes})...")
 
-        # 1. 真实拉取标的当前历史资金费率列表与当前全网 OI
+        # 1. 若为永续合约，分页拉取覆盖整个回溯区间的全量真实 8h 历史资金费率
         funding_rate_map: Dict[int, float] = {}
+        funding_ts_sorted: List[int] = []
         current_oi_val = 0.0
 
-        try:
-            funding_history = await self.rest_client.get_funding_rate_history(symbol=symbol, limit=100)
-            for item in funding_history:
-                f_ts = int(item.get("fundingTime", 0))
-                f_rate = float(item.get("fundingRate", 0.0001))
-                if f_ts > 0:
-                    funding_rate_map[f_ts] = f_rate
-            logger.info(f"✅ 成功拉取标的 {symbol} 真实资金费率历史记录 {len(funding_rate_map)} 条")
-        except Exception as f_err:
-            logger.warning(f"获取 {symbol} 真实历史资金费率轻微异常: {f_err}，采用标准 0.01% 基准")
+        if is_swap:
+            try:
+                max_f_pages = max(2, int((days_back * 3) // 95) + 3)
+                funding_rate_map = await self.rest_client.get_funding_rate_history_range(
+                    symbol=symbol,
+                    start_ts_ms=start_target_ms,
+                    max_pages=max_f_pages
+                )
+                funding_ts_sorted = sorted(funding_rate_map.keys())
+                logger.info(f"✅ 成功拉取标的 {symbol} 全区间真实资金费率记录 {len(funding_rate_map)} 条")
+            except Exception as f_err:
+                logger.warning(f"获取 {symbol} 真实历史资金费率异常: {f_err}，将回退至 0.01% 基准")
 
-        try:
-            oi_data = await self.rest_client.get_open_interest(symbol=symbol)
-            current_oi_val = float(oi_data.get("oi", 0.0)) if oi_data else 0.0
-            logger.info(f"✅ 成功获取标的 {symbol} 真实全网持仓量 OI: {current_oi_val}")
-        except Exception as oi_err:
-            logger.warning(f"获取 {symbol} 全网持仓量轻微异常: {oi_err}")
+            try:
+                oi_data = await self.rest_client.get_open_interest(symbol=symbol)
+                current_oi_val = float(oi_data.get("oi", 0.0)) if oi_data else 0.0
+            except Exception as oi_err:
+                logger.debug(f"获取 {symbol} 全网持仓量跳过: {oi_err}")
 
-        # 2. 逐周期拉取历史 K 线
+        def _match_funding_rate(ts_ms: int) -> float:
+            if not funding_ts_sorted:
+                return 0.0001 if is_swap else 0.0
+            idx = bisect.bisect_right(funding_ts_sorted, ts_ms) - 1
+            if idx < 0:
+                idx = 0
+            nearest_ts = funding_ts_sorted[idx]
+            if abs(ts_ms - nearest_ts) <= (12 * 3600 * 1000):
+                return funding_rate_map[nearest_ts]
+            # 检查右侧更近的时间点 (兼容边界)
+            if idx + 1 < len(funding_ts_sorted) and abs(funding_ts_sorted[idx + 1] - ts_ms) <= (12 * 3600 * 1000):
+                return funding_rate_map[funding_ts_sorted[idx + 1]]
+            return 0.0001
+
+        insert_sql = text("""
+            INSERT OR REPLACE INTO historical_klines (
+                symbol, timeframe, timestamp, open_price,
+                high_price, low_price, close_price, volume,
+                funding_rate, open_interest, created_at
+            ) VALUES (
+                :symbol, :timeframe, :timestamp, :open,
+                :high, :low, :close, :vol,
+                :funding_rate, :open_interest, CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 2. 逐周期分页向历史回溯拉取 K 线
         for tf in timeframes:
+            tf_norm = tf.lower()
             inserted_for_tf = 0
-            bar = tf
-            if tf == "1h":
-                bar = "1H"
-            elif tf == "4h":
-                bar = "4H"
-            elif tf == "1d":
-                bar = "1Dutc"
+            bar_map = {"1h": "1H", "4h": "4H", "1d": "1Dutc"}
+            bar = bar_map.get(tf_norm, tf)
 
-            cursor_after = None
+            cursor_after: Optional[str] = None
+            prev_oldest_ts: Optional[int] = None
             reached_target = False
 
             while not reached_target:
@@ -162,63 +190,52 @@ class DataLakeService:
                     if not candles:
                         break
 
-                    async with get_db_session() as db:
-                        for c in candles:
-                            ts = int(c.timestamp)
-                            if ts < start_target_ms:
-                                reached_target = True
+                    # get_kline_history 返回按时间戳升序排列，candles[0] 为本页最旧一根
+                    oldest_ts = int(candles[0].timestamp)
+                    if prev_oldest_ts is not None and oldest_ts >= prev_oldest_ts:
+                        break
+                    prev_oldest_ts = oldest_ts
 
-                            # 匹配真实资金费率: 寻找距离当前 K 线最近且已结算的 8h 费率
-                            # 若 funding_rate_map 有数据，寻找最靠近该时间点的真实记录
-                            matched_funding = 0.0001
-                            if funding_rate_map:
-                                # 寻找在 ts 附近的 funding rate
-                                closest_f_ts = min(funding_rate_map.keys(), key=lambda t: abs(t - ts))
-                                if abs(closest_f_ts - ts) <= (12 * 3600 * 1000):
-                                    matched_funding = funding_rate_map[closest_f_ts]
+                    rows_batch = []
+                    for c in candles:
+                        ts = int(c.timestamp)
+                        if ts < start_target_ms:
+                            reached_target = True
+                            continue
+                        rows_batch.append({
+                            "symbol": symbol,
+                            "timeframe": tf_norm,
+                            "timestamp": ts,
+                            "open": float(c.open),
+                            "high": float(c.high),
+                            "low": float(c.low),
+                            "close": float(c.close),
+                            "vol": float(c.volume),
+                            "funding_rate": _match_funding_rate(ts),
+                            "open_interest": current_oi_val,
+                        })
 
-                            sql = text("""
-                                INSERT OR REPLACE INTO historical_klines (
-                                    symbol, timeframe, timestamp, open_price, 
-                                    high_price, low_price, close_price, volume, 
-                                    funding_rate, open_interest, created_at
-                                ) VALUES (
-                                    :symbol, :timeframe, :timestamp, :open,
-                                    :high, :low, :close, :vol,
-                                    :funding_rate, :open_interest, CURRENT_TIMESTAMP
-                                )
-                            """)
-                            await db.execute(sql, {
-                                "symbol": symbol,
-                                "timeframe": tf,
-                                "timestamp": ts,
-                                "open": float(c.open_price),
-                                "high": float(c.high_price),
-                                "low": float(c.low_price),
-                                "close": float(c.close_price),
-                                "vol": float(c.volume),
-                                "funding_rate": matched_funding,
-                                "open_interest": current_oi_val
-                            })
-                            inserted_for_tf += 1
+                    if rows_batch:
+                        async with get_db_session() as db:
+                            await db.execute(insert_sql, rows_batch)
+                        inserted_for_tf += len(rows_batch)
+                        total_inserted += len(rows_batch)
 
-                    total_inserted += len(candles)
-                    cursor_after = str(candles[-1].timestamp)
-
-                    if len(candles) < 100 or reached_target:
+                    cursor_after = str(oldest_ts)
+                    if len(candles) < 100 or oldest_ts <= start_target_ms or reached_target:
                         break
 
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.06)
 
                 except Exception as e:
-                    logger.error(f"拉取 {symbol} [{tf}] 历史 K 线分批异常: {e}")
+                    logger.error(f"拉取 {symbol} [{tf_norm}] 历史 K 线分批异常: {e}")
                     break
 
-            details[tf] = inserted_for_tf
-            logger.info(f"标的 {symbol} [{tf}] 历史时序数据同步完成，共写入 {inserted_for_tf} 根")
+            details[tf_norm] = inserted_for_tf
+            logger.info(f"标的 {symbol} [{tf_norm}] 历史时序数据同步完成，共写入 {inserted_for_tf} 根")
 
             # 清除内存缓存以刷新最新数据
-            cache_key = self._get_cache_key(symbol, tf)
+            cache_key = self._get_cache_key(symbol, tf_norm)
             self._memory_cache.pop(cache_key, None)
 
         return {
@@ -229,13 +246,38 @@ class DataLakeService:
             "real_oi_captured": current_oi_val
         }
 
+    async def sync_core_universe(
+        self,
+        days_back: int = 1095,
+        timeframes: Optional[List[str]] = None,
+        include_spot: bool = True
+    ) -> Dict[str, Any]:
+        """
+        一键同步核心 Top 5 标的池近 3 年 (默认 1095 天) 真实 4H/1D 永续与现货 K 线及全量 8h 资金费率
+        """
+        tfs = timeframes or ["4h", "1d"]
+        summary: Dict[str, Any] = {}
+        symbols_to_sync: List[str] = list(settings.CORE_TRADING_UNIVERSE)
+        if include_spot:
+            for swap_sym in settings.CORE_TRADING_UNIVERSE:
+                spot_sym = swap_sym.replace("-SWAP", "")
+                symbols_to_sync.append(spot_sym)
+
+        for sym in symbols_to_sync:
+            summary[sym] = await self.sync_symbol_history(
+                symbol=sym,
+                timeframes=tfs,
+                days_back=days_back
+            )
+        return summary
+
     async def load_klines(
         self,
         symbol: str,
         timeframe: str,
         start_ts: Optional[int] = None,
         end_ts: Optional[int] = None,
-        limit: int = 10000
+        limit: int = 50000
     ) -> List[Dict[str, Any]]:
         """从数据湖高效加载 K 线记录列表 (支持内存高速环形队列加速)"""
         cache_key = self._get_cache_key(symbol, timeframe)

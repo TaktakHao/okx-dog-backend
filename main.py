@@ -28,7 +28,6 @@ from routers import (
     antigravity_router,
     auto_pilot_router,
     backtest_router,
-    consensus_router,
     data_lake_router,
     health_router,
     knowledge_base_router,
@@ -42,8 +41,6 @@ from routers import (
     trade_router,
     vault_router,
     websocket_router,
-    studio_router,
-    finance_router,
 )
 from vault import install_sensitive_data_filter
 from services.instrument_service import instrument_manager
@@ -85,11 +82,19 @@ async def lifespan(app: FastAPI):
         # 加载风控规则
         await risk_controller.load_config_from_db()
 
-        # 尝试从凭证密盒加载已保存的 OKX 凭证 (按最新更新时间优先加载)
+        # 尝试从凭证密盒加载已保存的 OKX 凭证 (Stage 0 T0.6: 默认禁止开机自动切入实盘，防止误触存量手动仓位)
         async with get_db_session() as db:
-            res = await db.execute(
-                text("SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_valid = 1 ORDER BY updated_at DESC, id DESC LIMIT 1")
-            )
+            if settings.AUTO_BOOT_LIVE_MODE:
+                cred_sql = text(
+                    "SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_valid = 1 "
+                    "ORDER BY updated_at DESC, id DESC LIMIT 1"
+                )
+            else:
+                cred_sql = text(
+                    "SELECT * FROM credentials_vault WHERE credential_type = 'OKX_V5' AND is_valid = 1 AND is_live_mode = 0 "
+                    "ORDER BY updated_at DESC, id DESC LIMIT 1"
+                )
+            res = await db.execute(cred_sql)
             cred = res.mappings().first()
             if cred:
                 try:
@@ -100,13 +105,18 @@ async def lifespan(app: FastAPI):
                         cred["salt"],
                         cred["nonce"]
                     )
-                    is_live = bool(cred["is_live_mode"])
+                    is_live = bool(cred["is_live_mode"]) and bool(settings.AUTO_BOOT_LIVE_MODE)
                     rest_client.update_credentials(dec_key, dec_sec, dec_pass, is_live)
                     ws_manager.update_credentials(dec_key, dec_sec, dec_pass)
                     ws_manager.set_live_mode(is_live)
                     logger.info(f"成功从本地密盒恢复 OKX 凭证 (实盘={is_live}, 脱敏Key={cred['api_key_masked']})")
                 except Exception as dec_err:
                     logger.warning(f"自动解密本地凭证失败 (可能使用了自定义主密码，切换实盘时请输入主密码): {dec_err}")
+            elif not settings.AUTO_BOOT_LIVE_MODE:
+                logger.info(
+                    "🛡️【防误切实盘安全模式】AUTO_BOOT_LIVE_MODE=False，系统保持模拟/影子盘启动 "
+                    f"(公共行情源={'OKX 实盘公共流' if settings.USE_LIVE_PUBLIC_MARKET_DATA else 'Demo 公共流'})"
+                )
 
         # 启动 WebSocket 管理器
         await ws_manager.start()
@@ -114,9 +124,11 @@ async def lifespan(app: FastAPI):
         # 初始化 OKX 全量产品元数据管理与高速缓存服务
         await instrument_manager.initialize()
 
-        # 注册默认标的行情与私有订阅
-        await ws_manager.subscribe_market_symbol("BTC-USDT-SWAP")
-        await ws_manager.subscribe_private_channels("SWAP")
+        # 注册 Top 5 核心标的公共行情订阅 (实时价格与 8h 资金费率流)
+        for core_sym in settings.CORE_TRADING_UNIVERSE:
+            await ws_manager.subscribe_market_symbol(core_sym)
+        if rest_client.is_live_mode and rest_client.api_key:
+            await ws_manager.subscribe_private_channels("SWAP")
 
         # 注册模拟操盘平仓事件监听至自动操盘中枢
         def on_paper_trade_closed(trade_record: dict):
@@ -205,28 +217,13 @@ app.include_router(system_config_router)
 app.include_router(antigravity_router)
 app.include_router(websocket_router)
 
-# v3.0 核心新增领域路由
+# 数据湖、双引擎同构回测、新闻防守与每日离线复盘路由
 app.include_router(data_lake_router)
 app.include_router(backtest_router)
 app.include_router(news_router)
 app.include_router(review_router)
 app.include_router(knowledge_base_router)
-app.include_router(consensus_router)
 app.include_router(telegram_router)
-
-# v3.5 AI Quant Studio & Codex Harness 策略实验室路由
-app.include_router(studio_router)
-
-# v3.6 多智能体自适应强化奖励与 AI 员工看板路由
-from routers.evolution import router as evolution_router
-app.include_router(evolution_router)
-
-# v3.7 资深财务分析师与资金配置路由
-app.include_router(finance_router)
-
-# v6.0 Paperclip 虚拟量化公司与 CFO 战绩配额路由
-from routers.paperclip import router as paperclip_router
-app.include_router(paperclip_router)
 
 
 

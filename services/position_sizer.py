@@ -95,6 +95,8 @@ class PositionSizer:
         lot_size: float = 0.001,             # 最小下单精度步进
         min_size: float = 0.001,             # 最小可下单量
         available_margin: Optional[float] = None,
+        timeframe: str = "1h",               # 周期自适应波动阈值 (15m/1h/4h/1d)
+        silent: bool = False,                # 回测批量调用时静默日志提升 10x 速度
     ) -> PositionSizeResult:
         """
         计算符合企业级量化风控标准的自适应头寸大小:
@@ -108,22 +110,28 @@ class PositionSizer:
         if equity <= 0 or entry_price <= 0:
             raise ValueError(f"账户净值与入场价格必须大于 0: equity={equity}, entry_price={entry_price}")
 
-        # 1. 波动状态与 ATR 评估
+        # 1. 周期自适应波动率状态评估 (按周期平方根缩放，杜绝将 4H/1D 正常日波动误判为 EXTREME)
+        tf_scale_map = {"15m": 0.6, "30m": 0.8, "1h": 1.0, "4h": 2.0, "1d": 4.0}
+        tf_scale = tf_scale_map.get(str(timeframe or "1h").lower(), 1.0)
+        high_th = 2.5 * tf_scale
+        extreme_th = 4.0 * tf_scale
+        low_th = 0.8 * tf_scale
+
         vol_ratio_pct = 0.0
         vol_regime = "NORMAL"
         vol_factor = 1.0
 
         if atr and atr > 0:
             vol_ratio_pct = (atr / entry_price) * 100.0
-            if vol_ratio_pct > 4.0:
+            if vol_ratio_pct > extreme_th:
                 vol_regime = "EXTREME"
-                vol_factor = 0.60   # 极端高波动插针环境，主动防守收缩 40% 仓位
-            elif vol_ratio_pct > 2.5:
+                vol_factor = 0.65   # 真正极端插针环境，主动防守收缩 35% 仓位
+            elif vol_ratio_pct > high_th:
                 vol_regime = "HIGH"
-                vol_factor = 0.80   # 较高波动环境，收缩 20%
-            elif vol_ratio_pct < 0.8:
+                vol_factor = 0.85   # 偏高波动环境，收缩 15%
+            elif vol_ratio_pct < low_th:
                 vol_regime = "LOW"
-                vol_factor = 1.05   # 超低波动窄幅震荡，小幅放大利用率
+                vol_factor = 1.05   # 超低波动环境，小幅提高利用率
             else:
                 vol_regime = "NORMAL"
                 vol_factor = 1.0
@@ -190,12 +198,13 @@ class PositionSizer:
         est_margin = round(notional_val / max(1, max_leverage), 2)
         effective_lev = round(notional_val / equity, 2) if equity > 0 else 0.0
 
-        logger.info(
-            f"📐 [PositionSizer] {symbol} 计算完成: 净值=${equity:.2f}, 风险预算=${risk_budget_usdt:.2f} ({risk_pct*100:.1f}%), "
-            f"波动状态={vol_regime}(ATR={atr or 'N/A'}, {vol_ratio_pct:.2f}%), "
-            f"入场=${entry_price}, 止损=${final_sl_px} (距={stop_dist_pct:.2f}%) -> "
-            f"开仓={final_size} 币 (名义价值=${notional_val:.2f}, 实际杠杆={effective_lev:.2f}x)"
-        )
+        if not silent:
+            logger.info(
+                f"📐 [PositionSizer] {symbol} 计算完成: 净值=${equity:.2f}, 风险预算=${risk_budget_usdt:.2f} ({risk_pct*100:.1f}%), "
+                f"波动状态={vol_regime}(ATR={atr or 'N/A'}, {vol_ratio_pct:.2f}%), "
+                f"入场=${entry_price}, 止损=${final_sl_px} (距={stop_dist_pct:.2f}%) -> "
+                f"开仓={final_size} 币 (名义价值=${notional_val:.2f}, 实际杠杆={effective_lev:.2f}x)"
+            )
 
         return PositionSizeResult(
             symbol=symbol,

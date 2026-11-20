@@ -13,7 +13,7 @@ OKX-Dog 个人量化智能交易系统 - 高仿真模拟操盘沙盒引擎 (Pape
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -21,6 +21,8 @@ import sqlite3
 import time
 import uuid
 from typing import Any, Dict, List, Optional
+
+from config import settings
 
 from models import (
     AccountBalanceModel,
@@ -45,13 +47,21 @@ class PaperTradingEngine:
     内置高仿真模拟操盘沙盒引擎
     """
 
-    def __init__(self, initial_equity: float = 10000.0):
+    def __init__(self, initial_equity: float = 10000.0, slippage_bps: Optional[float] = None):
         self.initial_equity: float = initial_equity
         self.cash: float = initial_equity  # 未占用可用现金 (USDT)
         self.today_start_equity: float = initial_equity
+        self.today_utc_date: str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self.slippage_bps: float = (
+            float(slippage_bps) if slippage_bps is not None else float(settings.PAPER_DEFAULT_SLIPPAGE_BPS)
+        )
 
         # 内存持仓字典: key 为 f"{symbol}:{pos_side}"
         self.positions: Dict[str, PositionModel] = {}
+        # Stage 0 (T0.5): 持仓成本台账 (记录已付开仓费、已结算资金费与上次 8h 资金费窗口，确保单笔净盈亏与现金流 100% 闭环)
+        self.position_cost_ledger: Dict[str, Dict[str, Any]] = {}
+        # 实时资金费率缓存 (由 OKX 实盘公共 WS funding-rate 频道更新)
+        self.funding_rate_map: Dict[str, float] = {}
         # 内存订单字典: key 为 order_id
         self.orders: Dict[str, OrderModel] = {}
         # 历史成交平仓记录 (用于统计胜率与收益)
@@ -61,18 +71,8 @@ class PaperTradingEngine:
             "BTC-USDT-SWAP": 63428.0,
             "ETH-USDT-SWAP": 2680.0,
             "SOL-USDT-SWAP": 188.5,
+            "BNB-USDT-SWAP": 580.0,
             "DOGE-USDT-SWAP": 0.155,
-            "XAU-USDT-SWAP": 2650.0,
-            "XAG-USDT-SWAP": 31.5,
-            "EUR-USDT-SWAP": 1.085,
-            "GBP-USDT-SWAP": 1.295,
-            "NVDA-USDT-SWAP": 128.5,
-            "TSLA-USDT-SWAP": 245.0,
-            "AAPL-USDT-SWAP": 228.0,
-            "ONDO-USDT-SWAP": 0.725,
-            "PENDLE-USDT-SWAP": 4.85,
-            "PAXG-USDT": 2650.0,
-            "MKR-USDT-SWAP": 1650.0,
         }
 
 
@@ -82,8 +82,65 @@ class PaperTradingEngine:
 
         logger.info(
             f"【模拟操盘沙盒】引擎初始化完成，初始虚拟资金: {self.initial_equity:.2f} USDT, "
-            f"当前可用现金: {self.cash:.2f} USDT, 活跃持仓数: {len(self.positions)}"
+            f"当前可用现金: {self.cash:.2f} USDT, 活跃持仓数: {len(self.positions)}, "
+            f"市价滑点={self.slippage_bps}bps"
         )
+
+    def update_funding_rate(self, symbol: str, funding_rate: float) -> None:
+        """更新标的实时 8 小时资金费率缓存"""
+        if symbol:
+            self.funding_rate_map[symbol.upper()] = float(funding_rate)
+
+    def _check_utc_day_rollover(self) -> None:
+        """按 UTC 00:00 自动重置今日起始权益基准"""
+        cur_utc_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if cur_utc_date != self.today_utc_date:
+            unrealized_pnl = sum(p.upl for p in self.positions.values())
+            used_margin = sum(p.margin for p in self.positions.values())
+            self.today_start_equity = max(0.0, self.cash + used_margin + unrealized_pnl)
+            self.today_utc_date = cur_utc_date
+
+    def settle_funding_if_due(self, now_ms: Optional[int] = None) -> float:
+        """
+        Stage 0 (T0.5): 按 OKX 真实 8 小时窗口 (UTC 00:00 / 08:00 / 16:00) 自动结算持仓资金费率
+        :return: 本次资金费对账户现金的净变动 (正数为收到资金费，负数为支付资金费)
+        """
+        ts_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        cur_window = ts_ms // (8 * 3600 * 1000)
+        total_cashflow = 0.0
+        settled_any = False
+
+        for key, pos in list(self.positions.items()):
+            if pos.pos <= 0 or "SWAP" not in pos.symbol.upper():
+                continue
+            ledger = self.position_cost_ledger.setdefault(
+                key,
+                {"open_fee": 0.0, "funding_fee": 0.0, "last_funding_window": cur_window}
+            )
+            last_win = int(ledger.get("last_funding_window", cur_window))
+            if cur_window > last_win:
+                windows_crossed = cur_window - last_win
+                rate = self.funding_rate_map.get(pos.symbol.upper(), float(settings.PAPER_DEFAULT_FUNDING_RATE_8H))
+                mark_px = pos.mark_px if (pos.mark_px and pos.mark_px > 0) else pos.avg_px
+                notional = mark_px * pos.pos
+                is_long = pos.pos_side == PosSide.LONG
+                # 多头正费率付钱，空头正费率收钱
+                cashflow = (-notional * rate * windows_crossed) if is_long else (notional * rate * windows_crossed)
+                cashflow = round(cashflow, 4)
+                self.cash += cashflow
+                # funding_fee 记为净支出成本 (正数=付出，负数=净收入)
+                ledger["funding_fee"] = round(float(ledger.get("funding_fee", 0.0)) - cashflow, 4)
+                ledger["last_funding_window"] = cur_window
+                total_cashflow += cashflow
+                settled_any = True
+                logger.info(
+                    f"【模拟盘-资金费结算】{pos.symbol} ({'多' if is_long else '空'}) 跨越 {windows_crossed} 个 8h 窗口, "
+                    f"费率={rate*100:.4f}%, 现金流={cashflow:+.4f} USDT"
+                )
+
+        if settled_any:
+            self.save_runtime_state()
+        return round(total_cashflow, 4)
 
     def save_runtime_state(self) -> None:
         """将当前模拟盘现金、持仓与今日起始权益持久化至本地 JSON，防止服务重启导致净值重置"""
@@ -95,6 +152,8 @@ class PaperTradingEngine:
                 "initial_equity": self.initial_equity,
                 "cash": round(self.cash, 4),
                 "today_start_equity": self.today_start_equity,
+                "today_utc_date": self.today_utc_date,
+                "position_cost_ledger": self.position_cost_ledger,
                 "balance": bal.model_dump() if hasattr(bal, "model_dump") else bal.dict(),
                 "positions": [
                     p.model_dump() if hasattr(p, "model_dump") else p.dict()
@@ -150,6 +209,10 @@ class PaperTradingEngine:
                 elif isinstance(data.get("balance"), dict) and "available_margin_usdt" in data["balance"]:
                     self.cash = float(data["balance"]["available_margin_usdt"])
                 self.today_start_equity = float(data.get("today_start_equity", self.initial_equity))
+                if data.get("today_utc_date"):
+                    self.today_utc_date = str(data["today_utc_date"])
+                if isinstance(data.get("position_cost_ledger"), dict):
+                    self.position_cost_ledger = dict(data["position_cost_ledger"])
 
                 if isinstance(data.get("last_price_map"), dict):
                     for k, v in data["last_price_map"].items():
@@ -186,7 +249,9 @@ class PaperTradingEngine:
         self.initial_equity = initial_equity
         self.cash = initial_equity
         self.today_start_equity = initial_equity
+        self.today_utc_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self.positions.clear()
+        self.position_cost_ledger.clear()
         self.orders.clear()
         self.closed_trades.clear()
         self.save_runtime_state()
@@ -202,6 +267,9 @@ class PaperTradingEngine:
             return []
 
         self.last_price_map[symbol] = price
+        # Stage 0 (T0.5): 每次行情驱动先检查跨日与 8h 资金费率结算
+        self._check_utc_day_rollover()
+        self.settle_funding_if_due()
         triggered_events = []
 
         # 动态盯市计算 UPL 与检查 TP/SL
@@ -282,7 +350,7 @@ class PaperTradingEngine:
                         triggered_events.append(close_res)
                         continue
 
-            # 2. 检查止损 (Stop Loss) 触发 (包含移动保本触发与测试网单 Tick 闪崩断层保护)
+            # 2. 检查止损 (Stop Loss) 触发 (Stage 0 T0.5: 严格按真实市场价撮合，彻底移除“跳空假装按止损价成交”美化逻辑)
             if pos.sl_trigger_price and pos.sl_trigger_price > 0:
                 is_sl_hit = False
                 if is_long and price <= pos.sl_trigger_price:
@@ -298,17 +366,12 @@ class PaperTradingEngine:
                     )
                     is_be = bool(getattr(pos, "is_breakeven_locked", False) and true_be)
 
-                    # 防御 OKX 模拟盘低流动性合约单 Tick 20% 假插针断层：若单次跳空偏离止损触发价超过 2.5%，按止损价 + 0.15% 真实滑点结算
+                    # 真实暴露跳空风险：若价格跳空穿透止损价，如实按当前市场价 (再叠加市价滑点) 结算
                     gap_ratio = abs(price - pos.sl_trigger_price) / max(pos.sl_trigger_price, 1e-6)
-                    exec_close_px = price
-                    if gap_ratio > 0.025:
-                        exec_close_px = round(
-                            pos.sl_trigger_price * (0.9985 if is_long else 1.0015),
-                            2 if pos.avg_px > 10 else 4
-                        )
+                    if gap_ratio > 0.01:
                         logger.warning(
-                            f"🛡️【防假插针断层保护】{symbol} 止损触发时出现异常单Tick跳空 ({gap_ratio*100:.2f}%: "
-                            f"SL=${pos.sl_trigger_price} vs Tick=${price})，按含滑点保护价 ${exec_close_px} 撮合平仓"
+                            f"⚠️【模拟盘真实跳空成交】{symbol} 止损触发时发生 {gap_ratio*100:.2f}% 跳空 "
+                            f"(SL=${pos.sl_trigger_price} vs Tick=${price})，如实按市价撮合平仓"
                         )
 
                     reason_str = (
@@ -320,7 +383,7 @@ class PaperTradingEngine:
                     close_res = self.close_position(
                         symbol=symbol,
                         pos_side=pos.pos_side,
-                        price=exec_close_px,
+                        price=price,
                         reason=reason_str
                     )
                     triggered_events.append(close_res)
@@ -340,10 +403,17 @@ class PaperTradingEngine:
         pos_side = PosSide.LONG if side == OrderSide.BUY else PosSide.SHORT
         leverage = req.leverage or 3
 
-        # 确定撮合价格
-        exec_price = float(getattr(req, "price", 0.0) or 0.0)
-        if getattr(req, "order_type", None) == OrderType.MARKET or exec_price <= 0:
-            exec_price = current_market_price or self.last_price_map.get(symbol, 96420.5)
+        # 确定撮合价格 (Stage 0 T0.5: 市价单引入真实不利滑点惩罚，POST_ONLY 挂单 0 滑点)
+        is_maker = getattr(req, "order_type", None) == OrderType.POST_ONLY
+        raw_price = float(getattr(req, "price", 0.0) or 0.0)
+        if getattr(req, "order_type", None) == OrderType.MARKET or raw_price <= 0:
+            raw_price = current_market_price or self.last_price_map.get(symbol, 96420.5)
+
+        slip_rate = 0.0 if is_maker else (max(0.0, self.slippage_bps) / 10000.0)
+        if slip_rate > 0:
+            exec_price = raw_price * (1.0 + slip_rate) if side == OrderSide.BUY else raw_price * (1.0 - slip_rate)
+        else:
+            exec_price = raw_price
 
         size = float(getattr(req, "sz", None) or getattr(req, "size", None) or 0.0)
         if size <= 0:
@@ -353,7 +423,6 @@ class PaperTradingEngine:
         required_margin = notional_usdt / leverage
 
         # 区分 Maker 与 Taker 真实交易费率 (POST_ONLY: 0.02% Maker, MARKET: 0.05% Taker)
-        is_maker = getattr(req, "order_type", None) == OrderType.POST_ONLY
         open_fee_rate = 0.0002 if is_maker else 0.0005
         open_fee = round(notional_usdt * open_fee_rate, 4)
 
@@ -492,6 +561,13 @@ class PaperTradingEngine:
             )
             self.positions[pos_key] = new_pos
 
+        # Stage 0 (T0.5): 将本次开仓手续费登记到持仓成本台账，平仓时按比例计入单笔净盈亏
+        cur_funding_win = now_ms // (8 * 3600 * 1000)
+        ledger = self.position_cost_ledger.setdefault(
+            pos_key,
+            {"open_fee": 0.0, "funding_fee": 0.0, "last_funding_window": cur_funding_win},
+        )
+        ledger["open_fee"] = round(float(ledger.get("open_fee", 0.0)) + open_fee, 4)
 
         self.save_runtime_state()
         logger.info(
@@ -508,9 +584,11 @@ class PaperTradingEngine:
         size: Optional[float] = None,
         reason: str = "交易员手动市价平仓"
     ) -> Dict[str, Any]:
-        """对模拟持仓进行市价/限价平仓并结算已实现盈亏"""
+        """对模拟持仓进行市价/限价平仓并结算含双边费用、滑点与资金费的真实净盈亏"""
         now_ms = int(time.time() * 1000)
-        close_price = price or self.last_price_map.get(symbol, 96420.5)
+        self._check_utc_day_rollover()
+        self.settle_funding_if_due(now_ms=now_ms)
+        raw_close_price = price or self.last_price_map.get(symbol, 96420.5)
 
         targets = []
         if pos_side:
@@ -526,26 +604,53 @@ class PaperTradingEngine:
             return {"success": False, "msg": f"未找到标的 {symbol} 的模拟持仓"}
 
         total_realized_pnl = 0.0
+        slip_rate = max(0.0, self.slippage_bps) / 10000.0
         for k, pos in targets:
             close_sz = size or pos.pos
             close_ratio = min(1.0, close_sz / pos.pos) if pos.pos > 0 else 1.0
 
             is_long = pos.pos_side == PosSide.LONG
+            # 平多为卖出 (价格向下滑点)，平空为买入 (价格向上滑点)
+            close_price = (
+                raw_close_price * (1.0 - slip_rate) if is_long else raw_close_price * (1.0 + slip_rate)
+            ) if slip_rate > 0 else raw_close_price
+
             if is_long:
                 raw_pnl = (close_price - pos.avg_px) * close_sz
             else:
                 raw_pnl = (pos.avg_px - close_price) * close_sz
 
-            # 扣除平仓手续费 (市价平仓按 Taker 0.05% 计，限价平仓按 0.02% 计)
+            # 扣除平仓手续费 (市价平仓按 Taker 0.05% 计)
             close_notional = close_price * close_sz
             close_fee_rate = 0.0005  # 平仓多数为市价止损或止盈单
             close_fee = round(close_notional * close_fee_rate, 4)
-            pnl = round(raw_pnl - close_fee, 4)
+
+            # Stage 0 (T0.5): 按平仓比例分摊已付开仓费与已结算资金费，使单笔 realized_pnl 与账户真实净现金变化 100% 闭环
+            ledger = self.position_cost_ledger.get(k, {"open_fee": 0.0, "funding_fee": 0.0})
+            allocated_open_fee = round(float(ledger.get("open_fee", 0.0)) * close_ratio, 4)
+            allocated_funding_fee = round(float(ledger.get("funding_fee", 0.0)) * close_ratio, 4)
+            total_trade_fee = round(close_fee + allocated_open_fee, 4)
+
+            # 现金只需结算本笔价差盈亏与平仓费 (开仓费与资金费已在发生时刻从 cash 中实时扣减/入账)
+            cash_pnl_delta = round(raw_pnl - close_fee, 4)
+            net_realized_pnl = round(raw_pnl - close_fee - allocated_open_fee - allocated_funding_fee, 4)
 
             released_margin = pos.margin * close_ratio
-            self.cash += (released_margin + pnl)
-            total_realized_pnl += pnl
+            self.cash += (released_margin + cash_pnl_delta)
+            total_realized_pnl += net_realized_pnl
 
+            if k in self.position_cost_ledger:
+                if close_ratio >= 0.999:
+                    self.position_cost_ledger.pop(k, None)
+                else:
+                    self.position_cost_ledger[k]["open_fee"] = round(
+                        max(0.0, float(ledger.get("open_fee", 0.0)) - allocated_open_fee), 4
+                    )
+                    self.position_cost_ledger[k]["funding_fee"] = round(
+                        float(ledger.get("funding_fee", 0.0)) - allocated_funding_fee, 4
+                    )
+
+            pnl = net_realized_pnl
             trade_record = {
                 "symbol": symbol,
                 "pos_side": pos.pos_side.value if hasattr(pos.pos_side, "value") else str(pos.pos_side),
@@ -553,9 +658,13 @@ class PaperTradingEngine:
                 "exit_price": close_price,
                 "size": close_sz,
                 "leverage": pos.leverage,
-                "realized_pnl": pnl,
-                "fee": close_fee,
-                "roi_pct": (pnl / released_margin * 100) if released_margin > 0 else 0.0,
+                "gross_pnl": round(raw_pnl, 4),
+                "realized_pnl": net_realized_pnl,
+                "fee": total_trade_fee,
+                "open_fee": allocated_open_fee,
+                "close_fee": close_fee,
+                "funding_fee": allocated_funding_fee,
+                "roi_pct": (net_realized_pnl / released_margin * 100) if released_margin > 0 else 0.0,
                 "reason": reason,
                 "timestamp": now_ms,
             }
@@ -705,12 +814,21 @@ class PaperTradingEngine:
         return list(self.orders.values())
 
     def get_account_balance(self) -> AccountBalanceModel:
-        """获取模拟账户资金全景"""
+        """获取模拟账户资金全景 (按 UTC 日界精确口径核算当日已实现盈亏)"""
         now_ms = int(time.time() * 1000)
+        self._check_utc_day_rollover()
         unrealized_pnl = sum(p.upl for p in self.positions.values())
         used_margin = sum(p.margin for p in self.positions.values())
         total_equity = max(0.0, self.cash + used_margin + unrealized_pnl)
-        realized_today = sum(t["realized_pnl"] for t in self.closed_trades)
+
+        # 仅汇总今日 (UTC 00:00 起) 的已实现盈亏，修复历史全量混算缺陷
+        utc_midnight_ms = int(
+            datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000
+        )
+        realized_today = sum(
+            t["realized_pnl"] for t in self.closed_trades
+            if int(t.get("timestamp", 0)) >= utc_midnight_ms
+        )
 
         today_pnl_ratio = (
             (total_equity - self.today_start_equity) / self.today_start_equity
